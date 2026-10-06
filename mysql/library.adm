@@ -1,0 +1,13 @@
+// MySQL and MariaDB as an ADM library: the `mysql:` driver of std.data.db,
+// speaking the server's client/server protocol over std.net.
+@manifest(version = "0.1.0")
+library adm.database.mysql {
+	use (
+		adm.database.mysql
+		adm.database.mysql.wire
+	)
+
+	export (
+		adm.database.mysql
+	)
+}

@@ -1,0 +1,749 @@
+partial module adm.database.mysql {
+	use (
+		std.data.db
+		std.net.url
+		adm.database.mysql.wire::*
+		adm.database.mysql.values::*
+	)
+
+	// Connection is one session with a MySQL or MariaDB server. It
+	// implements std.data.db.Connection; `interrupt`, `serverVersion` and
+	// `threadId` are MySQL's own.
+	//
+	// A statement with arguments is prepared, run and dropped on the server,
+	// so its values never become part of the text; one without arguments is
+	// sent as text. The overloads that take `named` rewrite `:name`
+	// placeholders to `?` (std.data.db.positional) when no positional
+	// arguments are given.
+	//
+	// Rows are read from the server as `next` asks for them. Running another
+	// statement on the connection ends the rows still open on it.
+	type Connection {
+		wire         Wire
+		// Where the session was opened, to open the side session `interrupt`
+		// needs.
+		source       url.URL
+		// The server's version text and the session's thread, from its
+		// greeting.
+		version      string
+		thread       int
+		deprecateEof bool
+		closed       bool
+		// What is still unread of a statement's answer: 0 nothing, 1 the
+		// rows of a result, 2 the header of a further result.
+		phase        int
+		// Whether the result being read is in the binary protocol.
+		binary       bool
+		// The columns of the result being read.
+		fields       Field[]
+		// What the last OK packet reported.
+		affected     int
+		insertId     int
+		// The server's status flags: 1 in a transaction, 8 more results
+		// follow.
+		status       int
+		// A one-off prepared statement to drop once its result is read.
+		dropping     int
+		// Counts the statements run, so rows of an earlier one know they
+		// have ended.
+		serial       int
+
+		def new(wire Wire, source url.URL) {
+			self.wire = wire
+			self.source = source
+		}
+
+		// placeholder implements std.data.db.Queryable.
+		def placeholder() db.Placeholder {
+			return db.Placeholder.Question
+		}
+
+		// exec implements std.data.db.Queryable.
+		// Fails with a DbError when the database rejects the statement, an
+		// argument cannot be bound, or the connection is closed or lost.
+		def exec(statement string, args ...any) !db.Result {
+			return try execute(self, statement, args)
+		}
+
+		// exec implements std.data.db.Queryable.
+		// Fails with a DbError when the database rejects the statement, an
+		// argument cannot be bound, or the connection is closed or lost.
+		def exec(statement string, named map<string, any>, args ...any) !db.Result {
+			if named.len() > 0 && args.len() == 0 {
+				let (text, ordered) = try db.positional(statement, named, db.Placeholder.Question, true)
+				return try execute(self, text, ordered)
+			}
+			return try execute(self, statement, args)
+		}
+
+		// query implements std.data.db.Queryable.
+		// Fails with a DbError when the database rejects the statement, an
+		// argument cannot be bound, or the connection is closed or lost.
+		def query(statement string, args ...any) !db.Rows {
+			return try open(self, statement, args)
+		}
+
+		// query implements std.data.db.Queryable.
+		// Fails with a DbError when the database rejects the statement, an
+		// argument cannot be bound, or the connection is closed or lost.
+		def query(statement string, named map<string, any>, args ...any) !db.Rows {
+			if named.len() > 0 && args.len() == 0 {
+				let (text, ordered) = try db.positional(statement, named, db.Placeholder.Question, true)
+				return try open(self, text, ordered)
+			}
+			return try open(self, statement, args)
+		}
+
+		// prepare implements std.data.db.Queryable.
+		// Fails with a DbError when the database rejects the statement, or the
+		// connection is closed or lost.
+		def prepare(statement string) !db.Statement {
+			let (text, names) = db.placeholders(statement, db.Placeholder.Question, true)
+			let (id, params) = try compile(self, text)
+			return new Statement(self, id, params, names)
+		}
+
+		// beginTx implements std.data.db.Connection.
+		// Fails with a DbError when a transaction is already open on the
+		// connection, or the connection is closed or lost.
+		def beginTx(isolation db.Isolation = db.Isolation.Default, readOnly bool = false) !db.Transaction {
+			try ready(self)
+			fail db.errorOf(db.ErrorKind.Other, "mysql: a transaction is already open on this connection") when (status & 1) != 0
+			match isolation {
+				case db.Isolation.ReadUncommitted:
+					try text(self, "SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED")
+				case db.Isolation.ReadCommitted:
+					try text(self, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED")
+				case db.Isolation.RepeatableRead:
+					try text(self, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+				case db.Isolation.Serializable:
+					try text(self, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE")
+				default:
+					try ready(self)
+			}
+			try text(self, readOnly ?? ("START TRANSACTION READ ONLY", "START TRANSACTION"))
+			return new Transaction(self)
+		}
+
+		// ping implements std.data.db.Connection.
+		// Fails with a DbError when the database does not answer.
+		def ping() !none {
+			try ready(self)
+			try wire.send(byte[0x0E])
+			phase = 2
+			try header(self)
+			return none
+		}
+
+		// close implements std.data.db.Connection.
+		// Fails with a DbError when the database reports a failure while
+		// closing.
+		def close() !none {
+			return none when closed
+			closed = true
+			wire.command()
+			wire.send(byte[0x01]) onerror recover none
+			wire.stream.close() onerror recover none
+			return none
+		}
+
+		// serverVersion returns the server's version as it greets with it,
+		// such as "8.4.3" or "11.4.4-MariaDB".
+		def serverVersion() string {
+			return version
+		}
+
+		// threadId returns the session's thread on the server, as
+		// `CONNECTION_ID()` does.
+		def threadId() int {
+			return thread
+		}
+
+		// interrupt stops the statement running on this connection, from any
+		// task: `KILL QUERY` sent on a session of its own. The statement
+		// then fails with ErrorKind.TimedOut.
+		// Fails with a DbError when that session cannot be opened or may not
+		// stop the statement.
+		def interrupt() !none {
+			let side = try dial(source)
+			let outcome = text(side, "KILL QUERY {thread}")
+			side.close() onerror recover none
+			try outcome
+			return none
+		}
+
+		def dispose() {
+			return when closed
+			closed = true
+			wire.stream.close() onerror recover none
+		}
+	}
+
+	// Transaction is a MySQL transaction on its connection.
+	internal type Transaction {
+		conn  Connection
+		ended bool
+
+		def new(conn Connection) {
+			self.conn = conn
+		}
+
+		def placeholder() db.Placeholder {
+			return db.Placeholder.Question
+		}
+
+		def exec(statement string, args ...any) !db.Result {
+			try running()
+			return conn.exec(statement, ...args)
+		}
+
+		def exec(statement string, named map<string, any>, args ...any) !db.Result {
+			try running()
+			return conn.exec(statement, named, ...args)
+		}
+
+		def query(statement string, args ...any) !db.Rows {
+			try running()
+			return conn.query(statement, ...args)
+		}
+
+		def query(statement string, named map<string, any>, args ...any) !db.Rows {
+			try running()
+			return conn.query(statement, named, ...args)
+		}
+
+		def prepare(statement string) !db.Statement {
+			try running()
+			return conn.prepare(statement)
+		}
+
+		def commitTx() !none {
+			try running()
+			ended = true
+			try text(conn, "COMMIT")
+			return none
+		}
+
+		def rollbackTx() !none {
+			return none when ended
+			ended = true
+			return none when conn.closed
+			try text(conn, "ROLLBACK")
+			return none
+		}
+
+		def running() !none {
+			fail db.errorOf(db.ErrorKind.Closed, "mysql: the transaction has ended") when ended
+			return none
+		}
+
+		def dispose() {
+			return when ended || conn.closed
+			ended = true
+			text(conn, "ROLLBACK") onerror recover db.Result{affected: 0, lastInsertId: 0}
+		}
+	}
+
+	// Statement is a statement the server has prepared.
+	internal type Statement {
+		conn   Connection
+		id     int
+		// How many parameters the statement takes.
+		params int
+		// The `:name` placeholders of the text, one per `?` in order.
+		names  string[]
+		closed bool
+
+		def new(conn Connection, id int, params int, names string[]) {
+			self.conn = conn
+			self.id = id
+			self.params = params
+			self.names = names
+		}
+
+		def exec(args ...any) !db.Result {
+			try usable()
+			try run(conn, id, params, args)
+			return outcome(conn)
+		}
+
+		def exec(named map<string, any>, args ...any) !db.Result {
+			try usable()
+			try run(conn, id, params, try ordered(named, args))
+			return outcome(conn)
+		}
+
+		def query(args ...any) !db.Rows {
+			try usable()
+			try run(conn, id, params, args)
+			return try rowsOf(conn)
+		}
+
+		def query(named map<string, any>, args ...any) !db.Rows {
+			try usable()
+			try run(conn, id, params, try ordered(named, args))
+			return try rowsOf(conn)
+		}
+
+		def close() !none {
+			return none when closed
+			closed = true
+			return none when conn.closed
+			try ready(conn)
+			return drop(conn, id)
+		}
+
+		def usable() !none {
+			fail db.errorOf(db.ErrorKind.Closed, "mysql: the statement is closed") when closed
+			return none
+		}
+
+		// The arguments in placeholder order: by name when the text had
+		// `:name` placeholders and no positional arguments came, else as
+		// given.
+		def ordered(named map<string, any>, args any[]) !any[] {
+			return args when args.len() > 0 || names.len() == 0
+			let out any[]
+			for let (_, key) in names {
+				fail db.errorOf(db.ErrorKind.Type, "mysql: no argument named '{key}'") unless named.hasKey(key)
+				out.push(named[key])
+			}
+			return out
+		}
+	}
+
+	// Rows is a result being read from the server.
+	internal type Rows {
+		conn   Connection
+		serial int
+		fields Field[]
+		binary bool
+		cols   db.Column[]
+		ended  bool
+		onRow  bool
+		// The current row's packet, with where each column's bytes start
+		// and how many they are (-1 for NULL).
+		row    byte[]
+		starts int[]
+		sizes  int[]
+
+		def new(conn Connection, fields Field[], binary bool) {
+			self.conn = conn
+			self.fields = fields
+			self.binary = binary
+			serial = conn.serial
+			ended = fields.len() == 0
+			starts.len(fields.len())
+			sizes.len(fields.len())
+			for let (_, f) in fields {
+				cols.push(db.Column{name: f.name, typeName: typeNameOf(f), nullable: (f.flags & flagNotNull) == 0})
+			}
+		}
+
+		def columns() db.Column[] {
+			return cols
+		}
+
+		def next() !bool {
+			return false when ended
+			fail db.errorOf(db.ErrorKind.Closed, "mysql: another statement ran on the connection and ended these rows") when conn.serial != serial
+			onRow = false
+			let has = rowPacket(conn) onerror (err error) {
+				ended = true
+				fail err
+			}
+			if !has {
+				ended = true
+				return false
+			}
+			row = conn.wire.body
+			if binary {
+				locateBinary()
+			} else {
+				locateText()
+			}
+			onRow = true
+			return true
+		}
+
+		// Finds the columns of a text protocol row: each a length-encoded
+		// string, or the NULL marker.
+		def locateText() {
+			let c = new Cursor(row)
+			for let i = 0; i < fields.len(); i++ {
+				let size = c.lenenc()
+				sizes[i] = size
+				starts[i] = c.at
+				c.at += size when size > 0
+			}
+		}
+
+		// Finds the columns of a binary protocol row: a bitmap of the NULL
+		// ones, then each value in the width its type has.
+		def locateBinary() {
+			let count = fields.len()
+			let c = new Cursor(row)
+			c.at = 1 + (count + 7 + 2) / 8
+			for let i = 0; i < count; i++ {
+				let bit = i + 2
+				if (int(row[1 + bit / 8]) & (1 << (bit % 8))) != 0 {
+					sizes[i] = -1
+					starts[i] = c.at
+					continue
+				}
+				let size = 0
+				match fields[i].kind {
+					case 1:
+						size = 1
+					case 2, 13:
+						size = 2
+					case 3, 9, 4:
+						size = 4
+					case 8, 5:
+						size = 8
+					case 7, 10, 11, 12:
+						size = c.get8()
+					default:
+						size = c.lenenc()
+				}
+				sizes[i] = size
+				starts[i] = c.at
+				c.at += size
+			}
+		}
+
+		def isNull(column int) bool {
+			return true unless onRow && column >= 0 && column < sizes.len()
+			return sizes[column] < 0
+		}
+
+		def bool(column int) !bool {
+			let data = try cell(column)
+			let n = intOfCell(fields[column], binary, data)
+			fail mismatch(column, "bool") when n is none
+			return n != 0
+		}
+
+		def int(column int) !int {
+			let data = try cell(column)
+			let n = intOfCell(fields[column], binary, data)
+			fail mismatch(column, "int") when n is none
+			return n
+		}
+
+		def float(column int) !float {
+			let data = try cell(column)
+			let f = floatOfCell(fields[column], binary, data)
+			fail mismatch(column, "float") when f is none
+			return f
+		}
+
+		def string(column int) !string {
+			let data = try cell(column)
+			return textOfCell(fields[column], binary, data)
+		}
+
+		def bytes(column int) !byte[] {
+			let data = try cell(column)
+			let f = fields[column]
+			fail mismatch(column, "byte[]") when isInteger(f.kind) || isTemporal(f.kind) || f.kind == typeFloat || f.kind == typeDouble
+			return data.clone()
+		}
+
+		def value(column int) !any {
+			fail db.errorOf(db.ErrorKind.Type, "mysql: no row is current") unless onRow
+			fail db.errorOf(db.ErrorKind.Type, "mysql: the result has no column {column}") when column < 0 || column >= sizes.len()
+			return none when sizes[column] < 0
+			return valueOfCell(fields[column], binary, row[starts[column]:starts[column] + sizes[column]])
+		}
+
+		def close() !none {
+			return none when ended
+			ended = true
+			onRow = false
+			return none when conn.serial != serial || conn.closed
+			return drain(conn)
+		}
+
+		// The bytes of a column of the current row.
+		// Fails with ErrorKind.Type when no row is current, the index is out
+		// of range or the column is NULL.
+		def cell(column int) !byte[] {
+			fail db.errorOf(db.ErrorKind.Type, "mysql: no row is current") unless onRow
+			fail db.errorOf(db.ErrorKind.Type, "mysql: the result has no column {column}") when column < 0 || column >= sizes.len()
+			fail db.errorOf(db.ErrorKind.Type, "mysql: column '{cols[column].name}' is NULL") when sizes[column] < 0
+			return row[starts[column]:starts[column] + sizes[column]]
+		}
+
+		def mismatch(column int, wanted string) db.DbError {
+			return db.errorOf(db.ErrorKind.Type, "mysql: column '{cols[column].name}' ({cols[column].typeName}) does not read as {wanted}")
+		}
+	}
+
+	// Reads the next packet. A read that fails or runs out of time leaves
+	// the session mid-answer, so it closes the connection.
+	internal def receive(conn Connection) !none {
+		return conn.wire.read() onerror (err error) {
+			conn.closed = true
+			conn.phase = 0
+			conn.wire.stream.close() onerror recover none
+			fail err
+		}
+	}
+
+	// Reads what an OK packet reports.
+	internal def noteOk(conn Connection) {
+		let c = new Cursor(conn.wire.body)
+		c.get8()
+		conn.affected = c.lenenc()
+		conn.insertId = c.lenenc()
+		conn.status = c.get16()
+	}
+
+	// Reads the head of a statement's answer: an OK packet (0 columns), or
+	// the column count and the columns' definitions. Returns the number of
+	// columns.
+	// Fails with the server's error when the statement failed.
+	internal def header(conn Connection) !int {
+		try receive(conn)
+		let body = conn.wire.body
+		let first = int(body[0])
+		if first == 0xFF {
+			conn.phase = 0
+			fail serverError(body)
+		}
+		if first == 0 {
+			noteOk(conn)
+			conn.phase = (conn.status & 8) != 0 ?? (2, 0)
+			return 0
+		}
+		if first == 0xFB {
+			// LOAD DATA LOCAL asks for a file of this machine: refused with
+			// an empty one.
+			try conn.wire.send(byte[])
+			return header(conn)
+		}
+		let c = new Cursor(body)
+		let count = c.lenenc()
+		let fields Field[]
+		for let i = 0; i < count; i++ {
+			try receive(conn)
+			fields.push(fieldOf(conn.wire.body))
+		}
+		try receive(conn) unless conn.deprecateEof
+		conn.fields = fields
+		conn.phase = 1
+		return count
+	}
+
+	// Reads the next packet of a result's rows: true when it is a row
+	// (left in the wire's body), false at the end of the rows.
+	internal def rowPacket(conn Connection) !bool {
+		try receive(conn)
+		let body = conn.wire.body
+		let first = int(body[0])
+		if first == 0xFF {
+			conn.phase = 0
+			fail serverError(body)
+		}
+		if first == 0xFE && body.len() < 9 && !conn.deprecateEof {
+			let c = new Cursor(body)
+			c.get8()
+			c.get16()
+			conn.status = c.get16()
+			conn.phase = (conn.status & 8) != 0 ?? (2, 0)
+			return false
+		}
+		if first == 0xFE && body.len() < maxPayload && conn.deprecateEof {
+			noteOk(conn)
+			conn.phase = (conn.status & 8) != 0 ?? (2, 0)
+			return false
+		}
+		return true
+	}
+
+	// Reads and drops what is left of a statement's answer.
+	internal def drain(conn Connection) !none {
+		for conn.phase != 0 {
+			if conn.phase == 1 {
+				for try rowPacket(conn) {
+					continue
+				}
+				continue
+			}
+			try header(conn)
+		}
+		return none
+	}
+
+	// Makes the connection ready for a new statement: open, with the answer
+	// of the one before read to its end and its one-off statement dropped.
+	internal def ready(conn Connection) !none {
+		fail db.errorOf(db.ErrorKind.Closed, "mysql: the connection is closed") when conn.closed
+		try drain(conn)
+		conn.serial++
+		if conn.dropping != 0 {
+			let id = conn.dropping
+			conn.dropping = 0
+			try drop(conn, id)
+		}
+		conn.wire.command()
+		return none
+	}
+
+	// Drops a prepared statement on the server; it sends no answer.
+	internal def drop(conn Connection, id int) !none {
+		let p = new Packet()
+		p.put8(0x19)
+		p.put32(id)
+		conn.wire.command()
+		return conn.wire.send(p.data)
+	}
+
+	// Reads every result of a statement to the end and returns what the
+	// statements changed between them.
+	internal def outcome(conn Connection) !db.Result {
+		let changed = 0
+		let inserted = 0
+		for conn.phase != 0 {
+			if conn.phase == 1 {
+				for try rowPacket(conn) {
+					continue
+				}
+				continue
+			}
+			let columns = try header(conn)
+			if columns == 0 {
+				changed += conn.affected
+				// The key of the last statement that generated one.
+				inserted = conn.insertId when conn.insertId != 0
+			}
+		}
+		return db.Result{affected: changed, lastInsertId: inserted}
+	}
+
+	// Runs text without arguments and reads its outcome.
+	internal def text(conn Connection, statement string) !db.Result {
+		try ready(conn)
+		let p = new Packet()
+		p.put8(0x03)
+		p.bytes(statement.bytes())
+		try conn.wire.send(p.data)
+		conn.binary = false
+		conn.insertId = 0
+		conn.phase = 2
+		return outcome(conn)
+	}
+
+	// Prepares a statement and returns its id and how many parameters it
+	// takes.
+	internal def compile(conn Connection, statement string) !(int, int) {
+		try ready(conn)
+		let p = new Packet()
+		p.put8(0x16)
+		p.bytes(statement.bytes())
+		try conn.wire.send(p.data)
+		try receive(conn)
+		fail serverError(conn.wire.body) when int(conn.wire.body[0]) == 0xFF
+		let c = new Cursor(conn.wire.body)
+		c.get8()
+		let id = c.get32()
+		let columns = c.get16()
+		let params = c.get16()
+		// The definitions of the parameters and of the columns follow, each
+		// list closed by an EOF packet on servers that still send one.
+		if params > 0 {
+			for let i = 0; i < params; i++ {
+				try receive(conn)
+			}
+			try receive(conn) unless conn.deprecateEof
+		}
+		if columns > 0 {
+			for let i = 0; i < columns; i++ {
+				try receive(conn)
+			}
+			try receive(conn) unless conn.deprecateEof
+		}
+		return (id, params)
+	}
+
+	// Runs a prepared statement with its arguments; its answer is then to
+	// be read.
+	internal def run(conn Connection, id int, params int, args any[]) !none {
+		try ready(conn)
+		fail db.errorOf(db.ErrorKind.Type, "mysql: {args.len()} arguments for a statement that takes {params}") when args.len() != params
+		let bound Param[]
+		for let (i, arg) in args {
+			bound.push(try paramOf(arg, i + 1))
+		}
+
+		let p = new Packet()
+		p.put8(0x17)
+		p.put32(id)
+		p.put8(0)
+		p.put32(1)
+		if params > 0 {
+			let bitmap byte[]
+			bitmap.len((params + 7) / 8)
+			for let (i, b) in bound {
+				bitmap[i / 8] = byte(int(bitmap[i / 8]) | (1 << (i % 8))) when b.null
+			}
+			p.bytes(bitmap)
+			p.put8(1)
+			for let (_, b) in bound {
+				p.put8(b.kind)
+				p.put8(0)
+			}
+			for let (_, b) in bound {
+				p.bytes(b.data) unless b.null
+			}
+		}
+		try conn.wire.send(p.data)
+		conn.binary = true
+		conn.insertId = 0
+		conn.phase = 2
+		return none
+	}
+
+	// Runs a statement and reads its outcome: as text without arguments,
+	// through a one-off prepared statement with them.
+	internal def execute(conn Connection, statement string, args any[]) !db.Result {
+		return try text(conn, statement) when args.len() == 0
+		let (id, params) = try compile(conn, statement)
+		run(conn, id, params, args) onerror (err error) {
+			conn.dropping = id
+			fail err
+		}
+		conn.dropping = id
+		return outcome(conn)
+	}
+
+	// The rows of the answer being read: its first result, or no rows when
+	// the statement returned none.
+	internal def rowsOf(conn Connection) !Rows {
+		let columns = try header(conn)
+		return new Rows(conn, Field[], conn.binary) when columns == 0
+		return new Rows(conn, conn.fields, conn.binary)
+	}
+
+	// Runs a statement and returns its rows, positioned before the first.
+	internal def open(conn Connection, statement string, args any[]) !Rows {
+		if args.len() == 0 {
+			try ready(conn)
+			let p = new Packet()
+			p.put8(0x03)
+			p.bytes(statement.bytes())
+			try conn.wire.send(p.data)
+			conn.binary = false
+			conn.phase = 2
+			return rowsOf(conn)
+		}
+		let (id, params) = try compile(conn, statement)
+		run(conn, id, params, args) onerror (err error) {
+			conn.dropping = id
+			fail err
+		}
+		conn.dropping = id
+		return rowsOf(conn)
+	}
+}

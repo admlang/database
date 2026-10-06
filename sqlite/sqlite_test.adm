@@ -1,0 +1,421 @@
+partial module adm.database.sqlite {
+	use (
+		std.testing
+		std.data.db
+		std.os
+		std.time
+		std.reflection
+		std.services::(Application)
+	)
+
+	struct Person {
+		id int
+		name string
+		@db.column("mail")
+		email ?string
+		score float
+		active bool
+		@db.column(stored = db.Stored.Text)
+		created time.Time
+		photo byte[]
+	}
+
+	def people() !db.Connection {
+		let conn = try db.connect("sqlite::memory:")
+		try conn.exec("CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE, mail TEXT, score REAL NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1, created TEXT, photo BLOB)")
+		return conn
+	}
+
+	def kindOfFailure(err error) db.ErrorKind {
+		return err.kind when err is db.DbError
+		return db.ErrorKind.Other
+	}
+
+	check "Connect" {
+		@test()
+		def TestSchemeIsRegistered() !none {
+			assert db.drivers().includes("sqlite")
+			assert db.drivers().includes("sqlite3")
+			assert version().startsWith("3.")
+		}
+
+		@test()
+		def TestFileDatabaseAndModes() !none {
+			let path = (try Application.home()) + "/sqlite-test.db"
+			if try os.exists(path) {
+				try os.remove(path)
+			}
+			let conn = try db.connect("sqlite://" + path)
+			try conn.exec("CREATE TABLE t (a INTEGER)")
+			let res = try conn.exec("INSERT INTO t VALUES (?), (?)", 1, 2)
+			assert res.affected == 2
+			try conn.close()
+			try conn.close()
+
+			let kind = db.ErrorKind.Other
+			conn.exec("SELECT 1") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover db.Result{affected: 0, lastInsertId: 0}
+			}
+			assert kind == db.ErrorKind.Closed
+
+			let ro = try db.connect("sqlite://" + path + "?mode=ro")
+			let rows = try ro.query("SELECT sum(a) FROM t")
+			assert try rows.next()
+			assert try rows.int(0) == 3
+			try rows.close()
+			kind = db.ErrorKind.Other
+			ro.exec("INSERT INTO t VALUES (3)") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover db.Result{affected: 0, lastInsertId: 0}
+			}
+			assert kind == db.ErrorKind.Denied
+			try ro.close()
+
+			kind = db.ErrorKind.Other
+			db.connect("sqlite:///no/such/folder/x.db?mode=rw") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover ro
+			}
+			assert kind == db.ErrorKind.Connection
+
+			let direct = try open(path, Mode.ReadWrite)
+			try direct.ping()
+			// With nothing running there is nothing to stop.
+			direct.interrupt()
+			try direct.ping()
+			try direct.close()
+			try os.remove(path)
+		}
+
+		@test()
+		def TestUrlOptions() !none {
+			let conn = try db.connect("sqlite:ignored.db?mode=memory&foreign_keys=on&busy_timeout=100")
+			try conn.exec("CREATE TABLE parent (id INTEGER PRIMARY KEY); CREATE TABLE child (p INTEGER REFERENCES parent(id))")
+			let kind = db.ErrorKind.Other
+			conn.exec("INSERT INTO child VALUES (5)") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover db.Result{affected: 0, lastInsertId: 0}
+			}
+			assert kind == db.ErrorKind.Constraint
+
+			let message = ""
+			db.connect("sqlite::memory:?nonsense=1") onerror (err error) {
+				message = err.message
+				recover conn
+			}
+			assert message == "sqlite: unknown option 'nonsense'"
+			message = ""
+			db.connect("sqlite::memory:?journal_mode=wal;drop") onerror (err error) {
+				message = err.message
+				recover conn
+			}
+			assert message.startsWith("sqlite: 'wal;drop' is not a value")
+		}
+	}
+
+	check "Statements" {
+		@test()
+		def TestInsertAndReadEveryType() !none {
+			let conn = try people()
+			let photo byte[] = [0, 1, 2, 255]
+			let res = try conn.exec("INSERT INTO people (name, mail, score, active, created, photo) VALUES (?, ?, ?, ?, ?, ?)", "Ana", none, 9.5, true, try time.parse("2026-10-06T12:30:00Z"), photo)
+			assert res.affected == 1
+			assert res.lastInsertId == 1
+			try conn.exec("INSERT INTO people (name, mail, score) VALUES (?, ?, ?)", "Żółw 🐢", "z@example.com", 3)
+
+			let rows = try conn.query("SELECT id, name, mail, score, active, created, photo, 9223372036854775807 AS big FROM people ORDER BY id")
+			let cols = rows.columns()
+			assert cols.len() == 8
+			assert cols[1].name == "name"
+			assert cols[1].typeName == "TEXT"
+			assert !cols[1].nullable
+			assert cols[2].nullable
+			assert cols[7].name == "big"
+			assert cols[7].typeName == ""
+
+			assert try rows.next()
+			assert try rows.int(0) == 1
+			let first = try rows.string(1)
+			assert rows.isNull(2)
+			assert !rows.isNull(1)
+			assert try rows.float(3) == 9.5
+			assert try rows.bool(4)
+			assert try rows.string(5) == "2026-10-06T12:30:00Z"
+			let got = try rows.bytes(6)
+			assert got.hex() == "000102FF"
+			assert try rows.int(7) == 9223372036854775807
+			assert try rows.string(0) == "1"
+			assert try rows.float(0) == 1.0
+
+			let kind = db.ErrorKind.Other
+			rows.int(1) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover 0
+			}
+			assert kind == db.ErrorKind.Type
+			kind = db.ErrorKind.Other
+			rows.string(2) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover ""
+			}
+			assert kind == db.ErrorKind.Type
+			kind = db.ErrorKind.Other
+			rows.int(20) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover 0
+			}
+			assert kind == db.ErrorKind.Type
+
+			assert try rows.next()
+			// The first row's text was copied, not borrowed from the engine.
+			assert first == "Ana"
+			assert try rows.string(1) == "Żółw 🐢"
+			assert try rows.string(2) == "z@example.com"
+			assert try rows.float(3) == 3.0
+			assert reflection.typeName(try rows.value(0)) == "int"
+			assert reflection.typeName(try rows.value(1)) == "string"
+			assert reflection.typeName(try rows.value(3)) == "float"
+			assert rows.isNull(6)
+			assert !(try rows.next())
+			assert !(try rows.next())
+			try rows.close()
+			try conn.close()
+		}
+
+		@test()
+		def TestNamedAndNumberedPlaceholders() !none {
+			let conn = try people()
+			let named = new map<string, any>()
+			named.set("name", "Ana")
+			named.set("@score", 7)
+			try conn.exec("INSERT INTO people (name, score, mail) VALUES (:name, @score, ?)", named, "a@example.com")
+
+			let rows = try conn.query("SELECT name, score, mail FROM people WHERE name = ?2 AND score > ?1", 5, "Ana")
+			assert try rows.next()
+			assert try rows.string(2) == "a@example.com"
+			try rows.close()
+
+			let message = ""
+			conn.exec("INSERT INTO people (name) VALUES (:missing)", named) onerror (err error) {
+				message = err.message
+				recover db.Result{affected: 0, lastInsertId: 0}
+			}
+			assert message == "sqlite: no argument named 'missing'"
+
+			let kind = db.ErrorKind.Other
+			conn.exec("INSERT INTO people (name) VALUES (?)", "a", "b") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover db.Result{affected: 0, lastInsertId: 0}
+			}
+			assert kind == db.ErrorKind.Type
+			kind = db.ErrorKind.Other
+			conn.query("SELECT ?, ?", 1) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover try conn.query("SELECT 1")
+			}
+			assert kind == db.ErrorKind.Type
+		}
+
+		@test()
+		def TestSeveralStatementsShareTheArguments() !none {
+			let conn = try people()
+			let res = try conn.exec("INSERT INTO people (name) VALUES (?); INSERT INTO people (name, score) VALUES (?, ?); -- done\n", "a", "b", 2.5)
+			assert res.affected == 2
+			assert res.lastInsertId == 2
+
+			let kind = db.ErrorKind.Other
+			conn.query("SELECT 1; SELECT 2") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover try conn.query("SELECT 1")
+			}
+			assert kind == db.ErrorKind.Syntax
+		}
+
+		@test()
+		def TestErrorsCarryKindAndCode() !none {
+			let conn = try people()
+			try conn.exec("INSERT INTO people (name) VALUES ('Ana')")
+
+			let kind = db.ErrorKind.Other
+			let native = 0
+			let message = ""
+			conn.exec("INSERT INTO people (name) VALUES ('Ana')") onerror (err error) {
+				if err is db.DbError {
+					kind = err.kind
+					native = err.native
+				}
+				message = err.message
+				recover db.Result{affected: 0, lastInsertId: 0}
+			}
+			assert kind == db.ErrorKind.Constraint
+			assert native == 2067
+			assert message == "sqlite: UNIQUE constraint failed: people.name"
+
+			kind = db.ErrorKind.Other
+			conn.exec("SELEC 1") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover db.Result{affected: 0, lastInsertId: 0}
+			}
+			assert kind == db.ErrorKind.Syntax
+
+			kind = db.ErrorKind.Other
+			conn.query("SELECT * FROM nowhere") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover try conn.query("SELECT 1")
+			}
+			assert kind == db.ErrorKind.Syntax
+
+			kind = db.ErrorKind.Other
+			conn.exec("INSERT INTO people (name) VALUES (?)", conn) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover db.Result{affected: 0, lastInsertId: 0}
+			}
+			assert kind == db.ErrorKind.Type
+		}
+
+		@test()
+		def TestZeroByteInTextAndEmptyValues() !none {
+			let conn = try people()
+			let none0 byte[]
+			try conn.exec("INSERT INTO people (name, mail, photo) VALUES (CAST(x'610062' AS TEXT), ?, ?)", "", none0)
+			let rows = try conn.query("SELECT name, mail, photo FROM people")
+			assert try rows.next()
+			let back = try rows.bytes(0)
+			assert back.hex() == "610062"
+			assert try rows.string(1) == ""
+			assert !rows.isNull(1)
+			assert !rows.isNull(2)
+			let photo = try rows.bytes(2)
+			assert photo.len() == 0
+			try rows.close()
+		}
+
+		@test()
+		def TestPreparedStatementRunsManyTimes() !none {
+			let conn = try people()
+			let insert = try conn.prepare("INSERT INTO people (name, score) VALUES (?, ?)")
+			for let i = 0; i < 100; i++ {
+				let res = try insert.exec("p{i}", i)
+				assert res.affected == 1
+			}
+			try insert.close()
+			try insert.close()
+
+			let find = try conn.prepare("SELECT name FROM people WHERE score >= :low ORDER BY score LIMIT 2")
+			let named = new map<string, any>()
+			named.set("low", 50)
+			let a = try find.query(named)
+			assert try a.next()
+			assert try a.string(0) == "p50"
+
+			named.set("low", 98)
+			let b = try find.query(named)
+			let kind = db.ErrorKind.Other
+			a.next() onerror (err error) {
+				kind = kindOfFailure(err)
+				recover false
+			}
+			assert kind == db.ErrorKind.Closed
+			assert try b.next()
+			assert try b.string(0) == "p98"
+			assert try b.next()
+			assert !(try b.next())
+
+			try find.close()
+			kind = db.ErrorKind.Other
+			find.exec() onerror (err error) {
+				kind = kindOfFailure(err)
+				recover db.Result{affected: 0, lastInsertId: 0}
+			}
+			assert kind == db.ErrorKind.Closed
+		}
+	}
+
+	check "Transactions" {
+		@test()
+		def TestCommitAndRollback() !none {
+			let conn = try people()
+			let tx = try conn.beginTx()
+			try tx.exec("INSERT INTO people (name) VALUES (?)", "kept")
+			try tx.commitTx()
+
+			let kind = db.ErrorKind.Other
+			tx.exec("INSERT INTO people (name) VALUES ('late')") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover db.Result{affected: 0, lastInsertId: 0}
+			}
+			assert kind == db.ErrorKind.Closed
+
+			let undo = try conn.beginTx(db.Isolation.Serializable)
+			try undo.exec("INSERT INTO people (name) VALUES (?)", "dropped")
+			let inside = try undo.query("SELECT count(*) FROM people")
+			assert try inside.next()
+			assert try inside.int(0) == 2
+			try inside.close()
+			try undo.rollbackTx()
+			try undo.rollbackTx()
+
+			let rows = try conn.query("SELECT name FROM people")
+			assert try rows.next()
+			assert try rows.string(0) == "kept"
+			assert !(try rows.next())
+		}
+
+		@test()
+		def TestOneTransactionAtATimeAndReadOnly() !none {
+			let conn = try people()
+			let tx = try conn.beginTx()
+			let message = ""
+			conn.beginTx() onerror (err error) {
+				message = err.message
+				recover tx
+			}
+			assert message == "sqlite: a transaction is already open on this connection"
+			try tx.rollbackTx()
+
+			let reader = try conn.beginTx(db.Isolation.Default, true)
+			let kind = db.ErrorKind.Other
+			reader.exec("INSERT INTO people (name) VALUES ('x')") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover db.Result{affected: 0, lastInsertId: 0}
+			}
+			assert kind == db.ErrorKind.Denied
+			try reader.commitTx()
+			let res = try conn.exec("INSERT INTO people (name) VALUES ('y')")
+			assert res.affected == 1
+		}
+	}
+
+	check "Objects" {
+		@test()
+		def TestValuesInsertAndReadBack() !none {
+			let conn = try people()
+			let p = Person{id: 7, name: "Ana", email: "ana@example.com", score: 4.25, active: true, created: try time.parse("2026-10-06T12:30:00Z"), photo: [1, 2, 3]}
+			try conn.exec("INSERT INTO people (id, name, mail, score, active, created, photo) VALUES (:id, :name, :mail, :score, :active, :created, :photo)", db.values(p))
+			let q = Person{id: 8, name: "Bob", email: none, score: 0.0, active: false, created: try time.parse("2026-01-01T00:00:00Z"), photo: byte[]}
+			try conn.exec("INSERT INTO people (id, name, mail, score, active, created, photo) VALUES (:id, :name, :mail, :score, :active, :created, :photo)", db.values(q))
+
+			let all = try db.readAll<Person>(try conn.query("SELECT * FROM people ORDER BY id"))
+			assert all.len() == 2
+			assert all[0].id == 7
+			assert all[0].name == "Ana"
+			assert all[0].score == 4.25
+			assert all[0].active
+			assert all[0].created.str() == "2026-10-06T12:30:00Z"
+			assert all[0].photo.hex() == "010203"
+			let mail = all[0].email
+			fail "expected an address" when mail is none
+			assert mail == "ana@example.com"
+			assert all[1].email is none
+			assert !all[1].active
+			assert all[1].photo.len() == 0
+
+			let rows = try conn.query("SELECT * FROM people WHERE id = ?", 8)
+			assert try rows.next()
+			let one = try db.read<Person>(rows)
+			assert one.name == "Bob"
+			try rows.close()
+		}
+	}
+}

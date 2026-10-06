@@ -1,0 +1,358 @@
+// MySQL and MariaDB for std.data.db. Linking this library registers the
+// `mysql:` and `mariadb:` schemes, so
+// `db.connect("mysql://app:secret@db.internal:3306/shop")` opens a session
+// with a server over the network.
+partial module adm.database.mysql {
+	use (
+		std.crypto
+		std.crypto.hash
+		std.data.db
+		std.data.encoding
+		std.net
+		std.net.tls
+		std.net.url
+		adm.database.mysql.wire::*
+	)
+
+	// MySQL is the driver of the `mysql:` and `mariadb:` schemes.
+	//
+	//     mysql://user:password@host:3306/database?sslmode=verify-full
+	//
+	// The port is 3306 when left out; the database may be left out. Text is
+	// exchanged as utf8mb4. Options in the query:
+	//
+	// - `sslmode`: `disable` (no TLS), `prefer` (TLS when the server offers
+	//   it, the default), `require` (TLS, certificate not checked),
+	//   `verify-ca` and `verify-full` (TLS with the certificate checked
+	//   against the system's authorities and the host name).
+	// - `connect_timeout`: seconds to wait for the connection, 30 by default.
+	// - `read_timeout`: seconds a statement may take to answer, 0 for no
+	//   limit (the default); past it the statement fails with
+	//   ErrorKind.TimedOut and the connection closes.
+	// - `multi_statements`: `true` lets `exec` and `query` without
+	//   arguments run several statements separated by `;` (off by default,
+	//   as on the server's other clients).
+	// - `found_rows`: `true` makes an UPDATE count the rows it matched, not
+	//   only those it changed.
+	//
+	// The password is checked with `caching_sha2_password`,
+	// `mysql_native_password`, `sha256_password` or `mysql_clear_password`
+	// (this one over TLS only), whichever the server asks for.
+	@db.driver("mysql", "mariadb")
+	type MySQL {
+		def new() {}
+
+		// placeholder returns Placeholder.Question.
+		def placeholder() db.Placeholder {
+			return db.Placeholder.Question
+		}
+
+		// connect opens a session with the server the URL names.
+		// Fails with a DbError: ErrorKind.Connection when the server cannot
+		// be reached or TLS fails, ErrorKind.Denied when it refuses the user
+		// or password, ErrorKind.Other for an option it does not know.
+		def connect(target url.URL) !db.Connection {
+			return try dial(target)
+		}
+	}
+
+	// open opens a session with the server a `mysql:` URL names and returns
+	// it as its own type, for what MySQL has beyond std.data.db:
+	// `interrupt`, `serverVersion`, `threadId`.
+	// Fails with a DbError as `MySQL.connect` does, and with a UrlError when
+	// the text is not a URL.
+	def open(target string) !Connection {
+		return dial(try url.parse(target))
+	}
+
+	// Capability flags of the handshake.
+	internal const capLongPassword = 0x1
+	internal const capFoundRows = 0x2
+	internal const capLongFlag = 0x4
+	internal const capConnectWithDb = 0x8
+	internal const capProtocol41 = 0x200
+	internal const capSsl = 0x800
+	internal const capTransactions = 0x2000
+	internal const capSecureConnection = 0x8000
+	internal const capMultiStatements = 0x10000
+	internal const capMultiResults = 0x20000
+	internal const capPsMultiResults = 0x40000
+	internal const capPluginAuth = 0x80000
+	internal const capPluginAuthLenenc = 0x200000
+	internal const capDeprecateEof = 0x1000000
+
+	// utf8mb4_general_ci, known to every server version.
+	internal const charsetUtf8mb4 = 45
+
+	// Login is what the password exchange needs at each step.
+	struct Login {
+		user     string
+		password string
+		// The method the server asked for and its challenge.
+		method   string
+		scramble byte[]
+		// Whether the stream is under TLS: a password may then travel as
+		// text.
+		secure   bool
+	}
+
+	// Opens and authenticates a session.
+	internal def dial(target url.URL) !Connection {
+		let host = target.hostname()
+		host = "localhost" when host == ""
+		let port = target.port()
+		port = 3306 when port <= 0
+
+		let user = ""
+		let password = ""
+		let info = target.user
+		if !(info is none) {
+			user = info.username
+			let given = info.password
+			password = given unless given is none
+		}
+		let database = target.path
+		database = database.slice(1, database.len()) when database.startsWith("/")
+
+		let mode = "prefer"
+		let timeout = 30s
+		let reads = 0s
+		let multi = false
+		let found = false
+		for let (_, pair) in target.query().pairs() {
+			match pair.key {
+				case "sslmode":
+					fail db.errorOf(db.ErrorKind.Other, "mysql: sslmode '{pair.value}' is not disable, prefer, require, verify-ca or verify-full") unless pair.value := "disable" || "prefer" || "require" || "verify-ca" || "verify-full"
+					mode = pair.value
+				case "connect_timeout":
+					fail db.errorOf(db.ErrorKind.Other, "mysql: connect_timeout '{pair.value}' is not a number of seconds") unless /^[0-9]{1,6}$/.test(pair.value)
+					timeout = duration(pair.value.toInt<int>() * 1000000000)
+					timeout = 30s when timeout == 0s
+				case "read_timeout":
+					fail db.errorOf(db.ErrorKind.Other, "mysql: read_timeout '{pair.value}' is not a number of seconds") unless /^[0-9]{1,6}$/.test(pair.value)
+					reads = duration(pair.value.toInt<int>() * 1000000000)
+				case "multi_statements":
+					fail db.errorOf(db.ErrorKind.Other, "mysql: multi_statements '{pair.value}' is not true or false") unless pair.value := "true" || "false"
+					multi = pair.value == "true"
+				case "found_rows":
+					fail db.errorOf(db.ErrorKind.Other, "mysql: found_rows '{pair.value}' is not true or false") unless pair.value := "true" || "false"
+					found = pair.value == "true"
+				default:
+					fail db.errorOf(db.ErrorKind.Other, "mysql: unknown option '{pair.key}'")
+			}
+		}
+
+		let address = host.contains(":") ?? ("[{host}]:{port}", "{host}:{port}")
+		let socket = net.dialStream(address, timeout) onerror (err error) {
+			fail db.errorOf(db.ErrorKind.Connection, "mysql: {err.message}")
+		}
+		let plain net.Stream = socket
+		let wire = new Wire(plain, timeout)
+		let conn = new Connection(wire, target)
+		handshake(conn, socket, host, mode, user, password, database, multi, found) onerror (err error) {
+			wire.stream.close() onerror recover none
+			fail err
+		}
+		// A day stands for no limit: a read needs some bound.
+		wire.timeout = reads == 0s ?? (24h, reads)
+		return conn
+	}
+
+	// Reads the server's greeting, moves to TLS as the mode asks, sends the
+	// login and answers the password exchange up to the server's OK.
+	internal def handshake(conn Connection, socket net.Connection, host string, mode string, user string, password string, database string, multi bool, found bool) !none {
+		let wire = conn.wire
+		try wire.read()
+		fail refused(serverError(wire.body)) when int(wire.body[0]) == 0xFF
+
+		let c = new Cursor(wire.body)
+		let protocol = c.get8()
+		fail db.errorOf(db.ErrorKind.Connection, "mysql: the server speaks protocol {protocol}, this driver protocol 10") when protocol != 10
+		conn.version = c.text()
+		conn.thread = c.get32()
+		let scramble = c.take(8).clone()
+		c.get8()
+		let caps = c.get16()
+		let method = "mysql_native_password"
+		if c.more() {
+			c.get8()
+			c.get16()
+			caps = caps | (c.get16() << 16)
+			let size = c.get8()
+			c.take(10)
+			if (caps & capSecureConnection) != 0 {
+				let rest = size - 8
+				rest = 13 when rest < 13
+				// The second part ends in a zero byte that is no part of
+				// the challenge.
+				scramble.push(...c.take(rest)[0:rest - 1])
+			}
+			method = c.text() when (caps & capPluginAuth) != 0 && c.more()
+		}
+		fail db.errorOf(db.ErrorKind.Connection, "mysql: the server is older than 4.1") when (caps & capProtocol41) == 0
+		conn.deprecateEof = (caps & capDeprecateEof) != 0
+
+		let mine = capLongPassword | capLongFlag | capProtocol41 | capTransactions | capSecureConnection | capMultiResults | capPsMultiResults | capPluginAuth | capPluginAuthLenenc
+		mine = mine | capDeprecateEof when conn.deprecateEof
+		mine = mine | capConnectWithDb when database != ""
+		mine = mine | capMultiStatements when multi
+		mine = mine | capFoundRows when found
+
+		let secure = false
+		if mode != "disable" {
+			if (caps & capSsl) == 0 {
+				fail db.errorOf(db.ErrorKind.Connection, "mysql: the server does not offer TLS and sslmode is {mode}") unless mode == "prefer"
+			} else {
+				mine = mine | capSsl
+				let request = new Packet()
+				request.put32(mine)
+				request.put32(0x1000000)
+				request.put8(charsetUtf8mb4)
+				request.zeros(23)
+				try wire.send(request.data)
+				fail db.errorOf(db.ErrorKind.Connection, "mysql: unexpected data before the TLS handshake") when wire.buffered() > 0
+
+				let config = tls.Config{}
+				config.serverName = host
+				config.insecureSkipVerify = mode := "prefer" || "require"
+				let secured = tls.client(socket, config)
+				secured.handshake(wire.timeout) onerror (err error) {
+					fail db.errorOf(db.ErrorKind.Connection, "mysql: TLS: {err.message}")
+				}
+				let stream net.Stream = secured
+				wire.stream = stream
+				secure = true
+			}
+		}
+
+		let login = Login{user: user, password: password, method: method, scramble: scramble, secure: secure}
+		let response = new Packet()
+		response.put32(mine)
+		response.put32(0x1000000)
+		response.put8(charsetUtf8mb4)
+		response.zeros(23)
+		response.text(user)
+		response.sized(try firstAnswer(login))
+		response.text(database) when database != ""
+		response.text(method)
+		try wire.send(response.data)
+
+		for {
+			try wire.read()
+			let first = int(wire.body[0])
+			return none when first == 0
+			fail refused(serverError(wire.body)) when first == 0xFF
+			if first == 0xFE {
+				// The server wants another method: its name and a new
+				// challenge follow.
+				let s = new Cursor(wire.body)
+				s.get8()
+				login.method = s.text()
+				let data = s.rest()
+				let size = data.len()
+				size = size - 1 when size > 0 && int(data[size - 1]) == 0
+				login.scramble = data[0:size].clone()
+				try wire.send(try firstAnswer(login))
+				continue
+			}
+			if first == 1 {
+				try moreData(wire, login, wire.body[1:wire.body.len()].clone())
+				continue
+			}
+			fail db.errorOf(db.ErrorKind.Connection, "mysql: unexpected packet {first} during the login")
+		}
+		fail db.errorOf(db.ErrorKind.Connection, "mysql: the login did not finish")
+	}
+
+	// A refusal during the login is about who is connecting, whatever the
+	// server's number for it.
+	internal def refused(failure db.DbError) db.DbError {
+		return failure unless failure.kind == db.ErrorKind.Other || failure.kind == db.ErrorKind.Syntax
+		return db.errorOf(db.ErrorKind.Denied, failure.message, failure.sqlState, failure.native)
+	}
+
+	// The first answer to a method's challenge.
+	// Fails with a DbError of ErrorKind.Denied for a method this driver does
+	// not have, or one that would send the password in clear without TLS.
+	internal def firstAnswer(login Login) !byte[] {
+		match login.method {
+			case "mysql_native_password":
+				return byte[] when login.password == ""
+				// SHA1(password) XOR SHA1(challenge + SHA1(SHA1(password)))
+				let stage1 = hash.digest(hash.Hash.SHA1, login.password.bytes())
+				let stage2 = hash.digest(hash.Hash.SHA1, stage1)
+				let mixed = login.scramble.clone()
+				mixed.push(...stage2)
+				return xor(stage1, hash.digest(hash.Hash.SHA1, mixed))
+			case "caching_sha2_password":
+				return byte[] when login.password == ""
+				// SHA256(password) XOR SHA256(SHA256(SHA256(password)) + challenge)
+				let stage1 = hash.digest(hash.Hash.SHA256, login.password.bytes())
+				let stage2 = hash.digest(hash.Hash.SHA256, stage1)
+				let mixed = stage2.clone()
+				mixed.push(...login.scramble)
+				return xor(stage1, hash.digest(hash.Hash.SHA256, mixed))
+			case "sha256_password":
+				return byte[0] when login.password == ""
+				return clearPassword(login.password) when login.secure
+				// Asks for the server's public key.
+				return byte[1]
+			case "mysql_clear_password":
+				fail db.errorOf(db.ErrorKind.Denied, "mysql: the server asks for the password as text, which this driver sends over TLS only") unless login.secure
+				return clearPassword(login.password)
+			default:
+				fail db.errorOf(db.ErrorKind.Denied, "mysql: the server asks for the login method '{login.method}', which this driver does not have")
+		}
+	}
+
+	// Answers a method's follow-up: the outcome of the cached check, or the
+	// server's public key to encrypt the password to.
+	internal def moreData(wire Wire, login Login, data byte[]) !none {
+		if login.method == "caching_sha2_password" && data.len() == 1 {
+			// 3: the server knew the password's hash, its OK follows.
+			return none when int(data[0]) == 3
+			fail db.errorOf(db.ErrorKind.Connection, "mysql: unexpected answer {int(data[0])} to the login") when int(data[0]) != 4
+			// 4: it needs the password itself, protected by TLS or by its
+			// public key.
+			return wire.send(clearPassword(login.password)) when login.secure
+			return wire.send(byte[2])
+		}
+		fail db.errorOf(db.ErrorKind.Denied, "mysql: unexpected data in the '{login.method}' login") unless login.method := "caching_sha2_password" || "sha256_password"
+
+		let block = encoding.pemDecode(string(data)) onerror (err error) {
+			fail db.errorOf(db.ErrorKind.Connection, "mysql: the server's public key does not parse: {err.message}")
+		}
+		let key = crypto.parsePKIXPublicKey(block.bytes) onerror (err error) {
+			fail db.errorOf(db.ErrorKind.Connection, "mysql: the server's public key does not parse: {err.message}")
+		}
+		if key is crypto.RSAPublicKey {
+			// The password and its closing zero, XORed with the challenge
+			// repeated, under RSA-OAEP with SHA-1.
+			let plain = clearPassword(login.password)
+			for let (i, b) in plain {
+				plain[i] = byte(int(b) ^ int(login.scramble[i % login.scramble.len()]))
+			}
+			let sealed = key.encrypt(plain, crypto.RSAPadding.OAEP, hash.Hash.SHA1) onerror (err error) {
+				fail db.errorOf(db.ErrorKind.Connection, "mysql: cannot encrypt the password to the server's key: {err.message}")
+			}
+			return wire.send(sealed)
+		}
+		fail db.errorOf(db.ErrorKind.Connection, "mysql: the server's public key is not an RSA key")
+	}
+
+	// The password with its closing zero byte.
+	internal def clearPassword(password string) byte[] {
+		let out = password.bytes()
+		out.push(byte(0))
+		return out
+	}
+
+	internal def xor(a byte[], b byte[]) byte[] {
+		let out byte[]
+		out.len(a.len())
+		for let (i, x) in a {
+			out[i] = byte(int(x) ^ int(b[i]))
+		}
+		return out
+	}
+}

@@ -1,0 +1,12 @@
+SQLite 3.53.4, the amalgamation (sqlite-amalgamation-3530400.zip).
+https://www.sqlite.org/2026/sqlite-amalgamation-3530400.zip
+License: public domain (https://www.sqlite.org/copyright.html).
+
+sha3-256  628a44cfe82c66aed1ccbbe85a562d2e33ebe64b3288981ed76285612227934e  sqlite-amalgamation-3530400.zip
+sha256    1e71ddf93849c6a6ecf58b827c0692073d2dd7ee40196158068f7b29f422e87d  sqlite-amalgamation-3530400.zip
+sha256    b1dd5d74ec7f29055a6684fa06fb3c2f6821c87dd38f9a458dfd2e8a1db28189  sqlite3.inc
+
+sqlite3.inc is the archive's sqlite3.c, unmodified. It carries another
+extension so that a build compiles it only through ../adm_sqlite.c, which
+sets SQLite's compile-time options before including it. adm_sqlite.c is not
+part of SQLite.

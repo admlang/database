@@ -1,0 +1,24 @@
+# adm.toml
+#
+# Manifest of the adm.database.sqlite library. The [publisher] section is
+# written by `adm app init` with the publisher's key.
+
+schema = 1
+
+# What ships beside the sources: the engine's C, compiled into every program
+# that uses the library.
+[[package.files]]
+from = "adm_sqlite.c"
+to = "adm_sqlite.c"
+
+[[package.files]]
+from = "sqlite/sqlite3.inc"
+to = "sqlite/sqlite3.inc"
+
+[[package.files]]
+from = "sqlite/UPSTREAM"
+to = "sqlite/UPSTREAM"
+
+[publisher]
+pubkey = "ed25519:base64:ZcfhD3m1jmc/pabbwU8U1XL8wQxCBia6+HCVV14aq50="
+repo_salt = "base64:MnZ5LN9BHqKTSVjhJ26IHRLR4ygMMcXDiDNCLhYY3ZY="

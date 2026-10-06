@@ -1,0 +1,482 @@
+partial module adm.database.sqlite {
+	use (
+		std.data.db
+		adm.database.sqlite.engine::*
+		adm.database.sqlite.session::*
+	)
+
+	// Connection is one open SQLite database. It implements
+	// std.data.db.Connection; `interrupt` is SQLite's own.
+	//
+	// A statement's text may hold several statements separated by `;` for
+	// `exec`: each runs in turn, taking its share of the positional
+	// arguments. `query` and `prepare` take one.
+	type Connection {
+		// The engine's handle; 0 once closed.
+		handle uint
+
+		def new(handle uint) {
+			self.handle = handle
+		}
+
+		// placeholder implements std.data.db.Queryable.
+		def placeholder() db.Placeholder {
+			return db.Placeholder.Question
+		}
+
+		// exec implements std.data.db.Queryable.
+		// Fails with a DbError when the database rejects the statement, an
+		// argument cannot be bound, or the connection is closed or lost.
+		def exec(statement string, args ...any) !db.Result {
+			return execAll(self, statement, noNames, args)
+		}
+
+		// exec implements std.data.db.Queryable. Each `:name`, `@name` or
+		// `$name` in the text takes the entry of `named` under that name,
+		// with or without its prefix; `?` takes the next of `args`.
+		// Fails with a DbError when the database rejects the statement, an
+		// argument cannot be bound, or the connection is closed or lost.
+		def exec(statement string, named map<string, any>, args ...any) !db.Result {
+			return execAll(self, statement, named, args)
+		}
+
+		// query implements std.data.db.Queryable.
+		// Fails with a DbError when the database rejects the statement, an
+		// argument cannot be bound, or the connection is closed or lost.
+		def query(statement string, args ...any) !db.Rows {
+			return try queryOne(self, statement, noNames, args)
+		}
+
+		// query implements std.data.db.Queryable, binding names as `exec`
+		// does.
+		// Fails with a DbError when the database rejects the statement, an
+		// argument cannot be bound, or the connection is closed or lost.
+		def query(statement string, named map<string, any>, args ...any) !db.Rows {
+			return try queryOne(self, statement, named, args)
+		}
+
+		// prepare implements std.data.db.Queryable.
+		// Fails with a DbError when the database rejects the statement, or the
+		// connection is closed or lost.
+		def prepare(statement string) !db.Statement {
+			let stmt = try compileOne(self, statement)
+			return new Statement(self, stmt)
+		}
+
+		// beginTx implements std.data.db.Connection. A transaction that may
+		// write takes the write lock at once (BEGIN IMMEDIATE), so it cannot
+		// fail halfway for a lock; a read-only one refuses writes. SQLite
+		// transactions are serializable whatever isolation is asked for.
+		// Fails with a DbError when a transaction is already open on the
+		// connection, or the connection is closed or lost.
+		def beginTx(isolation db.Isolation = db.Isolation.Default, readOnly bool = false) !db.Transaction {
+			try open()
+			fail db.errorOf(db.ErrorKind.Other, "sqlite: a transaction is already open on this connection") when asqAutocommit(handle) == 0
+			if readOnly {
+				try exec("BEGIN DEFERRED")
+				try exec("PRAGMA query_only = 1")
+			} else {
+				try exec("BEGIN IMMEDIATE")
+			}
+			return new Transaction(self, readOnly)
+		}
+
+		// ping implements std.data.db.Connection.
+		// Fails with a DbError when the database does not answer.
+		def ping() !none {
+			let rows = try query("SELECT 1")
+			return rows.close()
+		}
+
+		// close implements std.data.db.Connection. Rows and statements still
+		// open keep working until they are closed; the file is released
+		// with the last of them.
+		// Fails with a DbError when the database reports a failure while
+		// closing.
+		def close() !none {
+			return none when handle == 0
+			let rc = asqClose(handle)
+			handle = 0
+			fail db.errorOf(kindOf(rc), "sqlite: close: " + owned(asqErrorText(rc)), "", rc) when rc != 0
+			return none
+		}
+
+		// interrupt stops the statements running on this connection, from
+		// any task; each fails with ErrorKind.Other ("interrupted").
+		def interrupt() {
+			asqInterrupt(handle) unless handle == 0
+		}
+
+		// Fails with ErrorKind.Closed once the connection is closed.
+		def open() !none {
+			fail db.errorOf(db.ErrorKind.Closed, "sqlite: the connection is closed") when handle == 0
+			return none
+		}
+
+		def dispose() {
+			asqClose(handle) unless handle == 0
+			handle = 0
+		}
+	}
+
+	// Transaction is a SQLite transaction on its connection.
+	internal type Transaction {
+		conn     Connection
+		readOnly bool
+		ended    bool
+
+		def new(conn Connection, readOnly bool) {
+			self.conn = conn
+			self.readOnly = readOnly
+		}
+
+		def placeholder() db.Placeholder {
+			return db.Placeholder.Question
+		}
+
+		def exec(statement string, args ...any) !db.Result {
+			try running()
+			return execAll(conn, statement, noNames, args)
+		}
+
+		def exec(statement string, named map<string, any>, args ...any) !db.Result {
+			try running()
+			return execAll(conn, statement, named, args)
+		}
+
+		def query(statement string, args ...any) !db.Rows {
+			try running()
+			return try queryOne(conn, statement, noNames, args)
+		}
+
+		def query(statement string, named map<string, any>, args ...any) !db.Rows {
+			try running()
+			return try queryOne(conn, statement, named, args)
+		}
+
+		def prepare(statement string) !db.Statement {
+			try running()
+			return conn.prepare(statement)
+		}
+
+		def commitTx() !none {
+			try running()
+			ended = true
+			let outcome = execAll(conn, "COMMIT", noNames, noArgs)
+			leave()
+			try outcome
+			return none
+		}
+
+		def rollbackTx() !none {
+			return none when ended
+			ended = true
+			return none when conn.handle == 0
+			// A failed statement may have ended the transaction already.
+			if asqAutocommit(conn.handle) == 0 {
+				let outcome = execAll(conn, "ROLLBACK", noNames, noArgs)
+				leave()
+				try outcome
+				return none
+			}
+			leave()
+			return none
+		}
+
+		def running() !none {
+			fail db.errorOf(db.ErrorKind.Closed, "sqlite: the transaction has ended") when ended
+			return none
+		}
+
+		// Lets the connection write again after a read-only transaction.
+		def leave() {
+			return unless readOnly && conn.handle != 0
+			execAll(conn, "PRAGMA query_only = 0", noNames, noArgs) onerror recover db.Result{affected: 0, lastInsertId: 0}
+		}
+
+		def dispose() {
+			return when ended || conn.handle == 0
+			ended = true
+			if asqAutocommit(conn.handle) == 0 {
+				execAll(conn, "ROLLBACK", noNames, noArgs) onerror recover db.Result{affected: 0, lastInsertId: 0}
+			}
+			leave()
+		}
+	}
+
+	// Statement is a compiled SQLite statement. One set of rows is open on
+	// it at a time: running it again ends the rows of the run before.
+	internal type Statement {
+		conn   Connection
+		// The engine's statement; 0 once closed.
+		stmt   uint
+		// Counts the runs, so rows of an earlier run know they have ended.
+		serial int
+
+		def new(conn Connection, stmt uint) {
+			self.conn = conn
+			self.stmt = stmt
+		}
+
+		def exec(args ...any) !db.Result {
+			return try run(noNames, args)
+		}
+
+		def exec(named map<string, any>, args ...any) !db.Result {
+			return try run(named, args)
+		}
+
+		def query(args ...any) !db.Rows {
+			return try rows(noNames, args)
+		}
+
+		def query(named map<string, any>, args ...any) !db.Rows {
+			return try rows(named, args)
+		}
+
+		def close() !none {
+			return none when stmt == 0
+			asqFinalize(stmt)
+			stmt = 0
+			return none
+		}
+
+		def run(named map<string, any>, args any[]) !db.Result {
+			let rc = try start(named, args)
+			for rc == stepRow {
+				rc = asqNext(stmt)
+			}
+			let failure = rc == stepDone ?? (noFailure(), failed(conn.handle, rc))
+			let changed = asqReadOnly(stmt) == 1 ?? (0, asqChanges(conn.handle))
+			asqReset(stmt)
+			fail failure unless failure.message == ""
+			return db.Result{affected: changed, lastInsertId: asqLastInsertId(conn.handle)}
+		}
+
+		def rows(named map<string, any>, args any[]) !db.Rows {
+			let rc = try start(named, args)
+			if rc != stepRow && rc != stepDone {
+				let failure = failed(conn.handle, rc)
+				asqReset(stmt)
+				fail failure
+			}
+			return new Rows(conn, stmt, rc == stepRow, self)
+		}
+
+		// Binds the arguments and runs to the first row or the end.
+		def start(named map<string, any>, args any[]) !int {
+			fail db.errorOf(db.ErrorKind.Closed, "sqlite: the statement is closed") when stmt == 0
+			try conn.open()
+			serial++
+			asqReset(stmt)
+			let used = try bindAll(stmt, named, args, 0)
+			fail db.errorOf(db.ErrorKind.Type, "sqlite: {args.len()} arguments for a statement that takes {used}") when used != args.len()
+			return asqRun(stmt)
+		}
+
+		def dispose() {
+			asqFinalize(stmt) unless stmt == 0
+			stmt = 0
+		}
+	}
+
+	// Rows is the result of one run of a statement.
+	internal type Rows {
+		conn    Connection
+		stmt    uint
+		// Set while the first row is fetched and not yet handed out.
+		waiting bool
+		// Set while a row is current.
+		onRow   bool
+		ended   bool
+		// The prepared statement the rows come from, none when the rows own
+		// their statement and finalize it.
+		owner   ?Statement
+		serial  int
+		count   int
+		cols    db.Column[]
+		// Where text and blob columns are copied out of the engine.
+		scratch byte[]
+
+		def new(conn Connection, stmt uint, hasRow bool, owner ?Statement) {
+			self.conn = conn
+			self.stmt = stmt
+			self.owner = owner
+			serial = owner.serial unless owner is none
+			count = asqColumnCount(stmt)
+			scratch.len(256)
+			waiting = hasRow
+			// Without a first row there is nothing to read, yet the columns
+			// stay known until close.
+			for let i = 0; i < count; i++ {
+				cols.push(db.Column{name: owned(asqColumnName(stmt, i)), typeName: owned(asqColumnDeclared(stmt, i)), nullable: asqColumnNullable(conn.handle, stmt, i) == 1})
+			}
+		}
+
+		def columns() db.Column[] {
+			return cols
+		}
+
+		def next() !bool {
+			return false when ended
+			try live()
+			if waiting {
+				waiting = false
+				onRow = true
+				return true
+			}
+			if !onRow {
+				try close()
+				return false
+			}
+			let rc = asqNext(stmt)
+			return true when rc == stepRow
+			onRow = false
+			if rc != stepDone {
+				let failure = failed(conn.handle, rc)
+				try close()
+				fail failure
+			}
+			try close()
+			return false
+		}
+
+		def isNull(column int) bool {
+			return true unless onRow && column >= 0 && column < count
+			return asqColumnKind(stmt, column) == kindNull
+		}
+
+		def bool(column int) !bool {
+			let kind = try kindAt(column)
+			fail mismatch(column, kind, "bool") when kind != kindInteger
+			return asqColumnInt(stmt, column) != 0
+		}
+
+		def int(column int) !int {
+			let kind = try kindAt(column)
+			fail mismatch(column, kind, "int") when kind != kindInteger
+			return asqColumnInt(stmt, column)
+		}
+
+		def float(column int) !float {
+			let kind = try kindAt(column)
+			fail mismatch(column, kind, "float") unless kind == kindInteger || kind == kindFloat
+			return asqColumnFloat(stmt, column)
+		}
+
+		def string(column int) !string {
+			let kind = try kindAt(column)
+			match kind {
+				case 1:
+					return asqColumnInt(stmt, column).str()
+				case 2:
+					return asqColumnFloat(stmt, column).str()
+				default:
+					return string(copy(column))
+			}
+		}
+
+		def bytes(column int) !byte[] {
+			let kind = try kindAt(column)
+			fail mismatch(column, kind, "byte[]") unless kind == kindText || kind == kindBlob
+			return copy(column).clone()
+		}
+
+		def value(column int) !any {
+			fail db.errorOf(db.ErrorKind.Type, "sqlite: no row is current") unless onRow
+			fail db.errorOf(db.ErrorKind.Type, "sqlite: the result has no column {column}") when column < 0 || column >= count
+			try live()
+			match asqColumnKind(stmt, column) {
+				case 1:
+					return asqColumnInt(stmt, column)
+				case 2:
+					return asqColumnFloat(stmt, column)
+				case 3:
+					return string(copy(column))
+				case 4:
+					return copy(column).clone()
+				default:
+					return none
+			}
+		}
+
+		def close() !none {
+			return none when ended
+			ended = true
+			onRow = false
+			waiting = false
+			if owner is none {
+				asqFinalize(stmt)
+			} else if owner.stmt != 0 && owner.serial == serial {
+				asqReset(stmt)
+			}
+			stmt = 0
+			return none
+		}
+
+		// The storage class of a column of the current row.
+		// Fails with ErrorKind.Type when no row is current, the index is out
+		// of range or the column is NULL.
+		def kindAt(column int) !int {
+			fail db.errorOf(db.ErrorKind.Type, "sqlite: no row is current") unless onRow
+			fail db.errorOf(db.ErrorKind.Type, "sqlite: the result has no column {column}") when column < 0 || column >= count
+			try live()
+			let kind = asqColumnKind(stmt, column)
+			fail db.errorOf(db.ErrorKind.Type, "sqlite: column '{cols[column].name}' is NULL") when kind == kindNull
+			return kind
+		}
+
+		// Fails with ErrorKind.Closed when the prepared statement behind the
+		// rows was closed or run again.
+		def live() !none {
+			return none when owner is none
+			fail db.errorOf(db.ErrorKind.Closed, "sqlite: the statement was closed or run again") when owner.stmt == 0 || owner.serial != serial
+			return none
+		}
+
+		def mismatch(column int, kind int, wanted string) db.DbError {
+			return db.errorOf(db.ErrorKind.Type, "sqlite: column '{cols[column].name}' holds {kindName(kind)}, not {wanted}")
+		}
+
+		// The bytes of a text or blob column, in a buffer the rows reuse:
+		// good until the next column is read.
+		def copy(column int) byte[] {
+			let n = asqColumnCopy(stmt, column, scratch, scratch.len())
+			if n > scratch.len() {
+				scratch.len(n)
+				asqColumnCopy(stmt, column, scratch, n)
+			}
+			return scratch[0:n]
+		}
+
+		def dispose() {
+			return when ended || stmt == 0
+			if owner is none {
+				asqFinalize(stmt)
+			} else if owner.stmt != 0 && owner.serial == serial {
+				asqReset(stmt)
+			}
+			stmt = 0
+		}
+	}
+
+	// Runs one statement and returns its rows.
+	internal def queryOne(conn Connection, statement string, named map<string, any>, args any[]) !Rows {
+		let stmt = try compileOne(conn, statement)
+		let used = bindAll(stmt, named, args, 0) onerror (err error) {
+			asqFinalize(stmt)
+			fail err
+		}
+		if used != args.len() {
+			asqFinalize(stmt)
+			fail db.errorOf(db.ErrorKind.Type, "sqlite: {args.len()} arguments for a statement that takes {used}")
+		}
+		let rc = asqRun(stmt)
+		if rc != stepRow && rc != stepDone {
+			let failure = failed(conn.handle, rc)
+			asqFinalize(stmt)
+			fail failure
+		}
+		return new Rows(conn, stmt, rc == stepRow, none)
+	}
+}

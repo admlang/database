@@ -1,0 +1,13 @@
+// SQLite as an ADM library: the `sqlite:` driver of std.data.db, with the
+// engine compiled into the program.
+@manifest(version = "0.1.0")
+library adm.database.sqlite {
+	use (
+		adm.database.sqlite
+		adm.database.sqlite.engine
+	)
+
+	export (
+		adm.database.sqlite
+	)
+}

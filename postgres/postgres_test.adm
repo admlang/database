@@ -1,0 +1,521 @@
+// These tests need a PostgreSQL server; without ADM_TEST_POSTGRES they pass
+// without running. See README.md for the server they expect.
+partial module adm.database.postgres {
+	use (
+		std.testing
+		std.data.db
+		std.math
+		std.reflection
+		std.time
+	)
+
+	// The server's address as `host:port`, for a database `shop` owned by
+	// user `app` with password `secret`.
+	@env("ADM_TEST_POSTGRES")
+	internal const testServer string
+
+	struct Customer {
+		id int
+		name string
+		@db.column("mail")
+		email ?string
+		balance math.Decimal
+		active bool
+		joined time.Time
+		photo byte[]
+	}
+
+	def serverURL(options string = "sslmode=disable") string {
+		return "postgres://app:secret@{testServer}/shop?{options}"
+	}
+
+	def kindOfFailure(err error) db.ErrorKind {
+		return err.kind when err is db.DbError
+		return db.ErrorKind.Other
+	}
+
+	def stateOfFailure(err error) string {
+		return err.sqlState when err is db.DbError
+		return ""
+	}
+
+	// A connection with an empty `customers` table of its own (a temporary
+	// table lives and dies with the session).
+	def customers() !db.Connection {
+		let conn = try db.connect(serverURL())
+		try conn.exec("CREATE TEMPORARY TABLE customers (id int PRIMARY KEY, name text NOT NULL UNIQUE, mail text, balance numeric(12,2) NOT NULL DEFAULT 0, active boolean NOT NULL DEFAULT true, joined timestamptz NOT NULL DEFAULT now(), photo bytea NOT NULL DEFAULT '')")
+		return conn
+	}
+
+	def stopSoon(conn Connection) !none {
+		time.sleep(300ms)
+		return conn.interrupt()
+	}
+
+	check "Connect" {
+		@test()
+		def TestSchemesAreRegistered() !none {
+			assert db.drivers().includes("postgres")
+			assert db.drivers().includes("postgresql")
+		}
+
+		@test()
+		def TestLoginMethods() !none {
+			return none when testServer == ""
+			let scram = try open(serverURL())
+			try scram.ping()
+			let version = scram.setting("server_version")
+			fail "the server reported no version" when version is none
+			assert version.len() > 0
+			assert scram.processId() > 0
+			try scram.close()
+			try scram.close()
+
+			let md5 = try db.connect("postgresql://md5user:md5pw@{testServer}/shop?sslmode=disable")
+			try md5.ping()
+			try md5.close()
+
+			let plain = try db.connect("postgres://plainuser:plainpw@{testServer}/shop?sslmode=disable")
+			try plain.ping()
+			try plain.close()
+		}
+
+		@test()
+		def TestRefusals() !none {
+			return none when testServer == ""
+			let fallback = try db.connect(serverURL())
+
+			let kind = db.ErrorKind.Other
+			let state = ""
+			db.connect("postgres://app:wrong@{testServer}/shop?sslmode=disable") onerror (err error) {
+				kind = kindOfFailure(err)
+				state = stateOfFailure(err)
+				recover fallback
+			}
+			assert kind == db.ErrorKind.Denied
+			assert state == "28P01"
+
+			kind = db.ErrorKind.Other
+			db.connect("postgres://app:secret@{testServer}/nosuchdb?sslmode=disable") onerror (err error) {
+				kind = kindOfFailure(err)
+				state = stateOfFailure(err)
+				recover fallback
+			}
+			assert kind == db.ErrorKind.Denied
+			assert state == "3D000"
+
+			kind = db.ErrorKind.Other
+			db.connect("postgres://app:secret@127.0.0.1:1/shop?connect_timeout=2") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover fallback
+			}
+			assert kind == db.ErrorKind.Connection
+
+			let message = ""
+			db.connect(serverURL("sslmode=sometimes")) onerror (err error) {
+				message = err.message
+				recover fallback
+			}
+			assert message.startsWith("postgres: sslmode 'sometimes' is not")
+			try fallback.close()
+		}
+
+		@test()
+		def TestTls() !none {
+			return none when testServer == ""
+			let conn = try db.connect(serverURL("sslmode=require"))
+			let rows = try conn.query("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
+			assert try rows.next()
+			assert try rows.bool(0)
+			try rows.close()
+			try conn.close()
+
+			let preferred = try db.connect("postgres://app:secret@{testServer}/shop")
+			let again = try preferred.query("SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()")
+			assert try again.next()
+			assert try again.bool(0)
+			try again.close()
+
+			// The test server's certificate is signed by no authority.
+			let kind = db.ErrorKind.Other
+			db.connect(serverURL("sslmode=verify-full")) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover preferred
+			}
+			assert kind == db.ErrorKind.Connection
+			try preferred.close()
+		}
+
+		@test()
+		def TestSessionSettingsFromTheUrl() !none {
+			return none when testServer == ""
+			let conn = try db.connect(serverURL("sslmode=disable&application_name=adm-test&search_path=pg_catalog"))
+			let rows = try conn.query("SELECT current_setting('application_name'), current_setting('search_path')")
+			assert try rows.next()
+			assert try rows.string(0) == "adm-test"
+			assert try rows.string(1) == "pg_catalog"
+			try rows.close()
+			try conn.close()
+		}
+	}
+
+	check "Statements" {
+		@test()
+		def TestTypesRoundTrip() !none {
+			return none when testServer == ""
+			let conn = try db.connect(serverURL())
+			let blob byte[] = [0, 1, 2, 255]
+			let at = try time.parse("2026-10-06T12:30:00.25Z")
+			let rows = try conn.query("SELECT $1::int8, $2::float8, $3::text, $4::bytea, $5::timestamptz, $6::numeric, $7::bool, $8::text, $9::date, $10::time, $11::timestamp, $12::int2, 'x'::char(3), '{\"a\":1}'::jsonb, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'::uuid, 'NaN'::float8, 'infinity'::timestamptz", 9223372036854775807, 2.5, "Żółw 🐢", blob, at, try math.parseDecimal("1234.50"), true, none, new time.Date(2026, 10, 6), new time.TimeOfDay(12, 30, 15), new time.DateTime(2026, 10, 6, 12, 30, 15), -7)
+			let cols = rows.columns()
+			assert cols.len() == 17
+			assert cols[0].typeName == "int8"
+			assert cols[3].typeName == "bytea"
+			assert cols[13].typeName == "jsonb"
+
+			assert try rows.next()
+			assert try rows.int(0) == 9223372036854775807
+			assert try rows.float(1) == 2.5
+			assert try rows.string(2) == "Żółw 🐢"
+			let back = try rows.bytes(3)
+			assert back.hex() == "000102FF"
+			assert try rows.bool(6)
+			assert rows.isNull(7)
+			assert try rows.int(11) == -7
+			assert try rows.float(11) == -7.0
+			assert try rows.string(12) == "x  "
+			assert try rows.string(13) == "\{\"a\": 1\}"
+			assert try rows.string(14) == "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+
+			let moment = try rows.value(4)
+			assert reflection.typeName(moment) == "std.time.Time"
+			match moment {
+				case time.Time:
+					assert moment.unixNs() == at.unixNs()
+				default:
+					fail "timestamptz did not read as a time"
+			}
+			let amount = try rows.value(5)
+			match amount {
+				case math.Decimal:
+					assert amount.str() == "1234.50"
+				default:
+					fail "numeric did not read as a decimal"
+			}
+			assert reflection.typeName(try rows.value(0)) == "int"
+			assert reflection.typeName(try rows.value(1)) == "float"
+			assert reflection.typeName(try rows.value(3)) == "byte[]"
+			assert reflection.typeName(try rows.value(6)) == "bool"
+			assert (try rows.value(7)) is none
+			assert reflection.typeName(try rows.value(8)) == "std.time.Date"
+			assert reflection.typeName(try rows.value(9)) == "std.time.TimeOfDay"
+			assert reflection.typeName(try rows.value(10)) == "std.time.DateTime"
+			let day = try rows.string(8)
+			assert day == "2026-10-06"
+			assert try rows.string(9) == "12:30:15"
+			assert try rows.string(10) == "2026-10-06 12:30:15"
+			// What has no ADM value stays text.
+			assert reflection.typeName(try rows.value(16)) == "string"
+			let nan = try rows.float(15)
+			assert nan != nan
+
+			let kind = db.ErrorKind.Other
+			rows.int(2) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover 0
+			}
+			assert kind == db.ErrorKind.Type
+			kind = db.ErrorKind.Other
+			rows.string(7) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover ""
+			}
+			assert kind == db.ErrorKind.Type
+			assert !(try rows.next())
+			try conn.close()
+		}
+
+		@test()
+		def TestExecCountsAndSeveralStatements() !none {
+			return none when testServer == ""
+			let conn = try customers()
+			let res = try conn.exec("INSERT INTO customers (id, name) VALUES ($1, $2), ($3, $4)", 1, "Ana", 2, "Bob")
+			assert res.affected == 2
+			res = try conn.exec("UPDATE customers SET active = false WHERE id > $1", 0)
+			assert res.affected == 2
+			res = try conn.exec("INSERT INTO customers (id, name) VALUES (3, 'Cy'); DELETE FROM customers WHERE id < 3; -- done")
+			assert res.affected == 3
+			res = try conn.exec("")
+			assert res.affected == 0
+
+			let rows = try conn.query("SELECT name FROM customers")
+			assert try rows.next()
+			assert try rows.string(0) == "Cy"
+			assert !(try rows.next())
+			let empty0 = try conn.query("UPDATE customers SET active = true")
+			assert empty0.columns().len() == 0
+			assert !(try empty0.next())
+			try conn.close()
+		}
+
+		@test()
+		def TestErrors() !none {
+			return none when testServer == ""
+			let conn = try customers()
+			try conn.exec("INSERT INTO customers (id, name) VALUES (1, 'Ana')")
+
+			let kind = db.ErrorKind.Other
+			let state = ""
+			conn.exec("INSERT INTO customers (id, name) VALUES ($1, $2)", 2, "Ana") onerror (err error) {
+				kind = kindOfFailure(err)
+				state = stateOfFailure(err)
+				recover db.Result{affected: 0, lastInsertId: 0}
+			}
+			assert kind == db.ErrorKind.Constraint
+			assert state == "23505"
+
+			kind = db.ErrorKind.Other
+			conn.exec("SELEC 1") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover db.Result{affected: 0, lastInsertId: 0}
+			}
+			assert kind == db.ErrorKind.Syntax
+
+			kind = db.ErrorKind.Other
+			conn.query("SELECT * FROM nowhere WHERE a = $1", 1) onerror (err error) {
+				kind = kindOfFailure(err)
+				state = stateOfFailure(err)
+				recover try conn.query("SELECT 1")
+			}
+			assert kind == db.ErrorKind.Syntax
+			assert state == "42P01"
+
+			// A failure halfway through the rows comes out of `next`.
+			kind = db.ErrorKind.Other
+			let late = try conn.query("SELECT 10 / (n - $1) FROM generate_series(1, 5) AS n", 3)
+			assert try late.next()
+			assert try late.next()
+			late.next() onerror (err error) {
+				kind = kindOfFailure(err)
+				state = stateOfFailure(err)
+				recover false
+			}
+			assert kind == db.ErrorKind.Type
+			assert state == "22012"
+
+			kind = db.ErrorKind.Other
+			conn.exec("SELECT $1::int", conn) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover db.Result{affected: 0, lastInsertId: 0}
+			}
+			assert kind == db.ErrorKind.Type
+
+			// The session is still usable after each failure.
+			try conn.ping()
+			try conn.close()
+			kind = db.ErrorKind.Other
+			conn.exec("SELECT 1") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover db.Result{affected: 0, lastInsertId: 0}
+			}
+			assert kind == db.ErrorKind.Closed
+		}
+
+		@test()
+		def TestLargeResultsAndValues() !none {
+			return none when testServer == ""
+			let conn = try db.connect(serverURL())
+			let rows = try conn.query("SELECT n, repeat('x', 40) FROM generate_series(1, $1) AS n", 20000)
+			let count = 0
+			let sum = 0
+			for try rows.next() {
+				count++
+				sum += try rows.int(0)
+			}
+			assert count == 20000
+			assert sum == 200010000
+
+			let big = try conn.query("SELECT repeat('ab', $1)", 150000)
+			assert try big.next()
+			let text = try big.string(0)
+			assert text.len() == 300000
+			assert text.endsWith("abab")
+			try big.close()
+
+			// Rows left unread end when another statement runs.
+			let open0 = try conn.query("SELECT n FROM generate_series(1, 5000) AS n")
+			assert try open0.next()
+			try conn.ping()
+			let kind = db.ErrorKind.Other
+			open0.next() onerror (err error) {
+				kind = kindOfFailure(err)
+				recover false
+			}
+			assert kind == db.ErrorKind.Closed
+			try conn.close()
+		}
+
+		@test()
+		def TestPreparedStatements() !none {
+			return none when testServer == ""
+			let conn = try customers()
+			let insert = try conn.prepare("INSERT INTO customers (id, name, balance) VALUES ($1, $2, $3)")
+			for let i = 1; i <= 50; i++ {
+				let res = try insert.exec(i, "c{i}", i * 10)
+				assert res.affected == 1
+			}
+			try insert.close()
+			try insert.close()
+
+			let find = try conn.prepare("SELECT name FROM customers WHERE balance >= :low AND balance < :low + 20 ORDER BY id")
+			let named = new map<string, any>()
+			named.set("low", 100)
+			let rows = try find.query(named)
+			assert try rows.next()
+			assert try rows.string(0) == "c10"
+			assert try rows.next()
+			assert try rows.string(0) == "c11"
+			assert !(try rows.next())
+			let again = try find.query(490)
+			assert try again.next()
+			assert try again.string(0) == "c49"
+			try again.close()
+			try find.close()
+
+			let kind = db.ErrorKind.Other
+			find.exec(1) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover db.Result{affected: 0, lastInsertId: 0}
+			}
+			assert kind == db.ErrorKind.Closed
+
+			kind = db.ErrorKind.Other
+			conn.prepare("SELECT * FROM nowhere") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover find
+			}
+			assert kind == db.ErrorKind.Syntax
+			try conn.close()
+		}
+	}
+
+	check "Transactions" {
+		@test()
+		def TestCommitRollbackAndFailure() !none {
+			return none when testServer == ""
+			let conn = try customers()
+			let tx = try conn.beginTx()
+			try tx.exec("INSERT INTO customers (id, name) VALUES ($1, $2)", 1, "kept")
+			try tx.commitTx()
+			let kind = db.ErrorKind.Other
+			tx.exec("SELECT 1") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover db.Result{affected: 0, lastInsertId: 0}
+			}
+			assert kind == db.ErrorKind.Closed
+
+			let undo = try conn.beginTx(db.Isolation.Serializable)
+			try undo.exec("INSERT INTO customers (id, name) VALUES ($1, $2)", 2, "dropped")
+			let message = ""
+			conn.beginTx() onerror (err error) {
+				message = err.message
+				recover undo
+			}
+			assert message == "postgres: a transaction is already open on this connection"
+			try undo.rollbackTx()
+			try undo.rollbackTx()
+
+			let broken = try conn.beginTx()
+			try broken.exec("INSERT INTO customers (id, name) VALUES (3, 'three')")
+			broken.exec("INSERT INTO customers (id, name) VALUES (3, 'again')") onerror recover db.Result{affected: 0, lastInsertId: 0}
+			let state = ""
+			broken.commitTx() onerror (err error) {
+				state = stateOfFailure(err)
+				recover none
+			}
+			assert state == "25P02"
+
+			let reader = try conn.beginTx(db.Isolation.RepeatableRead, true)
+			kind = db.ErrorKind.Other
+			reader.exec("CREATE TABLE never_made (a int)") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover db.Result{affected: 0, lastInsertId: 0}
+			}
+			assert kind == db.ErrorKind.Denied
+			try reader.rollbackTx()
+
+			let rows = try conn.query("SELECT name FROM customers ORDER BY id")
+			assert try rows.next()
+			assert try rows.string(0) == "kept"
+			assert !(try rows.next())
+			try conn.close()
+		}
+	}
+
+	check "Objects" {
+		@test()
+		def TestValuesInsertAndReadBack() !none {
+			return none when testServer == ""
+			let conn = try customers()
+			let joined = try time.parse("2026-10-06T12:30:00Z")
+			let a = Customer{id: 7, name: "Ana", email: "ana@example.com", balance: try math.parseDecimal("12.50"), active: true, joined: joined, photo: [1, 2, 3]}
+			try conn.exec("INSERT INTO customers (id, name, mail, balance, active, joined, photo) VALUES (:id, :name, :mail, :balance, :active, :joined, :photo)", db.values(a))
+			let b = Customer{id: 8, name: "Bob", email: none, balance: new math.Decimal(0), active: false, joined: joined, photo: byte[]}
+			try conn.exec("INSERT INTO customers (id, name, mail, balance, active, joined, photo) VALUES (:id, :name, :mail, :balance, :active, :joined, :photo)", db.values(b))
+
+			let all = try db.readAll<Customer>(try conn.query("SELECT * FROM customers ORDER BY id"))
+			assert all.len() == 2
+			assert all[0].id == 7
+			assert all[0].name == "Ana"
+			assert all[0].balance.str() == "12.50"
+			assert all[0].active
+			assert all[0].joined.unixNs() == joined.unixNs()
+			assert all[0].photo.hex() == "010203"
+			let mail = all[0].email
+			fail "expected an address" when mail is none
+			assert mail == "ana@example.com"
+			assert all[1].email is none
+			assert !all[1].active
+			assert all[1].photo.len() == 0
+			try conn.close()
+		}
+	}
+
+	check "Interrupting" {
+		@test()
+		def TestInterruptStopsTheStatement() !none {
+			return none when testServer == ""
+			let conn = try open(serverURL())
+			let stopper = async stopSoon(conn)
+			let started = time.now()
+			let kind = db.ErrorKind.Other
+			conn.exec("SELECT pg_sleep(10)") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover db.Result{affected: 0, lastInsertId: 0}
+			}
+			assert kind == db.ErrorKind.TimedOut
+			assert time.since(started) < 5s
+			try await stopper
+			try conn.ping()
+			try conn.close()
+		}
+
+		@test()
+		def TestReadTimeoutEndsTheSession() !none {
+			return none when testServer == ""
+			let conn = try db.connect(serverURL("sslmode=disable&read_timeout=1"))
+			let kind = db.ErrorKind.Other
+			conn.exec("SELECT pg_sleep(4)") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover db.Result{affected: 0, lastInsertId: 0}
+			}
+			assert kind == db.ErrorKind.TimedOut
+			kind = db.ErrorKind.Other
+			conn.ping() onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == db.ErrorKind.Closed
+		}
+	}
+}

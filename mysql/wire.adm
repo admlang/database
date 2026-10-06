@@ -1,0 +1,327 @@
+// The MySQL client/server protocol: packet framing, the integer and string
+// forms packets are built from, and the server's error packet.
+internal partial module adm.database.mysql.wire {
+	use (
+		std.net
+		std.data.db
+	)
+
+	// The largest payload one packet carries; a longer one continues in the
+	// next packet.
+	const maxPayload = 0xFFFFFF
+
+	// Packet builds the payload of a client packet. Integers are little
+	// endian.
+	type Packet {
+		data byte[]
+
+		def new() {}
+
+		def put8(v int) {
+			data.push(byte(v & 0xFF))
+		}
+
+		def put16(v int) {
+			data.push(byte(v & 0xFF), byte((v >> 8) & 0xFF))
+		}
+
+		def put32(v int) {
+			data.push(byte(v & 0xFF), byte((v >> 8) & 0xFF), byte((v >> 16) & 0xFF), byte((v >> 24) & 0xFF))
+		}
+
+		def put64(v int) {
+			put32(v & 0xFFFFFFFF)
+			put32((v >> 32) & 0xFFFFFFFF)
+		}
+
+		// lenenc adds a length-encoded integer.
+		def lenenc(v int) {
+			if v < 251 {
+				put8(v)
+			} else if v < 0x10000 {
+				put8(0xFC)
+				put16(v)
+			} else if v < 0x1000000 {
+				put8(0xFD)
+				data.push(byte(v & 0xFF), byte((v >> 8) & 0xFF), byte((v >> 16) & 0xFF))
+			} else {
+				put8(0xFE)
+				put64(v)
+			}
+		}
+
+		// text adds a string and its closing zero byte.
+		def text(v string) {
+			data.push(...v.bytes())
+			data.push(byte(0))
+		}
+
+		def bytes(v byte[]) {
+			data.push(...v)
+		}
+
+		// sized adds bytes behind their length-encoded length.
+		def sized(v byte[]) {
+			lenenc(v.len())
+			data.push(...v)
+		}
+
+		def zeros(count int) {
+			for let i = 0; i < count; i++ {
+				data.push(byte(0))
+			}
+		}
+	}
+
+	// Wire reads server packets from a stream and writes client packets to
+	// it, numbering them as the protocol asks.
+	type Wire {
+		stream  net.Stream
+		// How long one read or write may wait.
+		timeout duration
+		buf     byte[]
+		head    int
+		tail    int
+		// The sequence number the next packet carries; a command starts at 0.
+		seq     int
+		// The payload last read: a view into the buffer, good until the next
+		// read.
+		body    byte[]
+
+		def new(stream net.Stream, timeout duration) {
+			self.stream = stream
+			self.timeout = timeout
+			buf.len(16384)
+		}
+
+		// command starts a new exchange: the numbering begins again.
+		def command() {
+			seq = 0
+		}
+
+		// send writes a payload as one packet, or several when it is longer
+		// than a packet carries.
+		// Fails with a DbError of ErrorKind.Connection when the write does.
+		def send(payload byte[]) !none {
+			let n = payload.len()
+			let out byte[]
+			let at = 0
+			for {
+				let size = n - at
+				size = maxPayload when size > maxPayload
+				out.push(byte(size & 0xFF), byte((size >> 8) & 0xFF), byte((size >> 16) & 0xFF), byte(seq & 0xFF))
+				out.push(...payload[at:at + size])
+				seq++
+				at += size
+				// A payload that fills its packet is followed by another,
+				// empty when nothing is left.
+				break when size < maxPayload
+			}
+			let sent = 0
+			for sent < out.len() {
+				let wrote = stream.write(out[sent:out.len()], timeout) onerror (err error) {
+					fail db.errorOf(db.ErrorKind.Connection, "mysql: write: {err.message}")
+				}
+				fail db.errorOf(db.ErrorKind.Connection, "mysql: the connection closed while writing") when wrote <= 0
+				sent += wrote
+			}
+			return none
+		}
+
+		// read reads the next payload into `body`, joining the packets of a
+		// long one.
+		// Fails with a DbError: ErrorKind.TimedOut when nothing arrives
+		// within the timeout, ErrorKind.Connection when the read fails or
+		// the server closes the connection.
+		def read() !none {
+			try need(4)
+			let size = int(buf[head]) | (int(buf[head + 1]) << 8) | (int(buf[head + 2]) << 16)
+			seq = (int(buf[head + 3]) + 1) & 0xFF
+			try need(4 + size)
+			body = buf[head + 4:head + 4 + size]
+			head += 4 + size
+			return none when size < maxPayload
+
+			let whole = body.clone()
+			for {
+				try need(4)
+				let more = int(buf[head]) | (int(buf[head + 1]) << 8) | (int(buf[head + 2]) << 16)
+				seq = (int(buf[head + 3]) + 1) & 0xFF
+				try need(4 + more)
+				whole.push(...buf[head + 4:head + 4 + more])
+				head += 4 + more
+				break when more < maxPayload
+			}
+			body = whole
+			return none
+		}
+
+		// buffered is how many bytes were read past the last packet.
+		def buffered() int {
+			return tail - head
+		}
+
+		// Makes `count` bytes available from `head`.
+		def need(count int) !none {
+			return none when tail - head >= count
+			if head > 0 {
+				let kept = tail - head
+				for let i = 0; i < kept; i++ {
+					buf[i] = buf[head + i]
+				}
+				head = 0
+				tail = kept
+			}
+			if buf.len() < count {
+				let size = buf.len()
+				for size < count {
+					size = size * 2
+				}
+				buf.len(size)
+			}
+			for tail < count {
+				let got = stream.read(buf[tail:buf.len()], timeout) onerror (err error) {
+					let late = false
+					late = err.kind == net.ErrorCode.TimedOut when err is net.NetError
+					fail db.errorOf(late ?? (db.ErrorKind.TimedOut, db.ErrorKind.Connection), "mysql: read: {err.message}")
+				}
+				fail db.errorOf(db.ErrorKind.Connection, "mysql: the server closed the connection") when got <= 0
+				tail += got
+			}
+			return none
+		}
+	}
+
+	// Cursor walks one payload.
+	type Cursor {
+		data byte[]
+		at   int
+
+		def new(data byte[]) {
+			self.data = data
+		}
+
+		def get8() int {
+			let v = int(data[at])
+			at++
+			return v
+		}
+
+		def get16() int {
+			let v = int(data[at]) | (int(data[at + 1]) << 8)
+			at += 2
+			return v
+		}
+
+		def get32() int {
+			let v = int(data[at]) | (int(data[at + 1]) << 8) | (int(data[at + 2]) << 16) | (int(data[at + 3]) << 24)
+			at += 4
+			return v
+		}
+
+		def get64() int {
+			let low = get32()
+			let high = get32()
+			return low | (high << 32)
+		}
+
+		// lenenc reads a length-encoded integer; -1 for the NULL marker.
+		def lenenc() int {
+			let first = get8()
+			return first when first < 251
+			return -1 when first == 0xFB
+			return get16() when first == 0xFC
+			if first == 0xFD {
+				let v = int(data[at]) | (int(data[at + 1]) << 8) | (int(data[at + 2]) << 16)
+				at += 3
+				return v
+			}
+			return get64()
+		}
+
+		// sized reads bytes behind a length-encoded length.
+		def sized() byte[] {
+			let n = lenenc()
+			n = 0 when n < 0
+			let out = data[at:at + n]
+			at += n
+			return out
+		}
+
+		// text reads up to the next zero byte.
+		def text() string {
+			let end = at
+			for end < data.len() && int(data[end]) != 0 {
+				end++
+			}
+			let out = string(data[at:end])
+			at = end + 1
+			return out
+		}
+
+		def take(count int) byte[] {
+			let out = data[at:at + count]
+			at += count
+			return out
+		}
+
+		def rest() byte[] {
+			let out = data[at:data.len()]
+			at = data.len()
+			return out
+		}
+
+		def more() bool {
+			return at < data.len()
+		}
+	}
+
+	// The DbError an ERR packet describes: its message, the SQLSTATE and the
+	// server's error number.
+	def serverError(body byte[]) db.DbError {
+		let c = new Cursor(body)
+		c.get8()
+		let code = c.get16()
+		let state = ""
+		if c.more() && int(body[c.at]) == 35 {
+			c.at++
+			state = string(c.take(5))
+		}
+		let message = string(c.rest())
+		return db.errorOf(kindOfCode(code, state), "mysql: {message}", state, code)
+	}
+
+	// The ErrorKind of a server error number and SQLSTATE.
+	def kindOfCode(code int, state string) db.ErrorKind {
+		match code {
+			case 1044, 1045, 1142, 1143, 1227, 1370, 1698, 1792:
+				return db.ErrorKind.Denied
+			case 1205, 1213:
+				return db.ErrorKind.Conflict
+			case 1317, 3024:
+				return db.ErrorKind.TimedOut
+			case 1040, 1053, 1152, 1153:
+				return db.ErrorKind.Connection
+			case 1048, 1062, 1169, 1216, 1217, 1364, 1451, 1452, 1557, 3819, 4025:
+				return db.ErrorKind.Constraint
+		}
+		return db.ErrorKind.Denied when state == "25006"
+		let family = state.len() >= 2 ?? (state.slice(0, 2), state)
+		match family {
+			case "23":
+				return db.ErrorKind.Constraint
+			case "42":
+				return db.ErrorKind.Syntax
+			case "28":
+				return db.ErrorKind.Denied
+			case "22":
+				return db.ErrorKind.Type
+			case "40":
+				return db.ErrorKind.Conflict
+			case "08":
+				return db.ErrorKind.Connection
+			default:
+				return db.ErrorKind.Other
+		}
+	}
+}

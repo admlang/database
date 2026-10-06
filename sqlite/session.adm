@@ -1,0 +1,224 @@
+internal partial module adm.database.sqlite.session {
+	use (
+		std.data.db
+		std.reflection
+		std.reflection::(FieldKind)
+		std.time
+		std.math
+		adm.database.sqlite::*
+		adm.database.sqlite.engine::*
+	)
+
+	const stepRow = 100
+	const stepDone = 101
+
+	const kindInteger = 1
+	const kindFloat = 2
+	const kindText = 3
+	const kindBlob = 4
+	const kindNull = 5
+
+	// What the calls without named arguments pass.
+	let noNames = new map<string, any>()
+	let noArgs any[]
+
+	// A copy of a string that points into SQLite's memory.
+	def owned(text string) string {
+		return string(text.bytes())
+	}
+
+	// The ErrorKind of a SQLite result code.
+	def kindOf(code int) db.ErrorKind {
+		match code & 0xFF {
+			case 19:
+				return db.ErrorKind.Constraint
+			case 5, 6:
+				return db.ErrorKind.Conflict
+			case 3, 8, 23:
+				return db.ErrorKind.Denied
+			case 14, 26:
+				return db.ErrorKind.Connection
+			case 1:
+				return db.ErrorKind.Syntax
+			case 18, 20, 25:
+				return db.ErrorKind.Type
+			default:
+				return db.ErrorKind.Other
+		}
+	}
+
+	// The failure the database last reported, or the text of the result code
+	// when it kept no message.
+	def failed(handle uint, code int) db.DbError {
+		let native = asqErrorCode(handle)
+		native = code when native == 0
+		return db.errorOf(kindOf(native), "sqlite: " + owned(asqErrorMessage(handle)), "", native)
+	}
+
+	// The DbError that stands for no failure: its message is empty.
+	def noFailure() db.DbError {
+		return db.errorOf(db.ErrorKind.Other, "")
+	}
+
+	def kindName(kind int) string {
+		match kind {
+			case 1:
+				return "an integer"
+			case 2:
+				return "a float"
+			case 3:
+				return "text"
+			case 4:
+				return "a blob"
+			default:
+				return "NULL"
+		}
+	}
+
+	// Compiles a text that holds exactly one statement.
+	def compileOne(conn Connection, statement string) !uint {
+		try conn.open()
+		let source = statement.bytes()
+		let n = source.len()
+		let tail int[] = [0]
+		let stmt = asqPrepare(conn.handle, source, n, 0, tail)
+		if stmt == 0 {
+			fail failed(conn.handle, 1) when asqErrorCode(conn.handle) != 0
+			fail db.errorOf(db.ErrorKind.Syntax, "sqlite: the text holds no statement")
+		}
+		for tail[0] < n {
+			let more = asqPrepare(conn.handle, source, n, tail[0], tail)
+			continue when more == 0 && asqErrorCode(conn.handle) == 0
+			asqFinalize(more) unless more == 0
+			asqFinalize(stmt)
+			fail db.errorOf(db.ErrorKind.Syntax, "sqlite: the text holds more than one statement")
+		}
+		return stmt
+	}
+
+	// Runs every statement of the text in turn; each takes the positional
+	// arguments its placeholders ask for.
+	def execAll(conn Connection, statement string, named map<string, any>, args any[]) !db.Result {
+		try conn.open()
+		let source = statement.bytes()
+		let n = source.len()
+		let tail int[] = [0]
+		let offset = 0
+		let used = 0
+		let changed = 0
+		for offset < n {
+			let stmt = asqPrepare(conn.handle, source, n, offset, tail)
+			offset = tail[0]
+			if stmt == 0 {
+				fail failed(conn.handle, 1) when asqErrorCode(conn.handle) != 0
+				continue
+			}
+			let taken = bindAll(stmt, named, args, used) onerror (err error) {
+				asqFinalize(stmt)
+				fail err
+			}
+			used += taken
+			let rc = asqRun(stmt)
+			for rc == stepRow {
+				rc = asqNext(stmt)
+			}
+			if rc != stepDone {
+				let failure = failed(conn.handle, rc)
+				asqFinalize(stmt)
+				fail failure
+			}
+			changed += asqChanges(conn.handle) unless asqReadOnly(stmt) == 1
+			asqFinalize(stmt)
+		}
+		fail db.errorOf(db.ErrorKind.Type, "sqlite: {args.len()} arguments for a text that takes {used}") when used != args.len()
+		return db.Result{affected: changed, lastInsertId: asqLastInsertId(conn.handle)}
+	}
+
+	// Binds a statement's parameters: a named one from `named` (by its name
+	// with or without the prefix), `?N` from args[N - 1], a plain `?` from
+	// the next of args starting at `first`. Returns how many of args the
+	// plain ones took.
+	def bindAll(stmt uint, named map<string, any>, args any[], first int) !int {
+		let count = asqBindCount(stmt)
+		let taken = 0
+		for let i = 1; i <= count; i++ {
+			let name = asqBindName(stmt, i)
+			if name == "" {
+				fail db.errorOf(db.ErrorKind.Type, "sqlite: no argument for placeholder {first + taken + 1}") when first + taken >= args.len()
+				try bindValue(stmt, i, args[first + taken])
+				taken++
+				continue
+			}
+			if name.startsWith("?") {
+				let at = name.slice(1, name.len()).toInt<int>()
+				fail db.errorOf(db.ErrorKind.Type, "sqlite: no argument for placeholder {name}") when at < 1 || at > args.len()
+				try bindValue(stmt, i, args[at - 1])
+				taken = at - first when at - first > taken
+				continue
+			}
+			let bare = name.slice(1, name.len())
+			let key = named.hasKey(bare) ?? (bare, name)
+			fail db.errorOf(db.ErrorKind.Type, "sqlite: no argument named '{bare}'") unless named.hasKey(key)
+			try bindValue(stmt, i, named[key])
+		}
+		return taken
+	}
+
+	// Binds one value to parameter `index`.
+	def bindValue(stmt uint, index int, v any) !none {
+		let rc = 0
+		match v {
+			case none:
+				rc = asqBindNull(stmt, index)
+			case bool:
+				rc = asqBindInt(stmt, index, v ?? (1, 0))
+			case int:
+				rc = asqBindInt(stmt, index, v)
+			case float:
+				rc = asqBindFloat(stmt, index, v)
+			case string:
+				let text = v.bytes()
+				rc = asqBindText(stmt, index, text, text.len())
+			case byte[]:
+				rc = asqBindBlob(stmt, index, v, v.len())
+			case time.Time:
+				let text = v.str().bytes()
+				rc = asqBindText(stmt, index, text, text.len())
+			case time.Date:
+				let text = v.str().bytes()
+				rc = asqBindText(stmt, index, text, text.len())
+			case time.TimeOfDay:
+				let text = v.str().bytes()
+				rc = asqBindText(stmt, index, text, text.len())
+			case time.DateTime:
+				let text = v.str().bytes()
+				rc = asqBindText(stmt, index, text, text.len())
+			case math.Decimal:
+				let text = v.str().bytes()
+				rc = asqBindText(stmt, index, text, text.len())
+			case bigint:
+				let text = v.toRadix(10).bytes()
+				rc = asqBindText(stmt, index, text, text.len())
+			default:
+				rc = try bindOther(stmt, index, v)
+		}
+		fail db.errorOf(kindOf(rc), "sqlite: argument {index}: " + owned(asqErrorText(rc)), "", rc) when rc != 0
+		return none
+	}
+
+	// Binds a number of another width, or fails for a type SQLite has no
+	// form for.
+	def bindOther(stmt uint, index int, v any) !int {
+		match reflection.kindOf(v) {
+			case FieldKind.Int, FieldKind.Uint, FieldKind.Enum:
+				let text = reflection.scalarText(v)
+				let n = text.toInt<int>()
+				fail db.errorOf(db.ErrorKind.Type, "sqlite: argument {index} ({text}) does not fit a 64-bit integer") when n.str() != text
+				return asqBindInt(stmt, index, n)
+			case FieldKind.Float:
+				return asqBindFloat(stmt, index, parseFloat<float>(reflection.scalarText(v)))
+			default:
+				fail db.errorOf(db.ErrorKind.Type, "sqlite: argument {index} is a {reflection.typeName(v)}, which cannot be bound")
+		}
+	}
+}

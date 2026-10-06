@@ -1,0 +1,123 @@
+partial module adm.database.sqlite {
+	use (
+		std.testing
+		std.data.db
+		std.time
+	)
+
+	// PersonStore is how a program uses the driver through `sql def`: a type
+	// holding its connection, with one method per statement.
+	type PersonStore {
+		@db.connection()
+		conn db.Queryable
+
+		def new(conn db.Queryable) {
+			self.conn = conn
+		}
+
+		sql def add(name string, email ?string, score float, created time.Time) !db.Result {
+			INSERT INTO people (name, mail, score, created, photo) VALUES ({name}, {email}, {score}, {created}, x'')
+		}
+
+		sql def rename(id int, name string) !none {
+			UPDATE people SET name = {name} WHERE id = {id};
+		}
+
+		sql def find(id int) !Person {
+			SELECT * FROM people WHERE id = {id}
+		}
+
+		sql def byEmail(email string) !?Person {
+			SELECT * FROM people WHERE mail = {email}
+		}
+
+		sql def scoring(low float) !Person[] {
+			SELECT * FROM people
+			WHERE score >= {low}
+			ORDER BY score DESC, id
+		}
+
+		sql def count() !int {
+			SELECT count(*) FROM people
+		}
+
+		sql def best() !(string, float) {
+			SELECT name, score FROM people ORDER BY score DESC LIMIT 1
+		}
+
+		sql def names() !string[] {
+			SELECT name FROM people ORDER BY id
+		}
+
+		sql def joined(id int) !time.Time {
+			SELECT created FROM people WHERE id = {id}
+		}
+	}
+
+	check "sql def" {
+		@test()
+		def TestStatementsAsMethods() !none {
+			let conn = try people()
+			let store = new PersonStore(conn)
+			let at = try time.parse("2026-10-06T12:30:00Z")
+
+			let res = try store.add("Ana", "ana@example.com", 9.5, at)
+			assert res.affected == 1
+			assert res.lastInsertId == 1
+			try store.add("Bob", none, 4.0, at)
+			try store.add("Cy", "cy@example.com", 7.25, at)
+			assert try store.count() == 3
+
+			try store.rename(2, "Robert")
+			let bob = try store.find(2)
+			assert bob.name == "Robert"
+			assert bob.email is none
+			assert bob.score == 4.0
+
+			let found = try store.byEmail("cy@example.com")
+			fail "expected a person" when found is none
+			assert found.name == "Cy"
+			let missing = try store.byEmail("nobody@example.com")
+			assert missing is none
+
+			let high = try store.scoring(7.0)
+			assert high.len() == 2
+			assert high[0].name == "Ana"
+			assert high[1].name == "Cy"
+
+			let (name, score) = try store.best()
+			assert name == "Ana"
+			assert score == 9.5
+			assert (try store.names()).join(",") == "Ana,Robert,Cy"
+			let when0 = try store.joined(1)
+			assert when0.unixNs() == at.unixNs()
+
+			let kind = db.ErrorKind.Other
+			store.find(99) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover new Person()
+			}
+			assert kind == db.ErrorKind.NoRows
+			kind = db.ErrorKind.Other
+			store.add("Ana", none, 1.0, at) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover db.Result{affected: 0, lastInsertId: 0}
+			}
+			assert kind == db.ErrorKind.Constraint
+		}
+
+		@test()
+		def TestMethodsRunInsideATransaction() !none {
+			let conn = try people()
+			let at = try time.parse("2026-10-06T12:30:00Z")
+			let tx = try conn.beginTx()
+			let inside = new PersonStore(tx)
+			try inside.add("Ana", none, 1.0, at)
+			assert try inside.count() == 1
+			try tx.rollbackTx()
+
+			let outside = new PersonStore(conn)
+			assert try outside.count() == 0
+		}
+	}
+}

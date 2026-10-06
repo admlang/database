@@ -1,0 +1,410 @@
+// How ADM values travel to MySQL as statement parameters (binary protocol)
+// and come back from result columns, in the text protocol (statements run
+// without arguments) and the binary one (prepared statements).
+internal partial module adm.database.mysql.values {
+	use (
+		std.bytes::(Endian)
+		std.data.db
+		std.reflection
+		std.reflection::(FieldKind)
+		std.time
+		std.math
+		adm.database.mysql.wire::*
+	)
+
+	// Column types of the protocol.
+	const typeDecimal = 0
+	const typeTiny = 1
+	const typeShort = 2
+	const typeLong = 3
+	const typeFloat = 4
+	const typeDouble = 5
+	const typeNull = 6
+	const typeTimestamp = 7
+	const typeLongLong = 8
+	const typeInt24 = 9
+	const typeDate = 10
+	const typeTime = 11
+	const typeDateTime = 12
+	const typeYear = 13
+	const typeBit = 16
+	const typeJson = 245
+	const typeNewDecimal = 246
+	const typeBlob = 252
+	const typeVarString = 253
+
+	const flagNotNull = 1
+	const flagUnsigned = 32
+	// The character set number of data that is bytes, not text.
+	const charsetBinary = 63
+
+	// Field is what a result column's definition says of it.
+	struct Field {
+		name     string
+		kind     int
+		flags    int
+		charset  int
+		// Digits behind the point of a time or datetime column.
+		decimals int
+	}
+
+	// Reads one column definition packet.
+	def fieldOf(body byte[]) Field {
+		let c = new Cursor(body)
+		// catalog, schema, table, original table
+		c.sized()
+		c.sized()
+		c.sized()
+		c.sized()
+		let name = string(c.sized())
+		c.sized()
+		c.lenenc()
+		let charset = c.get16()
+		c.get32()
+		let kind = c.get8()
+		let flags = c.get16()
+		let decimals = c.get8()
+		return Field{name: name, kind: kind, flags: flags, charset: charset, decimals: decimals}
+	}
+
+	// The name MySQL gives a column type.
+	def typeNameOf(f Field) string {
+		let unsigned = (f.flags & flagUnsigned) != 0 ?? (" unsigned", "")
+		match f.kind {
+			case 0, 246:
+				return "decimal" + unsigned
+			case 1:
+				return "tinyint" + unsigned
+			case 2:
+				return "smallint" + unsigned
+			case 3:
+				return "int" + unsigned
+			case 4:
+				return "float"
+			case 5:
+				return "double"
+			case 6:
+				return "null"
+			case 7:
+				return "timestamp"
+			case 8:
+				return "bigint" + unsigned
+			case 9:
+				return "mediumint" + unsigned
+			case 10:
+				return "date"
+			case 11:
+				return "time"
+			case 12:
+				return "datetime"
+			case 13:
+				return "year"
+			case 16:
+				return "bit"
+			case 245:
+				return "json"
+			case 247:
+				return "enum"
+			case 248:
+				return "set"
+			case 249, 250, 251, 252:
+				return f.charset == charsetBinary ?? ("blob", "text")
+			case 253, 15:
+				return f.charset == charsetBinary ?? ("varbinary", "varchar")
+			case 254:
+				return f.charset == charsetBinary ?? ("binary", "char")
+			case 255:
+				return "geometry"
+			default:
+				return "type {f.kind}"
+		}
+	}
+
+	// Reports whether a column holds an integer.
+	def isInteger(kind int) bool {
+		return kind := 1 || 2 || 3 || 8 || 9 || 13
+	}
+
+	// Reports whether a column holds a date, a time or both.
+	def isTemporal(kind int) bool {
+		return kind := 7 || 10 || 11 || 12
+	}
+
+	// Param is one bound parameter of the binary protocol: its type and
+	// its value's bytes.
+	struct Param {
+		null bool
+		kind int
+		data byte[]
+	}
+
+	// The binary form of an argument.
+	// Fails with a DbError of ErrorKind.Type for a type that cannot be sent.
+	def paramOf(v any, index int) !Param {
+		match v {
+			case none:
+				return Param{null: true, kind: typeNull, data: byte[]}
+			case bool:
+				return Param{null: false, kind: typeTiny, data: byte[v ?? (1, 0)]}
+			case int:
+				return intParam(v)
+			case float:
+				return Param{null: false, kind: typeDouble, data: v.bytes(Endian.Little)}
+			case string:
+				return sizedParam(typeVarString, v.bytes())
+			case byte[]:
+				return sizedParam(typeBlob, v)
+			case time.Time:
+				// Date and time in UTC, without a zone: what DATETIME and
+				// TIMESTAMP columns take.
+				return sizedParam(typeVarString, v.str().replace("T", " ").replace("Z", "").bytes())
+			case time.Date:
+				return sizedParam(typeVarString, v.str().bytes())
+			case time.TimeOfDay:
+				return sizedParam(typeVarString, v.str().bytes())
+			case time.DateTime:
+				return sizedParam(typeVarString, v.str().replace("T", " ").bytes())
+			case math.Decimal:
+				return sizedParam(typeNewDecimal, v.str().bytes())
+			case bigint:
+				return sizedParam(typeNewDecimal, v.toRadix(10).bytes())
+			default:
+				match reflection.kindOf(v) {
+					case FieldKind.Int, FieldKind.Uint, FieldKind.Enum:
+						let text = reflection.scalarText(v)
+						let n = text.toInt<int>()
+						return sizedParam(typeNewDecimal, text.bytes()) when n.str() != text
+						return intParam(n)
+					case FieldKind.Float:
+						return Param{null: false, kind: typeDouble, data: parseFloat<float>(reflection.scalarText(v)).bytes(Endian.Little)}
+					default:
+						fail db.errorOf(db.ErrorKind.Type, "mysql: argument {index} is a {reflection.typeName(v)}, which cannot be bound")
+				}
+		}
+	}
+
+	def intParam(v int) Param {
+		let p = new Packet()
+		p.put64(v)
+		return Param{null: false, kind: typeLongLong, data: p.data}
+	}
+
+	def sizedParam(kind int, data byte[]) Param {
+		let p = new Packet()
+		p.sized(data)
+		return Param{null: false, kind: kind, data: p.data}
+	}
+
+	// An integer in decimal digits, none when the bytes are not one that
+	// fits 64 bits.
+	def digitsOf(data byte[]) ?int {
+		let n = data.len()
+		return none when n == 0 || n > 20
+		let i = 0
+		let negative = int(data[0]) == 45
+		i = 1 when negative || int(data[0]) == 43
+		return none when i >= n
+		let v = 0
+		for i < n {
+			let d = int(data[i]) - 48
+			return none when d < 0 || d > 9
+			// Accumulate below zero: the lowest int64 has no positive twin.
+			let next = v * 10 - d
+			return none when next > v || (v != 0 && next / 10 != v)
+			v = next
+			i++
+		}
+		return v when negative
+		return none when v == -9223372036854775807 - 1
+		return -v
+	}
+
+	// A little-endian integer of 1, 2, 4 or 8 bytes, signed unless told
+	// otherwise. None for an unsigned value above the largest int.
+	def binaryInt(data byte[], unsigned bool) ?int {
+		let n = data.len()
+		let v = 0
+		for let i = n - 1; i >= 0; i-- {
+			v = (v << 8) | int(data[i])
+		}
+		if n == 8 {
+			return none when unsigned && v < 0
+			return v
+		}
+		return v when unsigned
+		let top = 1 << (n * 8 - 1)
+		return v - (top << 1) when v >= top
+		return v
+	}
+
+	// The integer a column of the current row holds, none when the column
+	// is not an integer one or the value does not fit.
+	def intOfCell(f Field, binary bool, data byte[]) ?int {
+		return none unless isInteger(f.kind)
+		return binaryInt(data, (f.flags & flagUnsigned) != 0) when binary
+		return digitsOf(data)
+	}
+
+	// The float a float, double or integer column holds.
+	def floatOfCell(f Field, binary bool, data byte[]) ?float {
+		if binary {
+			return float(float32(0.0).fromBytes(data, Endian.Little)) when f.kind == typeFloat
+			return float(0.0).fromBytes(data, Endian.Little) when f.kind == typeDouble
+			let n = intOfCell(f, binary, data)
+			return none when n is none
+			return float(n)
+		}
+		return none unless f.kind == typeFloat || f.kind == typeDouble || isInteger(f.kind)
+		let text = string(data)
+		return none unless /^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$/.test(text)
+		return parseFloat<float>(text)
+	}
+
+	def two(v int) string {
+		return v < 10 ?? ("0{v}", "{v}")
+	}
+
+	def padded(v int, width int) string {
+		let out = "{v}"
+		for out.len() < width {
+			out = "0" + out
+		}
+		return out
+	}
+
+	// The fraction of a second as MySQL writes it: as many digits behind a
+	// point as the column declares, nothing for a column without any.
+	def fraction(micros int, decimals int) string {
+		return "" when decimals <= 0 || decimals > 6
+		return "." + padded(micros, 6).slice(0, decimals)
+	}
+
+	// A date, datetime or timestamp of the binary protocol as text:
+	// `2026-10-06`, `2026-10-06 12:30:15`, with microseconds when present.
+	def binaryDate(f Field, data byte[]) string {
+		let n = data.len()
+		let year = 0
+		let month = 0
+		let day = 0
+		if n >= 4 {
+			year = int(data[0]) | (int(data[1]) << 8)
+			month = int(data[2])
+			day = int(data[3])
+		}
+		let date = "{padded(year, 4)}-{two(month)}-{two(day)}"
+		return date when f.kind == typeDate
+		let hour = 0
+		let minute = 0
+		let second = 0
+		let micros = 0
+		if n >= 7 {
+			hour = int(data[4])
+			minute = int(data[5])
+			second = int(data[6])
+		}
+		micros = int(data[7]) | (int(data[8]) << 8) | (int(data[9]) << 16) | (int(data[10]) << 24) when n >= 11
+		return "{date} {two(hour)}:{two(minute)}:{two(second)}{fraction(micros, f.decimals)}"
+	}
+
+	// A time of the binary protocol as text: `12:30:15`, `-838:59:59`.
+	def binaryTime(f Field, data byte[]) string {
+		let n = data.len()
+		return "00:00:00" + fraction(0, f.decimals) when n < 8
+		let negative = int(data[0]) != 0
+		let days = int(data[1]) | (int(data[2]) << 8) | (int(data[3]) << 16) | (int(data[4]) << 24)
+		let hours = days * 24 + int(data[5])
+		let micros = 0
+		micros = int(data[8]) | (int(data[9]) << 8) | (int(data[10]) << 16) | (int(data[11]) << 24) when n >= 12
+		let sign = negative ?? ("-", "")
+		return "{sign}{two(hours)}:{two(int(data[6]))}:{two(int(data[7]))}{fraction(micros, f.decimals)}"
+	}
+
+	// A column of the current row as text, the form the text protocol
+	// sends it in.
+	def textOfCell(f Field, binary bool, data byte[]) string {
+		return string(data) unless binary
+		if isInteger(f.kind) {
+			let n = binaryInt(data, (f.flags & flagUnsigned) != 0)
+			return parseBigInt(data.clone().reverse()).toRadix(10) when n is none
+			return n.str()
+		}
+		if f.kind == typeFloat || f.kind == typeDouble {
+			let v = floatOfCell(f, binary, data)
+			return "" when v is none
+			return v.str()
+		}
+		return binaryTime(f, data) when f.kind == typeTime
+		return binaryDate(f, data) when isTemporal(f.kind)
+		return string(data)
+	}
+
+	// A column's value in the ADM type nearest to its MySQL type. A value
+	// its type's parser does not take (a zero date, a time above a day)
+	// stays text.
+	def valueOfCell(f Field, binary bool, data byte[]) any {
+		if isInteger(f.kind) {
+			let n = intOfCell(f, binary, data)
+			if n is none {
+				let text = textOfCell(f, binary, data)
+				let failed = false
+				let big = parseBigInt(text) onerror (err error) {
+					failed = true
+					recover bigint(0)
+				}
+				return text when failed
+				return big
+			}
+			return n
+		}
+		if f.kind == typeFloat || f.kind == typeDouble {
+			let v = floatOfCell(f, binary, data)
+			return string(data) when v is none
+			return v
+		}
+		match f.kind {
+			case 0, 246:
+				let text = string(data)
+				let failed = false
+				let d = math.parseDecimal(text) onerror (err error) {
+					failed = true
+					recover new math.Decimal()
+				}
+				return text when failed
+				return d
+			case 10:
+				let text = textOfCell(f, binary, data)
+				let failed = false
+				let d = time.parseDate(text) onerror (err error) {
+					failed = true
+					recover new time.Date(1970, 1, 1)
+				}
+				return text when failed
+				return d
+			case 7, 12:
+				let text = textOfCell(f, binary, data)
+				let failed = false
+				let d = time.parseDateTime(text) onerror (err error) {
+					failed = true
+					recover new time.DateTime(1970, 1, 1)
+				}
+				return text when failed
+				return d
+			case 11:
+				let text = textOfCell(f, binary, data)
+				let failed = false
+				let d = time.parseTimeOfDay(text) onerror (err error) {
+					failed = true
+					recover new time.TimeOfDay(0)
+				}
+				return text when failed
+				return d
+			case 16, 255:
+				return data.clone()
+			case 249, 250, 251, 252, 253, 254, 15:
+				return data.clone() when f.charset == charsetBinary
+				return string(data)
+			default:
+				return string(data)
+		}
+	}
+}

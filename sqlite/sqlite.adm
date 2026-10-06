@@ -1,0 +1,158 @@
+// SQLite for std.data.db. Linking this library registers the `sqlite:`
+// scheme, so `db.connect("sqlite:///var/data/app.db")` opens a database
+// file with the engine compiled into the program.
+partial module adm.database.sqlite {
+	use (
+		std.data.db
+		std.net.url
+		adm.database.sqlite.engine::*
+		adm.database.sqlite.session::*
+	)
+
+	// Mode is how a database file is opened.
+	enum Mode {
+		// Reads only; the file must exist.
+		ReadOnly,
+		// Reads and writes; the file must exist.
+		ReadWrite,
+		// Reads and writes; the file is created when it does not exist.
+		ReadWriteCreate,
+		// A private database in memory, gone when the connection closes. The
+		// path is not used.
+		Memory,
+	}
+
+	// SQLite is the driver of the `sqlite:` and `sqlite3:` schemes.
+	//
+	//     sqlite:app.db                  a file, relative to the working directory
+	//     sqlite:///var/data/app.db      a file by absolute path
+	//     sqlite::memory:                a private database in memory
+	//     sqlite:app.db?mode=ro&busy_timeout=2000&foreign_keys=on
+	//
+	// Options in the query: `mode` (`ro`, `rw`, `rwc` the default, `memory`),
+	// `busy_timeout` (milliseconds to wait for another connection's lock,
+	// 5000 by default), and the pragmas `foreign_keys`, `journal_mode`,
+	// `synchronous`, `cache_size`, `temp_store`, `locking_mode`,
+	// `secure_delete`, `recursive_triggers`, `query_only`, each set once
+	// the database is open.
+	@db.driver("sqlite", "sqlite3")
+	type SQLite {
+		def new() {}
+
+		// placeholder returns Placeholder.Question; SQLite also takes
+		// `?3`, `:name`, `@name` and `$name` in statement text.
+		def placeholder() db.Placeholder {
+			return db.Placeholder.Question
+		}
+
+		// connect opens the database the URL names.
+		// Fails with a DbError: ErrorKind.Connection when the file cannot be
+		// opened or is not a database, ErrorKind.Other for an option the
+		// driver does not know or a value it does not take.
+		def connect(target url.URL) !db.Connection {
+			return try connectURL(target)
+		}
+	}
+
+	// open opens a database file, or a private database in memory with
+	// Mode.Memory. `busyTimeout` is how long a statement waits for another
+	// connection's lock before it fails with ErrorKind.Conflict.
+	// Fails with a DbError of ErrorKind.Connection when the file cannot be
+	// opened or is not a database.
+	def open(path string, mode Mode = Mode.ReadWriteCreate, busyTimeout duration = 5s) !Connection {
+		let name = path
+		let flags = openReadWrite | openCreate
+		match mode {
+			case Mode.ReadOnly:
+				flags = openReadOnly
+			case Mode.ReadWrite:
+				flags = openReadWrite
+			case Mode.ReadWriteCreate:
+				flags = openReadWrite | openCreate
+			case Mode.Memory:
+				name = ":memory:"
+		}
+		name = ":memory:" when name == ""
+
+		let handle = asqOpen(name, flags, int(busyTimeout) / 1000000)
+		fail db.errorOf(db.ErrorKind.Connection, "sqlite: out of memory opening '{name}'") when handle == 0
+
+		let code = asqErrorCode(handle)
+		if code != 0 {
+			let reason = owned(asqErrorMessage(handle))
+			asqClose(handle)
+			fail db.errorOf(db.ErrorKind.Connection, "sqlite: cannot open '{name}': {reason}", "", code)
+		}
+		return new Connection(handle)
+	}
+
+	// version returns the version of the SQLite engine in the program,
+	// such as "3.53.4".
+	def version() string {
+		return owned(asqVersion())
+	}
+
+	internal const openReadOnly = 0x1
+	internal const openReadWrite = 0x2
+	internal const openCreate = 0x4
+
+	// The pragmas a URL may set.
+	internal const urlPragmas = ["foreign_keys", "journal_mode", "synchronous", "cache_size", "temp_store", "locking_mode", "secure_delete", "recursive_triggers", "query_only"]
+
+	// Opens the database a `sqlite:` URL names and applies its options.
+	internal def connectURL(target url.URL) !Connection {
+		let path = target.opaque
+		if path == "" {
+			path = target.host + target.path
+		} else {
+			path = try url.pathUnescape(path)
+		}
+
+		let mode = Mode.ReadWriteCreate
+		let busy = 5s
+		let pragmas string[]
+		for let (_, pair) in target.query().pairs() {
+			match pair.key {
+				case "mode":
+					match pair.value {
+						case "ro":
+							mode = Mode.ReadOnly
+						case "rw":
+							mode = Mode.ReadWrite
+						case "rwc":
+							mode = Mode.ReadWriteCreate
+						case "memory":
+							mode = Mode.Memory
+						default:
+							fail db.errorOf(db.ErrorKind.Other, "sqlite: mode '{pair.value}' is not ro, rw, rwc or memory")
+					}
+				case "busy_timeout":
+					fail db.errorOf(db.ErrorKind.Other, "sqlite: busy_timeout '{pair.value}' is not a number of milliseconds") unless isPlainNumber(pair.value)
+					busy = duration(pair.value.toInt<int>() * 1000000)
+				default:
+					fail db.errorOf(db.ErrorKind.Other, "sqlite: unknown option '{pair.key}'") unless urlPragmas.includes(pair.key)
+					fail db.errorOf(db.ErrorKind.Other, "sqlite: '{pair.value}' is not a value for {pair.key}") unless isPragmaValue(pair.value)
+					pragmas.push("PRAGMA {pair.key} = {pair.value}")
+			}
+		}
+		mode = Mode.Memory when path == ":memory:"
+
+		let conn = try open(path, mode, busy)
+		for let (_, pragma) in pragmas {
+			let rows = try conn.query(pragma)
+			try rows.close()
+		}
+		return conn
+	}
+
+	// Reports whether the text is digits only.
+	internal def isPlainNumber(text string) bool {
+		return /^[0-9]{1,9}$/.test(text)
+	}
+
+	// Reports whether the text is a word or a number, the only forms a
+	// pragma set from a URL takes.
+	internal def isPragmaValue(text string) bool {
+		return /^-?[A-Za-z0-9_]{1,32}$/.test(text)
+	}
+}

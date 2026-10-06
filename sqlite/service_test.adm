@@ -1,0 +1,60 @@
+partial module adm.database.sqlite {
+	use (
+		std.testing
+		std.services.database::(Database, db)
+	)
+
+	// Statements as plain functions: they run on the Database service's
+	// connections, the default one unless `@db` names another.
+	sql def addNote(body string) !none {
+		INSERT INTO notes (body) VALUES ({body})
+	}
+
+	sql def noteCount() !int {
+		SELECT count(*) FROM notes
+	}
+
+	sql def noteBodies() !string[] {
+		SELECT body FROM notes ORDER BY id
+	}
+
+	@db("archive")
+	sql def archiveNote(body string) !none {
+		INSERT INTO notes (body) VALUES ({body})
+	}
+
+	@db("archive")
+	sql def archivedCount() !int {
+		SELECT count(*) FROM notes
+	}
+
+	check "sql def on the Database service" {
+		@test()
+		def TestFunctionsRunOnTheDefaultAndNamedConnections() !none {
+			try await Database.stop()
+			let message = ""
+			noteCount() onerror (err error) {
+				message = err.message
+				recover -1
+			}
+			assert message.startsWith("no database connection for this sql def")
+
+			try await Database.start()
+			// One connection each: a database in memory belongs to its
+			// connection.
+			try Database.add("", "sqlite::memory:", 1)
+			try Database.add("archive", "sqlite::memory:", 1)
+			try Database.exec("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")
+			let archive = try Database.get("archive")
+			try archive.exec("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")
+
+			try addNote("first")
+			try addNote("second")
+			try archiveNote("old")
+			assert try noteCount() == 2
+			assert try archivedCount() == 1
+			assert (try noteBodies()).join(",") == "first,second"
+			try await Database.stop()
+		}
+	}
+}

@@ -1,0 +1,295 @@
+// PostgreSQL for std.data.db. Linking this library registers the
+// `postgres:` and `postgresql:` schemes, so
+// `db.connect("postgres://app:secret@db.internal:5432/shop")` opens a
+// session with a server over the network.
+partial module adm.database.postgres {
+	use (
+		std.crypto.hash
+		std.data.db
+		std.net
+		std.net.sasl
+		std.net.tls
+		std.net.url
+		adm.database.postgres.wire::*
+	)
+
+	// Postgres is the driver of the `postgres:` and `postgresql:` schemes.
+	//
+	//     postgres://user:password@host:5432/database?sslmode=verify-full
+	//
+	// The port is 5432 when left out, the database the user's name. Options
+	// in the query:
+	//
+	// - `sslmode`: `disable` and `allow` (no TLS), `prefer` (TLS when the
+	//   server offers it, the default), `require` (TLS, certificate not
+	//   checked), `verify-ca` and `verify-full` (TLS with the certificate
+	//   checked against the system's authorities and the host name).
+	// - `connect_timeout`: seconds to wait for the connection, 30 by default.
+	// - `read_timeout`: seconds a statement may take to answer, 0 for no
+	//   limit (the default); past it the statement fails with
+	//   ErrorKind.TimedOut and the connection closes.
+	// - anything else is sent to the server as a session setting
+	//   (`application_name`, `search_path`, `statement_timeout`, ...).
+	//
+	// The password is checked with SCRAM-SHA-256 (bound to the TLS channel
+	// when the server offers it), MD5 or sent as text, whichever the server
+	// asks for.
+	@db.driver("postgres", "postgresql")
+	type Postgres {
+		def new() {}
+
+		// placeholder returns Placeholder.Dollar: `$1`, `$2`, ...
+		def placeholder() db.Placeholder {
+			return db.Placeholder.Dollar
+		}
+
+		// connect opens a session with the server the URL names.
+		// Fails with a DbError: ErrorKind.Connection when the server cannot
+		// be reached or TLS fails, ErrorKind.Denied when it refuses the user
+		// or password, ErrorKind.Other for an option value it does not take.
+		def connect(target url.URL) !db.Connection {
+			return try dial(target)
+		}
+	}
+
+	// open opens a session with the server a `postgres:` URL names and
+	// returns it as its own type, for what PostgreSQL has beyond
+	// std.data.db: `interrupt`, `setting`, `processId`.
+	// Fails with a DbError as `Postgres.connect` does, and with a UrlError
+	// when the text is not a URL.
+	def open(target string) !Connection {
+		return dial(try url.parse(target))
+	}
+
+	internal const sslRequestCode = 80877103
+	internal const cancelRequestCode = 80877102
+	internal const protocolVersion = 196608
+
+	// Target is where and how a session was opened, kept to open the side
+	// connection a cancel request travels on.
+	struct Target {
+		host    string
+		port    int
+		secure  bool
+		verify  bool
+		timeout duration
+	}
+
+	// Opens a stream to the server, under TLS as the mode asks.
+	internal def openStream(host string, port int, mode string, timeout duration) !(net.Stream, ?tls.Conn) {
+		let address = host.contains(":") ?? ("[{host}]:{port}", "{host}:{port}")
+		let socket = net.dialStream(address, timeout) onerror (err error) {
+			fail db.errorOf(db.ErrorKind.Connection, "postgres: {err.message}")
+		}
+		if mode := "disable" || "allow" {
+			let plain net.Stream = socket
+			return (plain, none)
+		}
+
+		let request = new Batch()
+		request.open(0)
+		request.put32(sslRequestCode)
+		request.end()
+		let wire = new Wire(socket, timeout)
+		try wire.send(request)
+		let answer = try wire.readByte()
+		if answer != 83 {
+			fail db.errorOf(db.ErrorKind.Connection, "postgres: the server does not offer TLS and sslmode is {mode}") unless mode == "prefer"
+			let plain net.Stream = socket
+			return (plain, none)
+		}
+		// Nothing may follow the answer in clear: it would be data injected
+		// ahead of the handshake.
+		fail db.errorOf(db.ErrorKind.Connection, "postgres: unexpected data before the TLS handshake") when wire.buffered() > 0
+
+		let config = tls.Config{}
+		config.serverName = host
+		config.insecureSkipVerify = mode := "prefer" || "require"
+		let secured = tls.client(socket, config)
+		secured.handshake(timeout) onerror (err error) {
+			fail db.errorOf(db.ErrorKind.Connection, "postgres: TLS: {err.message}")
+		}
+		let stream net.Stream = secured
+		return (stream, secured)
+	}
+
+	// Opens and authenticates a session.
+	internal def dial(target url.URL) !Connection {
+		let host = target.hostname()
+		host = "localhost" when host == ""
+		let port = target.port()
+		port = 5432 when port <= 0
+
+		let user = ""
+		let password = ""
+		let info = target.user
+		if !(info is none) {
+			user = info.username
+			let given = info.password
+			password = given unless given is none
+		}
+		fail db.errorOf(db.ErrorKind.Other, "postgres: the URL names no user") when user == ""
+
+		let database = target.path
+		database = database.slice(1, database.len()) when database.startsWith("/")
+		database = user when database == ""
+
+		let mode = "prefer"
+		let timeout = 30s
+		let reads = 0s
+		let settings = new map<string, string>()
+		for let (_, pair) in target.query().pairs() {
+			match pair.key {
+				case "sslmode":
+					fail db.errorOf(db.ErrorKind.Other, "postgres: sslmode '{pair.value}' is not disable, allow, prefer, require, verify-ca or verify-full") unless pair.value := "disable" || "allow" || "prefer" || "require" || "verify-ca" || "verify-full"
+					mode = pair.value
+				case "connect_timeout":
+					fail db.errorOf(db.ErrorKind.Other, "postgres: connect_timeout '{pair.value}' is not a number of seconds") unless /^[0-9]{1,6}$/.test(pair.value)
+					timeout = duration(pair.value.toInt<int>() * 1000000000)
+					timeout = 30s when timeout == 0s
+				case "read_timeout":
+					fail db.errorOf(db.ErrorKind.Other, "postgres: read_timeout '{pair.value}' is not a number of seconds") unless /^[0-9]{1,6}$/.test(pair.value)
+					reads = duration(pair.value.toInt<int>() * 1000000000)
+				default:
+					settings.set(pair.key, pair.value)
+			}
+		}
+
+		let (stream, secured) = try openStream(host, port, mode, timeout)
+		let wire = new Wire(stream, timeout)
+
+		let startup = new Batch()
+		startup.open(0)
+		startup.put32(protocolVersion)
+		startup.text("user")
+		startup.text(user)
+		startup.text("database")
+		startup.text(database)
+		startup.text("client_encoding")
+		startup.text("UTF8")
+		for let (key, value) in settings {
+			startup.text(key)
+			startup.text(value)
+		}
+		startup.put8(0)
+		startup.end()
+		try wire.send(startup)
+
+		let conn = new Connection(wire, Target{host: host, port: port, secure: !(secured is none), verify: mode := "verify-ca" || "verify-full", timeout: timeout})
+		authenticate(conn, user, password, secured) onerror (err error) {
+			stream.close() onerror recover none
+			fail err
+		}
+		// A day stands for no limit: a read needs some bound.
+		wire.timeout = reads == 0s ?? (24h, reads)
+		return conn
+	}
+
+	// Answers the server's authentication requests, then reads its settings
+	// up to the first ReadyForQuery.
+	internal def authenticate(conn Connection, user string, password string, secured ?tls.Conn) !none {
+		let wire = conn.wire
+		let scram ?sasl.ScramClient = none
+		for {
+			let kind = try wire.read()
+			match kind {
+				case 82:
+					let c = new Cursor(wire.body)
+					let code = c.get32()
+					match code {
+						case 0:
+							continue
+						case 3:
+							let reply = new Batch()
+							reply.open(112)
+							reply.text(password)
+							reply.end()
+							try wire.send(reply)
+						case 5:
+							let salt = c.rest()
+							let inner = hash.digest(hash.Hash.MD5, (password + user).bytes()).hex().lower()
+							let salted = inner.bytes()
+							salted.push(...salt)
+							let reply = new Batch()
+							reply.open(112)
+							reply.text("md5" + hash.digest(hash.Hash.MD5, salted).hex().lower())
+							reply.end()
+							try wire.send(reply)
+						case 10:
+							let offered string[]
+							for c.more() {
+								let name = c.text()
+								break when name == ""
+								offered.push(name)
+							}
+							let list = offered.join(", ")
+							fail db.errorOf(db.ErrorKind.Denied, "postgres: the server offers no SCRAM-SHA-256 login ({list})") unless offered.includes("SCRAM-SHA-256")
+							let binding ?sasl.ChannelBinding = none
+							binding = endPointBinding(secured) when !(secured is none) && offered.includes("SCRAM-SHA-256-PLUS")
+							let secret Secret<string> = password
+							let client = new sasl.ScramClient("", secret, sasl.ScramMechanism.Sha256, binding)
+							client.bindingOffered = offered.includes("SCRAM-SHA-256-PLUS")
+							let first = client.first() onerror (err error) {
+								fail db.errorOf(db.ErrorKind.Connection, "postgres: SCRAM: {err.message}")
+							}
+							let reply = new Batch()
+							reply.open(112)
+							reply.text(client.mechanismName())
+							reply.put32(first.bytes().len())
+							reply.bytes(first.bytes())
+							reply.end()
+							try wire.send(reply)
+							scram = client
+						case 11:
+							fail db.errorOf(db.ErrorKind.Connection, "postgres: SCRAM reply without a SCRAM login") when scram is none
+							let final = scram.final(string(c.rest())) onerror (err error) {
+								fail db.errorOf(db.ErrorKind.Denied, "postgres: SCRAM: {err.message}")
+							}
+							let reply = new Batch()
+							reply.open(112)
+							reply.bytes(final.bytes())
+							reply.end()
+							try wire.send(reply)
+						case 12:
+							fail db.errorOf(db.ErrorKind.Connection, "postgres: SCRAM reply without a SCRAM login") when scram is none
+							scram.verify(string(c.rest())) onerror (err error) {
+								fail db.errorOf(db.ErrorKind.Denied, "postgres: the server did not prove it knows the password: {err.message}")
+							}
+						default:
+							fail db.errorOf(db.ErrorKind.Denied, "postgres: the server asks for a login method this driver does not have (code {code})")
+					}
+				case 83:
+					let c = new Cursor(wire.body)
+					let name = c.text()
+					conn.settings.set(name, c.text())
+				case 75:
+					let c = new Cursor(wire.body)
+					conn.pid = c.get32()
+					conn.secret = c.get32()
+				case 90:
+					conn.status = int(wire.body[0])
+					return none
+				case 69:
+					let failure = serverError(wire.body)
+					// Before the session is up every refusal is about who is
+					// connecting.
+					fail db.errorOf(failure.kind == db.ErrorKind.Other ?? (db.ErrorKind.Denied, failure.kind), failure.message, failure.sqlState)
+				default:
+					continue
+			}
+		}
+		fail db.errorOf(db.ErrorKind.Connection, "postgres: the login did not finish")
+	}
+
+	// The hash of the server's certificate, for a login bound to the TLS
+	// channel; none when the certificate's signature names no hash.
+	internal def endPointBinding(secured tls.Conn) ?sasl.ChannelBinding {
+		let failed = false
+		let data = secured.channelBinding("tls-server-end-point") onerror (err error) {
+			failed = true
+			recover byte[]
+		}
+		return none when failed
+		return sasl.ChannelBinding{kind: "tls-server-end-point", data: data}
+	}
+}

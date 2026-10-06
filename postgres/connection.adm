@@ -1,0 +1,643 @@
+partial module adm.database.postgres {
+	use (
+		std.data.db
+		std.net
+		adm.database.postgres.wire::*
+		adm.database.postgres.values::*
+	)
+
+	// Connection is one session with a PostgreSQL server. It implements
+	// std.data.db.Connection; `interrupt`, `setting` and `processId` are
+	// PostgreSQL's own.
+	//
+	// `exec` without arguments may hold several statements separated by
+	// `;`; with arguments, and for `query` and `prepare`, the text is one
+	// statement. The overloads that take `named` rewrite `:name`
+	// placeholders to `$n` (std.data.db.positional) when no positional
+	// arguments are given.
+	//
+	// Rows are read from the server as `next` asks for them. Running another
+	// statement on the connection ends the rows still open on it.
+	type Connection {
+		wire     Wire
+		target   Target
+		// What the server reported about the session: `server_version`,
+		// `TimeZone`, `client_encoding`, ...
+		settings map<string, string>
+		// The server process serving the session, and the key a cancel
+		// request must carry.
+		pid      int
+		secret   int
+		// The transaction status of the last ReadyForQuery: 73 idle, 84 in
+		// a transaction, 69 in a failed transaction.
+		status   int                 = 73
+		closed   bool
+		// Set while a result is still unread on the wire.
+		busy     bool
+		// Counts the statements run, so rows of an earlier one know they
+		// have ended.
+		serial   int
+		// Names the prepared statements.
+		counter  int
+
+		def new(wire Wire, target Target) {
+			self.wire = wire
+			self.target = target
+			settings = new map<string, string>()
+		}
+
+		// placeholder implements std.data.db.Queryable.
+		def placeholder() db.Placeholder {
+			return db.Placeholder.Dollar
+		}
+
+		// exec implements std.data.db.Queryable.
+		// Fails with a DbError when the database rejects the statement, an
+		// argument cannot be bound, or the connection is closed or lost.
+		def exec(statement string, args ...any) !db.Result {
+			return try simple(self, statement) when args.len() == 0
+			return try execute(self, "", statement, args)
+		}
+
+		// exec implements std.data.db.Queryable.
+		// Fails with a DbError when the database rejects the statement, an
+		// argument cannot be bound, or the connection is closed or lost.
+		def exec(statement string, named map<string, any>, args ...any) !db.Result {
+			if named.len() > 0 && args.len() == 0 {
+				let (text, ordered) = try db.positional(statement, named, db.Placeholder.Dollar)
+				return try execute(self, "", text, ordered)
+			}
+			return try simple(self, statement) when args.len() == 0
+			return try execute(self, "", statement, args)
+		}
+
+		// query implements std.data.db.Queryable.
+		// Fails with a DbError when the database rejects the statement, an
+		// argument cannot be bound, or the connection is closed or lost.
+		def query(statement string, args ...any) !db.Rows {
+			return try open(self, "", statement, args)
+		}
+
+		// query implements std.data.db.Queryable.
+		// Fails with a DbError when the database rejects the statement, an
+		// argument cannot be bound, or the connection is closed or lost.
+		def query(statement string, named map<string, any>, args ...any) !db.Rows {
+			if named.len() > 0 && args.len() == 0 {
+				let (text, ordered) = try db.positional(statement, named, db.Placeholder.Dollar)
+				return try open(self, "", text, ordered)
+			}
+			return try open(self, "", statement, args)
+		}
+
+		// prepare implements std.data.db.Queryable.
+		// Fails with a DbError when the database rejects the statement, or the
+		// connection is closed or lost.
+		def prepare(statement string) !db.Statement {
+			try ready(self)
+			let (text, names) = db.placeholders(statement, db.Placeholder.Dollar)
+			counter++
+			let name = "adm_{counter}"
+			let batch = new Batch()
+			batch.open(80)
+			batch.text(name)
+			batch.text(text)
+			batch.put16(0)
+			batch.end()
+			batch.open(83)
+			batch.end()
+			try wire.send(batch)
+			try settle(self)
+			return new Statement(self, name, names)
+		}
+
+		// beginTx implements std.data.db.Connection.
+		// Fails with a DbError when a transaction is already open on the
+		// connection, or the connection is closed or lost.
+		def beginTx(isolation db.Isolation = db.Isolation.Default, readOnly bool = false) !db.Transaction {
+			try ready(self)
+			fail db.errorOf(db.ErrorKind.Other, "postgres: a transaction is already open on this connection") when status != 73
+			let text = "BEGIN"
+			match isolation {
+				case db.Isolation.ReadUncommitted:
+					text = "BEGIN ISOLATION LEVEL READ UNCOMMITTED"
+				case db.Isolation.ReadCommitted:
+					text = "BEGIN ISOLATION LEVEL READ COMMITTED"
+				case db.Isolation.RepeatableRead:
+					text = "BEGIN ISOLATION LEVEL REPEATABLE READ"
+				case db.Isolation.Serializable:
+					text = "BEGIN ISOLATION LEVEL SERIALIZABLE"
+				default:
+					text = "BEGIN"
+			}
+			text = text + " READ ONLY" when readOnly
+			try simple(self, text)
+			return new Transaction(self)
+		}
+
+		// ping implements std.data.db.Connection.
+		// Fails with a DbError when the database does not answer.
+		def ping() !none {
+			try simple(self, "")
+			return none
+		}
+
+		// close implements std.data.db.Connection.
+		// Fails with a DbError when the database reports a failure while
+		// closing.
+		def close() !none {
+			return none when closed
+			closed = true
+			let bye = new Batch()
+			bye.open(88)
+			bye.end()
+			wire.send(bye) onerror recover none
+			wire.stream.close() onerror recover none
+			return none
+		}
+
+		// setting returns what the server reported for a session setting
+		// (`server_version`, `TimeZone`, `server_encoding`), none when it
+		// reported none under that name.
+		def setting(name string) ?string {
+			return settings.get(name)
+		}
+
+		// processId returns the server process serving the session, as
+		// `pg_backend_pid()` does.
+		def processId() int {
+			return pid
+		}
+
+		// interrupt asks the server to stop the statement running on this
+		// connection, from any task: a cancel request on a connection of its
+		// own. The statement then fails with ErrorKind.TimedOut.
+		// Fails with a DbError of ErrorKind.Connection when the server
+		// cannot be reached for it.
+		def interrupt() !none {
+			let (stream, _) = try openStream(target.host, target.port, target.secure ?? (target.verify ?? ("verify-full", "require"), "disable"), target.timeout)
+			let request = new Batch()
+			request.open(0)
+			request.put32(cancelRequestCode)
+			request.put32(pid)
+			request.put32(secret)
+			request.end()
+			let side = new Wire(stream, target.timeout)
+			let outcome = side.send(request)
+			stream.close() onerror recover none
+			try outcome
+			return none
+		}
+
+		def dispose() {
+			return when closed
+			closed = true
+			wire.stream.close() onerror recover none
+		}
+	}
+
+	// Transaction is a PostgreSQL transaction on its connection.
+	internal type Transaction {
+		conn  Connection
+		ended bool
+
+		def new(conn Connection) {
+			self.conn = conn
+		}
+
+		def placeholder() db.Placeholder {
+			return db.Placeholder.Dollar
+		}
+
+		def exec(statement string, args ...any) !db.Result {
+			try running()
+			return conn.exec(statement, ...args)
+		}
+
+		def exec(statement string, named map<string, any>, args ...any) !db.Result {
+			try running()
+			return conn.exec(statement, named, ...args)
+		}
+
+		def query(statement string, args ...any) !db.Rows {
+			try running()
+			return conn.query(statement, ...args)
+		}
+
+		def query(statement string, named map<string, any>, args ...any) !db.Rows {
+			try running()
+			return conn.query(statement, named, ...args)
+		}
+
+		def prepare(statement string) !db.Statement {
+			try running()
+			return conn.prepare(statement)
+		}
+
+		def commitTx() !none {
+			try running()
+			ended = true
+			// COMMIT of a transaction a statement already failed in answers
+			// ROLLBACK: nothing was applied.
+			let failedInside = conn.status == 69
+			try simple(conn, "COMMIT")
+			fail db.errorOf(db.ErrorKind.Other, "postgres: the transaction had failed and was rolled back", "25P02") when failedInside
+			return none
+		}
+
+		def rollbackTx() !none {
+			return none when ended
+			ended = true
+			return none when conn.closed
+			try simple(conn, "ROLLBACK")
+			return none
+		}
+
+		def running() !none {
+			fail db.errorOf(db.ErrorKind.Closed, "postgres: the transaction has ended") when ended
+			return none
+		}
+
+		def dispose() {
+			return when ended || conn.closed
+			ended = true
+			simple(conn, "ROLLBACK") onerror recover db.Result{affected: 0, lastInsertId: 0}
+		}
+	}
+
+	// Statement is a statement the server has parsed, under a name.
+	internal type Statement {
+		conn   Connection
+		name   string
+		// The `:name` placeholders of the text, in the order of `$1`...
+		names  string[]
+		closed bool
+
+		def new(conn Connection, name string, names string[]) {
+			self.conn = conn
+			self.name = name
+			self.names = names
+		}
+
+		def exec(args ...any) !db.Result {
+			try usable()
+			return try execute(conn, name, "", args)
+		}
+
+		def exec(named map<string, any>, args ...any) !db.Result {
+			try usable()
+			return try execute(conn, name, "", try ordered(named, args))
+		}
+
+		def query(args ...any) !db.Rows {
+			try usable()
+			return try open(conn, name, "", args)
+		}
+
+		def query(named map<string, any>, args ...any) !db.Rows {
+			try usable()
+			return try open(conn, name, "", try ordered(named, args))
+		}
+
+		def close() !none {
+			return none when closed
+			closed = true
+			return none when conn.closed
+			try ready(conn)
+			let batch = new Batch()
+			batch.open(67)
+			batch.put8(83)
+			batch.text(name)
+			batch.end()
+			batch.open(83)
+			batch.end()
+			try conn.wire.send(batch)
+			try settle(conn)
+			return none
+		}
+
+		def usable() !none {
+			fail db.errorOf(db.ErrorKind.Closed, "postgres: the statement is closed") when closed
+			return none
+		}
+
+		// The arguments in placeholder order: by name when the text had
+		// `:name` placeholders and no positional arguments came, else as
+		// given.
+		def ordered(named map<string, any>, args any[]) !any[] {
+			return args when args.len() > 0 || names.len() == 0
+			let out any[]
+			for let (_, key) in names {
+				fail db.errorOf(db.ErrorKind.Type, "postgres: no argument named '{key}'") unless named.hasKey(key)
+				out.push(named[key])
+			}
+			return out
+		}
+	}
+
+	// Rows is a result being read from the server.
+	internal type Rows {
+		conn   Connection
+		serial int
+		cols   db.Column[]
+		oids   int[]
+		ended  bool
+		onRow  bool
+		// The current row's message, with where each column's bytes start
+		// and how many they are (-1 for NULL).
+		row    byte[]
+		starts int[]
+		sizes  int[]
+
+		def new(conn Connection, cols db.Column[], oids int[]) {
+			self.conn = conn
+			self.cols = cols
+			self.oids = oids
+			serial = conn.serial
+			starts.len(cols.len())
+			sizes.len(cols.len())
+		}
+
+		def columns() db.Column[] {
+			return cols
+		}
+
+		def next() !bool {
+			return false when ended
+			fail db.errorOf(db.ErrorKind.Closed, "postgres: another statement ran on the connection and ended these rows") when conn.serial != serial
+			onRow = false
+			let failure ?db.DbError = none
+			for {
+				let kind = try receive(conn)
+				match kind {
+					case 68:
+						let c = new Cursor(conn.wire.body)
+						let count = c.get16()
+						for let i = 0; i < count && i < starts.len(); i++ {
+							let size = c.get32()
+							sizes[i] = size
+							starts[i] = c.at
+							c.at += size when size > 0
+						}
+						row = conn.wire.body
+						onRow = true
+						return true
+					case 69:
+						failure = serverError(conn.wire.body)
+					case 90:
+						conn.status = int(conn.wire.body[0])
+						conn.busy = false
+						ended = true
+						fail failure unless failure is none
+						return false
+					default:
+						continue
+				}
+			}
+			return false
+		}
+
+		def isNull(column int) bool {
+			return true unless onRow && column >= 0 && column < sizes.len()
+			return sizes[column] < 0
+		}
+
+		def bool(column int) !bool {
+			let data = try cell(column)
+			fail mismatch(column, "bool") unless oids[column] == oidBool
+			return data.len() > 0 && int(data[0]) == 116
+		}
+
+		def int(column int) !int {
+			let data = try cell(column)
+			fail mismatch(column, "int") unless oids[column] := oidInt8 || oidInt4 || oidInt2 || oidOid
+			let n = intOf(data)
+			fail mismatch(column, "int") when n is none
+			return n
+		}
+
+		def float(column int) !float {
+			let data = try cell(column)
+			fail mismatch(column, "float") unless oids[column] := oidFloat8 || oidFloat4 || oidInt8 || oidInt4 || oidInt2
+			let f = floatOf(string(data))
+			fail mismatch(column, "float") when f is none
+			return f
+		}
+
+		def string(column int) !string {
+			let data = try cell(column)
+			return string(data)
+		}
+
+		def bytes(column int) !byte[] {
+			let data = try cell(column)
+			return byteaOf(data) when oids[column] == oidBytea
+			return data.clone()
+		}
+
+		def value(column int) !any {
+			fail db.errorOf(db.ErrorKind.Type, "postgres: no row is current") unless onRow
+			fail db.errorOf(db.ErrorKind.Type, "postgres: the result has no column {column}") when column < 0 || column >= sizes.len()
+			return none when sizes[column] < 0
+			return valueOf(oids[column], row[starts[column]:starts[column] + sizes[column]])
+		}
+
+		def close() !none {
+			return none when ended
+			ended = true
+			onRow = false
+			return none when conn.serial != serial || conn.closed
+			return drain(conn)
+		}
+
+		// The bytes of a column of the current row.
+		// Fails with ErrorKind.Type when no row is current, the index is out
+		// of range or the column is NULL.
+		def cell(column int) !byte[] {
+			fail db.errorOf(db.ErrorKind.Type, "postgres: no row is current") unless onRow
+			fail db.errorOf(db.ErrorKind.Type, "postgres: the result has no column {column}") when column < 0 || column >= sizes.len()
+			fail db.errorOf(db.ErrorKind.Type, "postgres: column '{cols[column].name}' is NULL") when sizes[column] < 0
+			return row[starts[column]:starts[column] + sizes[column]]
+		}
+
+		def mismatch(column int, wanted string) db.DbError {
+			return db.errorOf(db.ErrorKind.Type, "postgres: column '{cols[column].name}' ({cols[column].typeName}) does not read as {wanted}")
+		}
+	}
+
+	// Reads the next message of a result. A read that fails or runs out of
+	// time leaves the session mid-answer, so it closes the connection.
+	internal def receive(conn Connection) !int {
+		return conn.wire.read() onerror (err error) {
+			conn.closed = true
+			conn.busy = false
+			conn.wire.stream.close() onerror recover none
+			fail err
+		}
+	}
+
+	// Makes the connection ready for a new statement: open, and with the
+	// result of the one before read to its end.
+	internal def ready(conn Connection) !none {
+		fail db.errorOf(db.ErrorKind.Closed, "postgres: the connection is closed") when conn.closed
+		try drain(conn) when conn.busy
+		conn.serial++
+		return none
+	}
+
+	// Reads and drops what is left of a result, up to ReadyForQuery.
+	internal def drain(conn Connection) !none {
+		for conn.busy {
+			let kind = try receive(conn)
+			if kind == 90 {
+				conn.status = int(conn.wire.body[0])
+				conn.busy = false
+			}
+		}
+		return none
+	}
+
+	// Reads answers up to ReadyForQuery.
+	// Fails with the first error the server reported among them.
+	internal def settle(conn Connection) !db.Result {
+		let failure ?db.DbError = none
+		let changed = 0
+		for {
+			let kind = try receive(conn)
+			match kind {
+				case 67:
+					let c = new Cursor(conn.wire.body)
+					changed += tagCount(c.text())
+				case 69:
+					failure = serverError(conn.wire.body) when failure is none
+				case 83:
+					let c = new Cursor(conn.wire.body)
+					let name = c.text()
+					conn.settings.set(name, c.text())
+				case 71, 87:
+					// COPY ... FROM STDIN has no data to give here.
+					let refuse = new Batch()
+					refuse.open(102)
+					refuse.text("COPY FROM STDIN is not available through exec")
+					refuse.end()
+					try conn.wire.send(refuse)
+				case 90:
+					conn.status = int(conn.wire.body[0])
+					conn.busy = false
+					fail failure unless failure is none
+					return db.Result{affected: changed, lastInsertId: 0}
+				default:
+					continue
+			}
+		}
+		return db.Result{affected: changed, lastInsertId: 0}
+	}
+
+	// Runs text through the simple query protocol: any number of statements,
+	// no arguments.
+	internal def simple(conn Connection, statement string) !db.Result {
+		try ready(conn)
+		let batch = new Batch()
+		batch.open(81)
+		batch.text(statement)
+		batch.end()
+		try conn.wire.send(batch)
+		conn.busy = true
+		return settle(conn)
+	}
+
+	// Sends one statement with its arguments through the extended query
+	// protocol: Parse (unless `name` is a prepared statement), Bind,
+	// Describe, Execute, Sync.
+	internal def submit(conn Connection, name string, statement string, args any[]) !none {
+		try ready(conn)
+		let params Param[]
+		for let (i, arg) in args {
+			params.push(try paramOf(arg, i + 1))
+		}
+
+		let batch = new Batch()
+		if name == "" {
+			batch.open(80)
+			batch.text("")
+			batch.text(statement)
+			batch.put16(0)
+			batch.end()
+		}
+		batch.open(66)
+		batch.text("")
+		batch.text(name)
+		batch.put16(params.len())
+		for let (_, p) in params {
+			batch.put16(p.format)
+		}
+		batch.put16(params.len())
+		for let (_, p) in params {
+			if p.null {
+				batch.put32(-1)
+				continue
+			}
+			batch.put32(p.data.len())
+			batch.bytes(p.data)
+		}
+		batch.put16(0)
+		batch.end()
+		batch.open(68)
+		batch.put8(80)
+		batch.text("")
+		batch.end()
+		batch.open(69)
+		batch.text("")
+		batch.put32(0)
+		batch.end()
+		batch.open(83)
+		batch.end()
+		try conn.wire.send(batch)
+		conn.busy = true
+		return none
+	}
+
+	// Runs one statement with arguments and reads its outcome.
+	internal def execute(conn Connection, name string, statement string, args any[]) !db.Result {
+		try submit(conn, name, statement, args)
+		return settle(conn)
+	}
+
+	// Runs one statement and returns its rows, positioned before the first.
+	internal def open(conn Connection, name string, statement string, args any[]) !Rows {
+		try submit(conn, name, statement, args)
+		for {
+			let kind = try receive(conn)
+			match kind {
+				case 84:
+					let c = new Cursor(conn.wire.body)
+					let count = c.get16()
+					let cols db.Column[]
+					let oids int[]
+					for let i = 0; i < count; i++ {
+						let label = c.text()
+						c.at += 6
+						let oid = c.get32()
+						c.at += 8
+						let known = typeNameOf(oid)
+						cols.push(db.Column{name: label, typeName: known == "" ?? ("oid {oid}", known), nullable: true})
+						oids.push(oid)
+					}
+					return new Rows(conn, cols, oids)
+				case 110:
+					// A statement without a result: its rows are none.
+					return new Rows(conn, db.Column[], int[])
+				case 69:
+					let failure = serverError(conn.wire.body)
+					try drain(conn)
+					fail failure
+				case 90:
+					conn.status = int(conn.wire.body[0])
+					conn.busy = false
+					fail db.errorOf(db.ErrorKind.Other, "postgres: the server answered without a result")
+				default:
+					continue
+			}
+		}
+		fail db.errorOf(db.ErrorKind.Other, "postgres: the server answered without a result")
+	}
+}

@@ -1,0 +1,256 @@
+// The PostgreSQL frontend/backend protocol, version 3.0: message framing,
+// the pieces messages are built from, and the server's error fields.
+internal partial module adm.database.postgres.wire {
+	use (
+		std.net
+		std.data.db
+	)
+
+	// Batch builds frontend messages one after another, to be written in
+	// one piece.
+	type Batch {
+		data  byte[]
+		// Where the open message's length field starts.
+		start int
+
+		def new() {}
+
+		// open opens a message of the given type; 0 opens one without a
+		// type byte (startup, SSL and cancel requests).
+		def open(kind int) {
+			data.push(byte(kind)) unless kind == 0
+			start = data.len()
+			data.push(byte(0), byte(0), byte(0), byte(0))
+		}
+
+		def put32(v int) {
+			data.push(byte((v >> 24) & 0xFF), byte((v >> 16) & 0xFF), byte((v >> 8) & 0xFF), byte(v & 0xFF))
+		}
+
+		def put16(v int) {
+			data.push(byte((v >> 8) & 0xFF), byte(v & 0xFF))
+		}
+
+		def put8(v int) {
+			data.push(byte(v))
+		}
+
+		// text adds a string and its closing zero byte.
+		def text(v string) {
+			data.push(...v.bytes())
+			data.push(byte(0))
+		}
+
+		def bytes(v byte[]) {
+			data.push(...v)
+		}
+
+		// end closes the open message by writing its length.
+		def end() {
+			let size = data.len() - start
+			data[start] = byte((size >> 24) & 0xFF)
+			data[start + 1] = byte((size >> 16) & 0xFF)
+			data[start + 2] = byte((size >> 8) & 0xFF)
+			data[start + 3] = byte(size & 0xFF)
+		}
+	}
+
+	// Wire reads backend messages from a stream and writes batches to it.
+	type Wire {
+		stream  net.Stream
+		// How long one read or write may wait.
+		timeout duration
+		buf     byte[]
+		head    int
+		tail    int
+		// The body of the message last read: a view into the buffer, good
+		// until the next read.
+		body    byte[]
+
+		def new(stream net.Stream, timeout duration) {
+			self.stream = stream
+			self.timeout = timeout
+			buf.len(16384)
+		}
+
+		// send writes a batch whole.
+		// Fails with a DbError of ErrorKind.Connection when the write does.
+		def send(batch Batch) !none {
+			let sent = 0
+			let n = batch.data.len()
+			for sent < n {
+				let wrote = stream.write(batch.data[sent:n], timeout) onerror (err error) {
+					fail db.errorOf(db.ErrorKind.Connection, "postgres: write: {err.message}")
+				}
+				fail db.errorOf(db.ErrorKind.Connection, "postgres: the connection closed while writing") when wrote <= 0
+				sent += wrote
+			}
+			return none
+		}
+
+		// read reads the next message, leaves its body in `body` and returns
+		// its type byte.
+		// Fails with a DbError: ErrorKind.TimedOut when nothing arrives within
+		// the timeout, ErrorKind.Connection when the read fails, the server
+		// closes the connection or the frame is malformed.
+		def read() !int {
+			try need(5)
+			let kind = int(buf[head])
+			let size = (int(buf[head + 1]) << 24) | (int(buf[head + 2]) << 16) | (int(buf[head + 3]) << 8) | int(buf[head + 4])
+			fail db.errorOf(db.ErrorKind.Connection, "postgres: malformed message length {size}") when size < 4 || size > 0x3FFFFFFF
+			try need(1 + size)
+			body = buf[head + 5:head + 1 + size]
+			head += 1 + size
+			return kind
+		}
+
+		// readByte reads one byte outside the message framing (the answer to
+		// an SSL request).
+		def readByte() !int {
+			try need(1)
+			let b = int(buf[head])
+			head++
+			return b
+		}
+
+		// buffered is how many bytes were read past the last message.
+		def buffered() int {
+			return tail - head
+		}
+
+		// Makes `count` bytes available from `head`.
+		def need(count int) !none {
+			return none when tail - head >= count
+			if head > 0 {
+				let kept = tail - head
+				for let i = 0; i < kept; i++ {
+					buf[i] = buf[head + i]
+				}
+				head = 0
+				tail = kept
+			}
+			if buf.len() < count {
+				let size = buf.len()
+				for size < count {
+					size = size * 2
+				}
+				buf.len(size)
+			}
+			for tail < count {
+				let got = stream.read(buf[tail:buf.len()], timeout) onerror (err error) {
+					let late = false
+					late = err.kind == net.ErrorCode.TimedOut when err is net.NetError
+					fail db.errorOf(late ?? (db.ErrorKind.TimedOut, db.ErrorKind.Connection), "postgres: read: {err.message}")
+				}
+				fail db.errorOf(db.ErrorKind.Connection, "postgres: the server closed the connection") when got <= 0
+				tail += got
+			}
+			return none
+		}
+	}
+
+	// Cursor walks the body of one message.
+	type Cursor {
+		data byte[]
+		at   int
+
+		def new(data byte[]) {
+			self.data = data
+		}
+
+		def get32() int {
+			let v = (int(data[at]) << 24) | (int(data[at + 1]) << 16) | (int(data[at + 2]) << 8) | int(data[at + 3])
+			at += 4
+			// The field is signed: -1 marks NULL.
+			return v >= 0x80000000 ?? (v - 0x100000000, v)
+		}
+
+		def get16() int {
+			let v = (int(data[at]) << 8) | int(data[at + 1])
+			at += 2
+			return v
+		}
+
+		def get8() int {
+			let v = int(data[at])
+			at++
+			return v
+		}
+
+		// text reads up to the next zero byte.
+		def text() string {
+			let end = at
+			for end < data.len() && int(data[end]) != 0 {
+				end++
+			}
+			let out = string(data[at:end])
+			at = end + 1
+			return out
+		}
+
+		def rest() byte[] {
+			let out = data[at:data.len()]
+			at = data.len()
+			return out
+		}
+
+		def more() bool {
+			return at < data.len()
+		}
+	}
+
+	// The DbError an ErrorResponse describes: its message with the detail
+	// when there is one, the SQLSTATE and the kind that code stands for.
+	def serverError(body byte[]) db.DbError {
+		let c = new Cursor(body)
+		let message = ""
+		let detail = ""
+		let state = ""
+		for c.more() {
+			let field = c.get8()
+			break when field == 0
+			let value = c.text()
+			match field {
+				case 77:
+					message = value
+				case 68:
+					detail = value
+				case 67:
+					state = value
+			}
+		}
+		message = "{message} ({detail})" when detail != ""
+		return db.errorOf(kindOfState(state), "postgres: {message}", state)
+	}
+
+	// The ErrorKind of a SQLSTATE.
+	def kindOfState(state string) db.ErrorKind {
+		return db.ErrorKind.Denied when state := "42501" || "25006"
+		return db.ErrorKind.Conflict when state := "40001" || "40P01" || "55P03"
+		return db.ErrorKind.TimedOut when state := "57014" || "25P03"
+		let family = state.len() >= 2 ?? (state.slice(0, 2), state)
+		match family {
+			case "23":
+				return db.ErrorKind.Constraint
+			case "42":
+				return db.ErrorKind.Syntax
+			case "28":
+				return db.ErrorKind.Denied
+			case "08", "57":
+				return db.ErrorKind.Connection
+			case "22":
+				return db.ErrorKind.Type
+			default:
+				return db.ErrorKind.Other
+		}
+	}
+
+	// The rows a CommandComplete tag counts: the last number of `INSERT 0 5`,
+	// `UPDATE 3`, `SELECT 2`; 0 for a tag without one.
+	def tagCount(tag string) int {
+		let parts = tag.split(" ")
+		let last = parts[parts.len() - 1]
+		return 0 unless /^[0-9]+$/.test(last)
+		return last.toInt<int>()
+	}
+}

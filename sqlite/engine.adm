@@ -1,0 +1,102 @@
+// The C side of adm.database.sqlite (adm_sqlite.c): SQLite behind functions
+// that take and return integers, strings and byte arrays. `db` is a database
+// handle from asqOpen, `stmt` a statement from asqPrepare. Result codes are
+// SQLite's: 0 ok, 100 a row is ready, 101 done. A string a function returns
+// is SQLite's own memory, good until the next call on the same handle: copy
+// it (`owned`) before keeping it.
+@link("m")
+internal module adm.database.sqlite.engine {
+	// Opens a database with SQLite's open flags and a wait of busyMs for
+	// locks. The handle comes back even when opening failed, so the reason
+	// can be read from it; 0 when memory ran out.
+	def asqOpen(name string, flags int, busyMs int) uint;
+
+	// Closes a database; one with statements still open closes with the last
+	// of them.
+	def asqClose(db uint) int;
+
+	// The extended result code of the last failed call on the database.
+	def asqErrorCode(db uint) int;
+
+	// The message of the last failed call on the database.
+	def asqErrorMessage(db uint) string;
+
+	// The message for a result code.
+	def asqErrorText(code int) string;
+
+	// Compiles the first statement of source[offset..n); tail[0] receives the
+	// offset of the next one. 0 when the text failed to compile
+	// (asqErrorCode is then not 0) or held only space and comments.
+	def asqPrepare(db uint, source byte[], n int, offset int, tail int[]) uint;
+
+	def asqFinalize(stmt uint) int;
+
+	// Makes a statement ready to run again and drops its bound values.
+	def asqReset(stmt uint) int;
+
+	def asqBindCount(stmt uint) int;
+
+	// The name of parameter `index` (from 1) with its prefix (":id", "@id",
+	// "$id", "?3"); "" for a plain `?`.
+	def asqBindName(stmt uint, index int) string;
+
+	def asqBindNull(stmt uint, index int) int;
+
+	def asqBindInt(stmt uint, index int, value int) int;
+
+	def asqBindFloat(stmt uint, index int, value float) int;
+
+	// Binds n bytes of UTF-8 text; SQLite keeps its own copy.
+	def asqBindText(stmt uint, index int, text byte[], n int) int;
+
+	// Binds n bytes; SQLite keeps its own copy.
+	def asqBindBlob(stmt uint, index int, data byte[], n int) int;
+
+	// Runs a statement to its first row (100) or its end (101); anything
+	// else is the result code of the failure. The task's processor is free
+	// while it works or waits for a lock.
+	def asqRun(stmt uint) int;
+
+	// Moves to the next row: 100, 101 or a result code.
+	def asqNext(stmt uint) int;
+
+	def asqColumnCount(stmt uint) int;
+
+	def asqColumnName(stmt uint, column int) string;
+
+	// The type the column was declared with; "" for an expression.
+	def asqColumnDeclared(stmt uint, column int) string;
+
+	// 0 when the result column is a table column declared NOT NULL, else 1.
+	def asqColumnNullable(db uint, stmt uint, column int) int;
+
+	// The storage class of a column of the current row: 1 integer, 2 float,
+	// 3 text, 4 blob, 5 NULL.
+	def asqColumnKind(stmt uint, column int) int;
+
+	def asqColumnInt(stmt uint, column int) int;
+
+	def asqColumnFloat(stmt uint, column int) float;
+
+	// Copies up to cap bytes of a text or blob column of the current row
+	// into out and returns how many bytes the column holds; a result above
+	// cap asks for a larger buffer.
+	def asqColumnCopy(stmt uint, column int, out byte[], cap int) int;
+
+	// Rows the last INSERT, UPDATE or DELETE on the database changed.
+	def asqChanges(db uint) int;
+
+	def asqLastInsertId(db uint) int;
+
+	// 1 when no transaction is open on the database.
+	def asqAutocommit(db uint) int;
+
+	// 1 when the statement makes no direct change to the database.
+	def asqReadOnly(stmt uint) int;
+
+	// Stops the statements running on the database, from any task.
+	def asqInterrupt(db uint);
+
+	// The SQLite version, "3.53.4".
+	def asqVersion() string;
+}

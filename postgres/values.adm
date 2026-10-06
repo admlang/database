@@ -1,0 +1,296 @@
+// How ADM values travel to PostgreSQL as parameters and come back from
+// result columns. Parameters and results use the text format, except
+// `byte[]` parameters, which are sent as they are.
+internal partial module adm.database.postgres.values {
+	use (
+		std.data.db
+		std.data.encoding
+		std.reflection
+		std.reflection::(FieldKind)
+		std.time
+		std.math
+	)
+
+	// Type OIDs of the builtin types the driver reads apart from text.
+	const oidBool = 16
+	const oidBytea = 17
+	const oidInt8 = 20
+	const oidInt2 = 21
+	const oidInt4 = 23
+	const oidOid = 26
+	const oidFloat4 = 700
+	const oidFloat8 = 701
+	const oidDate = 1082
+	const oidTime = 1083
+	const oidTimestamp = 1114
+	const oidTimestampTz = 1184
+	const oidNumeric = 1700
+
+	// Param is one bound parameter as it goes on the wire.
+	struct Param {
+		null   bool
+		// 0 text, 1 binary.
+		format int
+		data   byte[]
+	}
+
+	// The wire form of an argument.
+	// Fails with a DbError of ErrorKind.Type for a type that cannot be sent.
+	def paramOf(v any, index int) !Param {
+		match v {
+			case none:
+				return Param{null: true, format: 0, data: byte[]}
+			case bool:
+				return textParam(v ?? ("true", "false"))
+			case int:
+				return textParam(v.str())
+			case float:
+				return textParam(floatText(v))
+			case string:
+				return Param{null: false, format: 0, data: v.bytes()}
+			case byte[]:
+				return Param{null: false, format: 1, data: v}
+			case time.Time:
+				return textParam(v.str())
+			case time.Date:
+				return textParam(v.str())
+			case time.TimeOfDay:
+				return textParam(v.str())
+			case time.DateTime:
+				return textParam(v.str())
+			case math.Decimal:
+				return textParam(v.str())
+			case bigint:
+				return textParam(v.toRadix(10))
+			default:
+				match reflection.kindOf(v) {
+					case FieldKind.Int, FieldKind.Uint, FieldKind.Enum, FieldKind.Float:
+						return textParam(reflection.scalarText(v))
+					default:
+						fail db.errorOf(db.ErrorKind.Type, "postgres: argument {index} is a {reflection.typeName(v)}, which cannot be bound")
+				}
+		}
+	}
+
+	def textParam(text string) Param {
+		return Param{null: false, format: 0, data: text.bytes()}
+	}
+
+	// A float as PostgreSQL reads it.
+	def floatText(v float) string {
+		return "NaN" when v != v
+		return "Infinity" when v > 1.7976931348623157e308
+		return "-Infinity" when v < -1.7976931348623157e308
+		return v.str()
+	}
+
+	// The name PostgreSQL gives a builtin type, "" for one the driver does
+	// not know by number.
+	def typeNameOf(oid int) string {
+		match oid {
+			case 16:
+				return "bool"
+			case 17:
+				return "bytea"
+			case 18:
+				return "char"
+			case 19:
+				return "name"
+			case 20:
+				return "int8"
+			case 21:
+				return "int2"
+			case 23:
+				return "int4"
+			case 25:
+				return "text"
+			case 26:
+				return "oid"
+			case 114:
+				return "json"
+			case 142:
+				return "xml"
+			case 700:
+				return "float4"
+			case 701:
+				return "float8"
+			case 790:
+				return "money"
+			case 829:
+				return "macaddr"
+			case 869:
+				return "inet"
+			case 650:
+				return "cidr"
+			case 1042:
+				return "bpchar"
+			case 1043:
+				return "varchar"
+			case 1082:
+				return "date"
+			case 1083:
+				return "time"
+			case 1114:
+				return "timestamp"
+			case 1184:
+				return "timestamptz"
+			case 1186:
+				return "interval"
+			case 1266:
+				return "timetz"
+			case 1700:
+				return "numeric"
+			case 2950:
+				return "uuid"
+			case 3802:
+				return "jsonb"
+			default:
+				return ""
+		}
+	}
+
+	// An integer in decimal digits, none when the bytes are not one.
+	def intOf(data byte[]) ?int {
+		let n = data.len()
+		return none when n == 0 || n > 20
+		let i = 0
+		let negative = int(data[0]) == 45
+		i = 1 when negative || int(data[0]) == 43
+		return none when i >= n
+		let v = 0
+		for i < n {
+			let d = int(data[i]) - 48
+			return none when d < 0 || d > 9
+			// Accumulate below zero: the lowest int64 has no positive twin.
+			let next = v * 10 - d
+			return none when next > v
+			v = next
+			i++
+		}
+		return v when negative
+		return none when v == -9223372036854775807 - 1
+		return -v
+	}
+
+	// A float8 or float4 in PostgreSQL's text form.
+	def floatOf(text string) ?float {
+		match text {
+			case "NaN":
+				return 0.0 / 0.0
+			case "Infinity":
+				return 1.0 / 0.0
+			case "-Infinity":
+				return -1.0 / 0.0
+			default:
+				return none unless /^[+-]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][+-]?[0-9]+)?$/.test(text)
+				return parseFloat<float>(text)
+		}
+	}
+
+	// A bytea column: hex after `\x` (the server's default output), else the
+	// bytes as sent.
+	def byteaOf(data byte[]) !byte[] {
+		if data.len() >= 2 && int(data[0]) == 92 && int(data[1]) == 120 {
+			return encoding.hexdecode(string(data[2:data.len()])) onerror fail db.errorOf(db.ErrorKind.Type, "postgres: malformed bytea value")
+		}
+		return data.clone()
+	}
+
+	// A timestamptz in ISO date style as RFC 3339: `T` for the space, and
+	// minutes on an offset given in hours (`+02` to `+02:00`).
+	def instantText(text string) string {
+		let out = text.replace(" ", "T")
+		let n = out.len()
+		return out when n < 3
+		let sign = out.slice(n - 3, n - 2)
+		return out + ":00" when sign := "+" || "-"
+		return out
+	}
+
+	// A column's value in the ADM type nearest to its PostgreSQL type. A
+	// value its type's parser does not take (`infinity`, a date before the
+	// common era) stays text.
+	def valueOf(oid int, data byte[]) !any {
+		match oid {
+			case 16:
+				return data.len() > 0 && int(data[0]) == 116
+			case 20, 21, 23, 26:
+				let n = intOf(data)
+				return string(data) when n is none
+				return n
+			case 700, 701:
+				let f = floatOf(string(data))
+				return string(data) when f is none
+				return f
+			case 17:
+				return try byteaOf(data)
+			case 1700:
+				let text = string(data)
+				return decimalOr(text)
+			case 1082:
+				let text = string(data)
+				return dateOr(text)
+			case 1083:
+				let text = string(data)
+				return timeOfDayOr(text)
+			case 1114:
+				let text = string(data)
+				return dateTimeOr(text)
+			case 1184:
+				let text = string(data)
+				return instantOr(text)
+			default:
+				return string(data)
+		}
+	}
+
+	def decimalOr(text string) any {
+		let failed = false
+		let d = math.parseDecimal(text) onerror (err error) {
+			failed = true
+			recover new math.Decimal()
+		}
+		return text when failed
+		return d
+	}
+
+	def dateOr(text string) any {
+		let failed = false
+		let d = time.parseDate(text) onerror (err error) {
+			failed = true
+			recover new time.Date(1970, 1, 1)
+		}
+		return text when failed
+		return d
+	}
+
+	def timeOfDayOr(text string) any {
+		let failed = false
+		let d = time.parseTimeOfDay(text) onerror (err error) {
+			failed = true
+			recover new time.TimeOfDay(0)
+		}
+		return text when failed
+		return d
+	}
+
+	def dateTimeOr(text string) any {
+		let failed = false
+		let d = time.parseDateTime(text) onerror (err error) {
+			failed = true
+			recover new time.DateTime(1970, 1, 1)
+		}
+		return text when failed
+		return d
+	}
+
+	def instantOr(text string) any {
+		let failed = false
+		let t = time.parse(instantText(text)) onerror (err error) {
+			failed = true
+			recover time.fromUnixNs(int64(0))
+		}
+		return text when failed
+		return t
+	}
+}

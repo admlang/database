@@ -1,0 +1,81 @@
+partial module adm.database.sqlite {
+	use (
+		std.testing
+		std.data.db
+		std.os
+		std.services::(Application)
+		std.services.database::(Database)
+	)
+
+	def insertBatch(shared db.Pool, worker int, count int) !none {
+		let tx = try shared.beginTx()
+		for let i = 0; i < count; i++ {
+			try tx.exec("INSERT INTO jobs (worker, n) VALUES (?, ?)", worker, i)
+		}
+		return tx.commitTx()
+	}
+
+	check "Pool" {
+		@test()
+		def TestTasksShareAFileThroughAPool() !none {
+			let path = (try Application.home()) + "/sqlite-pool-test.db"
+			try os.remove(path) when try os.exists(path)
+			let shared = try db.pool("sqlite://" + path + "?journal_mode=wal", 4)
+			try shared.exec("CREATE TABLE jobs (id INTEGER PRIMARY KEY, worker INTEGER NOT NULL, n INTEGER NOT NULL)")
+
+			let a = async insertBatch(shared, 1, 50)
+			let b = async insertBatch(shared, 2, 50)
+			let c = async insertBatch(shared, 3, 50)
+			let d = async insertBatch(shared, 4, 50)
+			let e = async insertBatch(shared, 5, 50)
+			let f = async insertBatch(shared, 6, 50)
+			try await a
+			try await b
+			try await c
+			try await d
+			try await e
+			try await f
+
+			let rows = try shared.query("SELECT count(*), count(DISTINCT worker), sum(n) FROM jobs")
+			assert try rows.next()
+			assert try rows.int(0) == 300
+			assert try rows.int(1) == 6
+			assert try rows.int(2) == 6 * 1225
+			try rows.close()
+			assert shared.idleCount() >= 1
+			assert shared.idleCount() <= 4
+
+			// A rolled back transaction gives its connection back too.
+			let undo = try shared.beginTx()
+			try undo.exec("DELETE FROM jobs")
+			try undo.rollbackTx()
+			let store = try shared.prepare("SELECT count(*) FROM jobs WHERE worker = ?")
+			let left = try store.query(3)
+			assert try left.next()
+			assert try left.int(0) == 50
+			try left.close()
+			try store.close()
+
+			try shared.close()
+			try os.remove(path)
+		}
+
+		@test()
+		def TestTheDatabaseServiceOverSqlite() !none {
+			try await Database.stop()
+			try await Database.start()
+			// One connection: a database in memory belongs to its connection.
+			try Database.add("notes", "sqlite::memory:", 1)
+			try Database.exec("CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)")
+			let res = try Database.exec("INSERT INTO notes (body) VALUES (?), (?)", "first", "second")
+			assert res.affected == 2
+			let rows = try Database.query("SELECT body FROM notes WHERE id = ?", 2)
+			assert try rows.next()
+			assert try rows.string(0) == "second"
+			try rows.close()
+			let notes = try Database.get("notes")
+			assert notes.idleCount() == 1
+			try await Database.stop()
+		}
+	}
+}
