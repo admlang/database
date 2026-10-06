@@ -119,5 +119,34 @@ partial module adm.database.sqlite {
 			let outside = new PersonStore(conn)
 			assert try outside.count() == 0
 		}
+
+		// A `transaction` block is a database transaction for the `sql def`
+		// calls inside it: committed when the block's body is done, rolled
+		// back when it fails.
+		@test()
+		def TestTransactionBlockCommitsOrRollsBack() !none {
+			let conn = try people()
+			let store = new PersonStore(conn)
+			let at = try time.parse("2026-10-06T12:30:00Z")
+
+			transaction {
+				try store.add("Ana", none, 1.0, at)
+				try store.add("Bob", none, 2.0, at)
+			}
+			assert try store.count() == 2
+
+			let failed = false
+			transaction {
+				try store.add("Cy", none, 3.0, at)
+				assert try store.count() == 3
+				try store.find(99)
+			} onerror (err error) {
+				failed = true
+				recover none
+			}
+			assert failed
+			assert try store.count() == 2
+			return none
+		}
 	}
 }
