@@ -1,6 +1,6 @@
 // An embedded key-value database as an ADM library: one file, ordered
 // buckets, transactions that survive a crash.
-@manifest(version = "0.1.0")
+@manifest(version = "0.1.1")
 library adm.database.store {
 	use (
 		adm.database.store
