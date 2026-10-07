@@ -1,0 +1,330 @@
+partial module adm.database.store {
+	use (
+		std.os
+		std.testing
+	)
+
+	// A 32-byte key that depends on `seed`.
+	def keyOf(seed int) byte[] {
+		let key byte[] = []
+		key.len(32)
+		for let i = 0; i < 32; i++ {
+			key[i] = byte((seed * 37 + i * 11) & 255)
+		}
+		return key
+	}
+
+	// True when `needle` occurs in `hay`.
+	def holds(hay byte[], needle byte[]) bool {
+		let last = hay.len() - needle.len()
+		for let i = 0; i <= last; i++ {
+			continue when hay[i] != needle[0]
+			let same = true
+			for let j = 1; j < needle.len(); j++ {
+				if hay[i + j] != needle[j] {
+					same = false
+					break
+				}
+			}
+			return true when same
+		}
+		return false
+	}
+
+	def opening(path string, options Options) !?Database {
+		return try open(path, options)
+	}
+
+	// The kind `open` fails with, `none` when it opens.
+	def openFailure(path string, options Options) string {
+		let kind = "none"
+		let db = opening(path, options) onerror (err error) {
+			kind = kindOfFailure(err).value
+			recover none
+		}
+		if !(db is none) {
+			db.close() onerror recover none
+		}
+		return kind
+	}
+
+	// Fills bucket `b`: small values, values of several pages, and enough
+	// keys for a tree of more than one level.
+	def fill(db Database, model map<string, string>, round int) !none {
+		try db.write(def (tx Transaction) !none {
+			let bucket = try tx.createBucket("b")
+			for let i = 0; i < 400; i++ {
+				let key = "secret-key-{i.str().padStart(4, "0")}"
+				let value = filler(round * 1000 + i, i % 50 == 0 ?? (20000 + i, 40 + i % 90))
+				try bucket.put(key, value)
+				model.set(key, value)
+			}
+			for let i = round; i < 400; i += 7 {
+				let key = "secret-key-{i.str().padStart(4, "0")}"
+				try bucket.delete(key)
+				model.delete(key)
+			}
+			return none
+		})
+		return none
+	}
+
+	// "" when bucket `b` holds exactly the model, else what differs.
+	def verdict(db Database, model map<string, string>) !string {
+		let lines string[] = []
+		try db.read(def (tx Transaction) !none {
+			lines = try watched(tx)
+			return none
+		})
+		return sameLines(lines, expected(model)) ?? ("", "{lines.len()} lines, {model.len()} expected")
+	}
+
+	check "Encryption" {
+		@test()
+		def TestKeyOpensWhatItSealed() !none {
+			let path = scratch("sealed")
+			let options = Options{key: keyOf(1)}
+			let model = new map<string, string>()
+			let db = try open(path, options)
+			try fill(db, model, 1)
+			try fill(db, model, 2)
+			assert (try verdict(db, model)) == ""
+			try db.close()
+
+			db = try open(path, options)
+			assert (try verdict(db, model)) == ""
+			// Pages freed by one commit are reused by the next ones.
+			try fill(db, model, 3)
+			try fill(db, model, 4)
+			assert (try db.stats()).freePages > 0
+			try db.close()
+			db = try open(path, Options{key: keyOf(1), readOnly: true})
+			assert (try verdict(db, model)) == ""
+			try db.close()
+
+			// Nothing of the content is readable in the file.
+			let raw = try os.readFile(path)
+			assert !holds(raw, "secret-key".bytes())
+			assert !holds(raw, "abcdefghij".bytes())
+			// The same content without a key is there to find.
+			let plain = scratch("unsealed")
+			db = try open(plain)
+			try fill(db, new map<string, string>(), 1)
+			try db.close()
+			assert holds(try os.readFile(plain), "secret-key".bytes())
+			try os.remove(plain)
+
+			assert openFailure(path, Options{}) == "key"
+			assert openFailure(path, Options{key: keyOf(2)}) == "key"
+			assert openFailure(path, Options{password: "letmein"}) == "key"
+			try os.remove(path)
+			return none
+		}
+
+		@test()
+		def TestPasswordOpensWhatItSealed() !none {
+			let path = scratch("password")
+			let model = new map<string, string>()
+			let db = try open(path, Options{password: "correct horse", passwordRounds: 2000})
+			try fill(db, model, 1)
+			try db.close()
+			// The rounds of the file count, not the ones asked for now.
+			db = try open(path, Options{password: "correct horse", passwordRounds: 5})
+			assert (try verdict(db, model)) == ""
+			try fill(db, model, 2)
+			try db.close()
+			db = try open(path, Options{password: "correct horse"})
+			assert (try verdict(db, model)) == ""
+			try db.close()
+
+			assert openFailure(path, Options{password: "correct horse "}) == "key"
+			assert openFailure(path, Options{key: keyOf(1)}) == "key"
+			assert openFailure(path, Options{}) == "key"
+
+			// Two databases with one password have different keys.
+			let other = scratch("password-two")
+			db = try open(other, Options{password: "correct horse", passwordRounds: 2000})
+			try db.close()
+			let a = try os.readFile(path)
+			let b = try os.readFile(other)
+			assert !a[16:32].equals(b[16:32])
+			try os.remove(path)
+			try os.remove(other)
+			return none
+		}
+
+		@test()
+		def TestRefusals() !none {
+			let path = scratch("refused")
+			assert openFailure(path, Options{key: keyOf(1)[:16]}) == "argument"
+			assert openFailure(path, Options{key: keyOf(1), password: "both"}) == "argument"
+			assert openFailure(path, Options{password: "p", passwordRounds: 0}) == "argument"
+			os.remove(path) onerror recover none
+
+			// A key for a database that is not encrypted is a mistake to
+			// report, not to ignore.
+			let db = try open(path)
+			try db.close()
+			assert openFailure(path, Options{key: keyOf(1)}) == "key"
+			assert openFailure(path, Options{password: "p"}) == "key"
+			assert openFailure(path, Options{}) == "none"
+			try os.remove(path)
+			return none
+		}
+
+		@test()
+		def TestChangedPagesDoNotOpen() !none {
+			let path = scratch("tamper")
+			let options = Options{key: keyOf(3)}
+			let model = new map<string, string>()
+			let db = try open(path, options)
+			try fill(db, model, 1)
+			let pages = (try db.stats()).pages
+			try db.close()
+			let whole = try os.readFile(path)
+
+			// One bit of any page: whatever reads that page fails, and no
+			// read returns changed content.
+			let dice = new Dice(77)
+			let caught = 0
+			for let round = 0; round < 12; round++ {
+				let harmed = whole.clone()
+				let page = 2 + dice.roll(pages - 2)
+				harmed[page * 4096 + dice.roll(4096)] ^= byte(1 << dice.roll(8))
+				try os.writeFile(path, harmed)
+				let kind = "none"
+				let said = ""
+				db = open(path, options) onerror (err error) {
+					kind = kindOfFailure(err).value
+					recover db
+				}
+				if kind == "none" {
+					said = verdict(db, model) onerror (err error) {
+						kind = kindOfFailure(err).value
+						recover ""
+					}
+					db.close() onerror recover none
+				}
+				// A page no node uses any more may change unseen.
+				assert kind == "corrupt" || (kind == "none" && said == "")
+				caught++ when kind == "corrupt"
+			}
+			assert caught > 6
+
+			// A sealed page put in the place of another one does not open
+			// there, even though the key sealed it.
+			let refused = 0
+			for let round = 0; round < 12; round++ {
+				let moved = whole.clone()
+				let to = 2 + dice.roll(pages - 2)
+				let from = 2 + (to - 2 + 1 + dice.roll(pages - 3)) % (pages - 2)
+				for let i = 0; i < 4096; i++ {
+					moved[to * 4096 + i] = whole[from * 4096 + i]
+				}
+				try os.writeFile(path, moved)
+				let kind = "none"
+				let said = ""
+				db = open(path, options) onerror (err error) {
+					kind = kindOfFailure(err).value
+					recover db
+				}
+				if kind == "none" {
+					said = verdict(db, model) onerror (err error) {
+						kind = kindOfFailure(err).value
+						recover ""
+					}
+					db.close() onerror recover none
+				}
+				assert kind == "corrupt" || (kind == "none" && said == "")
+				refused++ when kind == "corrupt"
+			}
+			assert refused > 0
+			try os.remove(path)
+			return none
+		}
+
+		@test()
+		def TestTornMetaFallsBack() !none {
+			let path = scratch("sealed-torn")
+			let options = Options{password: "pw", passwordRounds: 1000}
+			let db = try open(path, options)
+			try db.write(def (tx Transaction) !none {
+				try (try tx.createBucket("b")).put("state", "before")
+				return none
+			})
+			try db.write(def (tx Transaction) !none {
+				try (try tx.createBucket("b")).put("state", "after")
+				return none
+			})
+			let commits = (try db.stats()).commits
+			try db.close()
+			// Half of the last commit's meta page reached the device.
+			let file = try os.open(path, "r+")
+			let torn byte[] = []
+			torn.len(40)
+			torn.fill(byte(0xEE))
+			try file.writeAt(torn, ((commits + 1) % 2) * 4096 + 60)
+			try file.close()
+			db = try open(path, options)
+			assert (try db.stats()).commits == commits - 1
+			try db.read(def (tx Transaction) !none {
+				let bucket = try tx.bucket("b")
+				fail "no bucket" when bucket is none
+				assert (try textOf(bucket, "state")) == "before"
+				return none
+			})
+			try db.close()
+			// The wrong password is still told apart from damage.
+			assert openFailure(path, Options{password: "wrong"}) == "key"
+
+			// With both meta pages torn nothing is left to open.
+			file = try os.open(path, "r+")
+			try file.writeAt(torn, 60)
+			try file.writeAt(torn, 4096 + 60)
+			try file.close()
+			assert openFailure(path, options) == "corrupt"
+			try os.remove(path)
+			return none
+		}
+
+		@test()
+		def TestCopiesKeepTheKey() !none {
+			let path = scratch("sealed-source")
+			let copy = scratch("sealed-backup")
+			let small = scratch("sealed-compact")
+			let options = Options{password: "pw", passwordRounds: 1000}
+			let model = new map<string, string>()
+			let db = try open(path, options)
+			try fill(db, model, 1)
+			try fill(db, model, 2)
+			try db.backup(copy)
+			try db.compact(small)
+			try db.close()
+
+			for let made in [copy, small] {
+				assert openFailure(made, Options{}) == "key"
+				assert openFailure(made, Options{password: "other"}) == "key"
+				let again = try open(made, options)
+				assert (try verdict(again, model)) == ""
+				try again.close()
+				assert !holds(try os.readFile(made), "secret-key".bytes())
+			}
+			assert (try os.stat(small)).size < (try os.stat(path)).size
+
+			// A larger page size seals the same way.
+			let wide = scratch("sealed-wide")
+			db = try open(wide, Options{key: keyOf(9), pageSize: 16384})
+			try fill(db, model, 3)
+			try db.close()
+			db = try open(wide, Options{key: keyOf(9)})
+			assert (try db.stats()).pageSize == 16384
+			assert (try verdict(db, model)) == ""
+			try db.close()
+			try os.remove(path)
+			try os.remove(copy)
+			try os.remove(small)
+			try os.remove(wide)
+			return none
+		}
+	}
+}

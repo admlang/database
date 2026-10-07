@@ -53,6 +53,11 @@ internal partial module adm.database.store.engine {
 		file     os.File
 		path     string
 		pageSize int
+		// How many bytes of a node one page holds: the page size, less
+		// what sealing takes in an encrypted database.
+		room     int
+		// The key of an encrypted database.
+		sealer   ?Sealer         = none
 		readOnly bool
 		// False skips the syncs: faster, and a crash may lose or break
 		// the last commits.
@@ -73,12 +78,14 @@ internal partial module adm.database.store.engine {
 		// How many pages were free or waiting to be at the last commit.
 		spare    int
 
-		def new(file os.File, path string, base Meta, readOnly bool, cachePages int) {
+		def new(file os.File, path string, base Meta, readOnly bool, cachePages int, sealer ?Sealer = none) {
 			self.file = file
 			self.path = path
 			self.base = base
 			self.readOnly = readOnly
+			self.sealer = sealer
 			pageSize = base.pageSize
+			room = sealer is none ?? (pageSize, pageSize - sealOverhead)
 			cache = new Cache(cachePages)
 			writer = new sync.Mutex()
 		}
@@ -156,13 +163,35 @@ internal partial module adm.database.store.engine {
 			return buf
 		}
 
-		// The page run that starts at page `id`, whatever its length.
+		// The bytes of the node or free list in the page run that starts
+		// at page `id`, whatever its length, checked against the run's
+		// checksum or opened with the key.
+		// Fails with ErrorKind.Storage or ErrorKind.Corrupt.
 		def readRun(id int) !byte[] {
-			let first = try readPages(id, 1)
-			let more = try overflowOf(first, id)
-			return first when more == 0
+			let pages = try readPages(id, 1)
+			let key = sealer
+			let more = 0
+			if key is none {
+				more = try overflowOf(pages, id)
+			} else {
+				more = getU32(pages, nonceSize)
+			}
 			fail errorOf(ErrorKind.Corrupt, "store: page {id} claims a run of {more} pages") when more > (1 << 20)
-			return try readPages(id, more + 1)
+			pages = try readPages(id, more + 1) when more > 0
+			return try key.openRun(id, pages, room) unless key is none
+			fail errorOf(ErrorKind.Corrupt, "store: page {id} fails its checksum") when getU32(pages, 12) != checksumOf(pages)
+			return pages
+		}
+
+		// What goes into the file for the bytes of a node or free list
+		// bound for page `id`: the same bytes with their checksum, or the
+		// sealed run.
+		// Fails with ErrorKind.Storage when a nonce cannot be drawn.
+		def sealed(id int, run byte[]) !byte[] {
+			let key = sealer
+			return try key.sealRun(id, run, pageSize) unless key is none
+			putU32(run, 12, checksumOf(run))
+			return run
 		}
 
 		// The node stored at page `id`.
@@ -170,7 +199,7 @@ internal partial module adm.database.store.engine {
 		def node(id int) !Node {
 			let cached = cache.get(id)
 			return cached unless cached is none
-			let node = try decodeNode(try readRun(id), id, pageSize)
+			let node = try decodeNode(try readRun(id), id, room)
 			cache.put(node)
 			return node
 		}
@@ -315,11 +344,11 @@ internal partial module adm.database.store.engine {
 		// the page.
 		def place(node Node) int {
 			let size = node.measure()
-			let span = ((size + core.pageSize - 1) / core.pageSize).max(1)
+			let span = ((size + core.room - 1) / core.room).max(1)
 			discard(node.id)
 			node.id = allocate(span)
 			writeIds.push(node.id)
-			writeBuf.push(node.pack(core.pageSize))
+			writeBuf.push(node.pack(core.room))
 			settled.push(node)
 			return node.id
 		}
@@ -332,7 +361,7 @@ internal partial module adm.database.store.engine {
 			// The old free list's own pages are free from here on.
 			if base.freelist != 0 {
 				let old = try core.readRun(base.freelist)
-				for let i = 0; i < old.len() / core.pageSize; i++ {
+				for let i = 0; i < old.len() / core.room; i++ {
 					freed.push(base.freelist + i)
 				}
 			}
@@ -346,21 +375,20 @@ internal partial module adm.database.store.engine {
 			base.freelist = 0
 			if core.free.len() + waiting.len() > 0 {
 				// Taking the list's pages can only shorten the list.
-				let span = freeSpan(core.free.len() + waiting.len(), core.pageSize)
+				let span = freeSpan(core.free.len() + waiting.len(), core.room)
 				base.freelist = allocate(span)
-				let buf = encodeFree(merged(core.free, waiting), core.pageSize)
+				let buf = encodeFree(merged(core.free, waiting), core.room)
 				let padded byte[] = []
-				padded.len(span * core.pageSize)
+				padded.len(span * core.room)
 				buf.copy(padded)
 				putU32(padded, 8, span - 1)
-				putU32(padded, 12, checksumOf(padded))
 				writeIds.push(base.freelist)
 				writeBuf.push(padded)
 			}
 			base.txid = txid
 			try flush()
 			try core.sync()
-			try core.writePages(txid % 2, encodeMeta(base))
+			try core.writePages(txid % 2, try encodeMeta(base, core.sealer))
 			try core.sync()
 			for let node in settled {
 				core.cache.put(node)
@@ -375,8 +403,8 @@ internal partial module adm.database.store.engine {
 			return none
 		}
 
-		// Writes the queued page runs in file order, neighbours in one
-		// write.
+		// Writes the queued page runs in file order, checksummed or
+		// sealed, neighbours in one write.
 		def flush() !none {
 			let order int[] = []
 			order.len(writeIds.len())
@@ -388,12 +416,12 @@ internal partial module adm.database.store.engine {
 			let i = 0
 			for i < order.len() {
 				let start = writeIds[order[i]]
-				let batch = writeBuf[order[i]]
+				let batch = try core.sealed(start, writeBuf[order[i]])
 				let next = start + batch.len() / core.pageSize
 				let j = i + 1
 				let joined ?byte[] = none
 				for j < order.len() && writeIds[order[j]] == next && next - start < 256 {
-					let more = writeBuf[order[j]]
+					let more = try core.sealed(next, writeBuf[order[j]])
 					joined = batch.clone() when joined is none
 					joined.push(...more) unless joined is none
 					next += more.len() / core.pageSize

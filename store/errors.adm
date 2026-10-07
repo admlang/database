@@ -9,7 +9,7 @@ partial module adm.database.store {
 		// Another process has the database open.
 		Busy     = "busy",
 		// The file is not a database of this library, or a page of it
-		// fails its checksum.
+		// fails its checksum (its authentication, when encrypted).
 		Corrupt  = "corrupt",
 		// The database or the transaction is closed.
 		Closed   = "closed",
@@ -22,6 +22,13 @@ partial module adm.database.store {
 		Exists   = "exists",
 		// An empty key, or a key or a value over the size limit.
 		Argument = "argument",
+		// The key of a new record is taken, or another record holds the
+		// same value in a unique index.
+		Duplicate = "duplicate",
+		// The database is encrypted and the key or password given does
+		// not open it, or none was given; or one was given for a database
+		// that is not encrypted.
+		Key = "key",
 	}
 
 	// StoreError is the payload every failure of this library carries.

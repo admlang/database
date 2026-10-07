@@ -223,8 +223,11 @@ internal partial module adm.database.store.engine {
 		// Fails with ErrorKind.Storage or ErrorKind.Corrupt.
 		def settle() !none {
 			for let (_, nested) in opened {
-				continue when nested.dropped || !nested.changed
+				continue when nested.dropped
+				// A bucket that did not change may hold one that did, and
+				// changes with it.
 				try nested.settle()
+				continue unless nested.changed
 				try store(nested.name, rootRecord(nested.root, nested.sequence), flagBucket)
 				nested.changed = false
 			}
@@ -264,7 +267,7 @@ internal partial module adm.database.store.engine {
 			for let childId in node.children {
 				try rebalance(childId) when childId < 0
 			}
-			let low = state.core.pageSize / 4
+			let low = state.core.room / 4
 			let i = 0
 			for i < node.children.len() {
 				let childId = node.children[i]
@@ -283,7 +286,7 @@ internal partial module adm.database.store.engine {
 				// Two changed neighbours that fit one page become one.
 				if i + 1 < node.children.len() && node.children[i + 1] < 0 {
 					let after = try state.node(node.children[i + 1])
-					if after.count() > 0 && size + after.measure() - headerSize <= state.core.pageSize {
+					if after.count() > 0 && size + after.measure() - headerSize <= state.core.room {
 						child.take(after, 0, after.count())
 						state.discard(after.id)
 						node.keys.remove(i + 1)
@@ -333,7 +336,7 @@ internal partial module adm.database.store.engine {
 				node.keys = keys
 				node.children = children
 			}
-			let pageSize = state.core.pageSize
+			let pageSize = state.core.room
 			let total = node.measure()
 			let count = node.count()
 			let parts Part[] = []

@@ -15,7 +15,7 @@ One library is a database of its own rather than a driver:
 
 | Library | What it is |
 |---|---|
-| [`adm.database.store`](store/) | an embedded key-value database written in ADM: one file, ordered buckets, crash-safe transactions; its own API, not `std.data.db` |
+| [`adm.database.store`](store/) | an embedded database written in ADM: one file, ordered buckets, crash-safe transactions, and typed collections (a struct per record, indexes declared with `@store.index`); its own API, not `std.data.db` |
 
 ## Use
 

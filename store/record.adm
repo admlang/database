@@ -1,0 +1,214 @@
+// Records whose every field is a plain value are written and read here,
+// field by field from a plan made once per collection. They are the same
+// MessagePack map the general codec writes, which reads and writes the
+// records of every other type.
+partial module adm.database.store {
+	use (
+		std.reflection
+		std.time
+		adm.database.store.engine::*
+	)
+
+	internal const msgpackAttr = "std.data.encoding.msgpack"
+
+	internal enum ColumnKind {
+		Bool,
+		Int,
+		Uint,
+		Float,
+		Float32,
+		Text,
+		Bytes,
+		Time,
+	}
+
+	// Column is one field of a plain record.
+	internal struct Column {
+		kind     ColumnKind
+		optional bool
+		// The field's name, and the name as a MessagePack str.
+		name     byte[]
+		head     byte[]
+	}
+
+	// The columns of a record type, in field order; none when a field is
+	// not a plain value or sets how MessagePack writes it.
+	internal def columnsOf(sample any) ?Column[] {
+		let columns Column[] = []
+		for let f in reflection.fields(sample) {
+			return none when f.hasAttr(msgpackAttr)
+			let optional = f.kind == reflection.FieldKind.Optional
+			let kind = optional ?? (f.elemKind, f.kind)
+			let typeName = f.typeName.trimPrefix("?")
+			let column = Column{kind: ColumnKind.Int, optional: optional, name: f.name.bytes(), head: []}
+			if typeName == "duration" {
+				column.kind = ColumnKind.Int
+			} else {
+				match kind {
+					case reflection.FieldKind.Bool:
+						column.kind = ColumnKind.Bool
+					case reflection.FieldKind.Int, reflection.FieldKind.Enum:
+						column.kind = ColumnKind.Int
+					case reflection.FieldKind.Uint:
+						column.kind = ColumnKind.Uint
+					case reflection.FieldKind.Float:
+						return none unless typeName := "float" || "float64" || "float32"
+						column.kind = typeName == "float32" ?? (ColumnKind.Float32, ColumnKind.Float)
+					case reflection.FieldKind.String:
+						column.kind = ColumnKind.Text
+					case reflection.FieldKind.Array:
+						return none unless !optional && (typeName := "byte[]" || "uint8[]")
+						column.kind = ColumnKind.Bytes
+					case reflection.FieldKind.Struct:
+						return none unless typeName == "std.time.Time"
+						column.kind = ColumnKind.Time
+					default:
+						return none
+				}
+			}
+			packText(column.head, column.name)
+			columns.push(column)
+		}
+		return columns
+	}
+
+	// Writes a plain record.
+	internal def packRecord(columns Column[], fields reflection.Field[]) byte[] {
+		let out byte[] = []
+		out.cap(columns.len() * 16)
+		packMapHead(out, columns.len())
+		for let (i, column) in columns {
+			let f = fields[i]
+			out.push(...column.head)
+			if column.optional && f.value() is none {
+				out.push(byte(0xC0))
+				continue
+			}
+			match column.kind {
+				case ColumnKind.Bool:
+					out.push(byte(f.asBool() ?? (0xC3, 0xC2)))
+				case ColumnKind.Int:
+					packInt(out, f.asInt())
+				case ColumnKind.Uint:
+					packUint(out, uint64(f.asUint()))
+				case ColumnKind.Float:
+					packFloat(out, f.asFloat(), false)
+				case ColumnKind.Float32:
+					packFloat(out, f.asFloat(), true)
+				case ColumnKind.Text:
+					packText(out, f.asString().bytes())
+				case ColumnKind.Bytes:
+					let n = f.len()
+					let data byte[] = []
+					data.cap(n)
+					for let k = 0; k < n; k++ {
+						data.push(byte(f.at(k).asUint()))
+					}
+					packBytes(out, data)
+				case ColumnKind.Time:
+					let held = f.value()
+					if held is time.Time {
+						packTime(out, int(held.unixNs()))
+					} else {
+						out.push(byte(0xC0))
+					}
+			}
+		}
+		return out
+	}
+
+	// The column a key names: the one expected first, as the keys of a
+	// record come in field order unless the type changed since.
+	internal def columnFor(columns Column[], expected int, data byte[], from int, size int) int {
+		let n = columns.len()
+		for let step = 0; step < n; step++ {
+			let at = (expected + step) % n
+			let name = columns[at].name
+			continue when name.len() != size
+			let same = true
+			for let k = 0; k < size; k++ {
+				if name[k] != data[from + k] {
+					same = false
+					break
+				}
+			}
+			return at when same
+		}
+		return -1
+	}
+
+	internal def otherCase(columns Column[], key byte[]) bool {
+		let lowered = string(key).lower()
+		for let column in columns {
+			return true when string(column.name).lower() == lowered
+		}
+		return false
+	}
+
+	// Fills the fields of a plain record from stored bytes. False when the
+	// bytes hold something this reader does not take: another format for a
+	// value than the field's own, a key that is not a str, the same key
+	// twice. The general codec then reads the record, or says what is
+	// wrong with it.
+	internal def unpackRecord(columns Column[], fields reflection.Field[], data byte[]) bool {
+		let reader = new Unpacker(data)
+		return false unless reader.readMapHead()
+		let entries = reader.size
+		let seen bool[] = []
+		seen.len(columns.len())
+		seen.fill(false)
+		let expected = 0
+		for let entry = 0; entry < entries; entry++ {
+			return false unless reader.readText()
+			let at = columnFor(columns, expected, data, reader.from, reader.size)
+			if at < 0 {
+				// A field the type no longer has is passed over, unless
+				// the key is a field's name in other letter case, which
+				// the general codec takes for that field.
+				return false when otherCase(columns, data[reader.from:reader.from + reader.size])
+				return false unless reader.skip()
+				continue
+			}
+			return false when seen[at]
+			seen[at] = true
+			expected = at + 1
+			let column = columns[at]
+			let f = fields[at]
+			if reader.readNil() {
+				f.setNone() when column.optional
+				continue
+			}
+			match column.kind {
+				case ColumnKind.Bool:
+					return false unless reader.readBool()
+					f.setBool(reader.flag)
+				case ColumnKind.Int:
+					return false unless reader.readInt()
+					f.setInt(reader.whole)
+				case ColumnKind.Uint:
+					return false unless reader.readUint()
+					f.setUint(uint(reader.natural))
+				case ColumnKind.Float, ColumnKind.Float32:
+					return false unless reader.readFloat()
+					f.setFloat(reader.real)
+				case ColumnKind.Text:
+					return false unless reader.readText()
+					let raw = data[reader.from:reader.from + reader.size]
+					return false when raw.indexOf(byte(0)) >= 0
+					let text = string(raw)
+					return false unless text.isUTF8()
+					f.setString(text)
+				case ColumnKind.Bytes:
+					return false unless reader.readBytes()
+					return false unless f.setLen(reader.size)
+					for let k = 0; k < reader.size; k++ {
+						f.at(k).setUint(uint(data[reader.from + k]))
+					}
+				case ColumnKind.Time:
+					return false unless reader.readTime()
+					return false unless f.set(time.fromUnixNs(int64(reader.whole)))
+			}
+		}
+		return reader.at == data.len()
+	}
+}

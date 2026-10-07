@@ -11,16 +11,29 @@ partial module adm.database.store {
 	struct Options {
 		// Open an existing database for reading only. Other processes may
 		// read it at the same time.
-		readOnly   bool = false
+		readOnly       bool           = false
 		// The page size of a database being created: a power of two from
 		// 4096 to 65536. An existing database keeps its own.
-		pageSize   int  = 4096
+		pageSize       int            = 4096
 		// False skips the two syncs of every commit. Much faster for a
 		// bulk load, and a crash or a power cut may lose the last commits
 		// or leave the file unreadable.
-		sync       bool = true
+		sync           bool           = true
 		// How many tree nodes are kept in memory once read.
-		cachePages int  = 8192
+		cachePages     int            = 8192
+		// A 32-byte key that encrypts the database: every page of the file
+		// is sealed with ChaCha20-Poly1305, and a page changed outside the
+		// library fails to read. Creating a database with a key encrypts
+		// it; opening it takes the same key from then on.
+		key            Secret<byte[]> = []
+		// A password that encrypts the database in place of `key`: the key
+		// is made from it with PBKDF2 (HMAC-SHA-256) and a salt kept in
+		// the file.
+		password       Secret<string> = ""
+		// How many PBKDF2 rounds a database being created asks of its
+		// password: more makes every `open` slower, and guessing the
+		// password as much slower. An existing database keeps its own.
+		passwordRounds int            = 600000
 	}
 
 	// Stats describes the file.
@@ -133,7 +146,8 @@ partial module adm.database.store {
 		}
 
 		// backup writes the database as it is now to a new file, while
-		// other transactions go on.
+		// other transactions go on. The copy of an encrypted database opens
+		// with the same key or password.
 		// Fails with a StoreError as the type says, and with
 		// ErrorKind.Storage when the copy cannot be written.
 		def backup(path string) !none {
@@ -150,13 +164,15 @@ partial module adm.database.store {
 
 		// compact writes the content of the database to a new file with no
 		// free pages in it: the way to shrink a file after large deletes.
+		// The copy of an encrypted database opens with the same key or
+		// password.
 		// Fails with a StoreError as the type says, with ErrorKind.Exists
 		// when `path` already holds something, and ErrorKind.Storage when
 		// the copy cannot be written.
 		def compact(path string) !none {
 			let present = os.exists(path) onerror recover false
 			fail errorOf(ErrorKind.Exists, "store: {path} already exists") when present
-			let target = try open(path, Options{pageSize: core.pageSize, sync: false})
+			let target = try openFile(path, Options{pageSize: core.pageSize, sync: false}, core.sealer)
 			let copier = new Copier(target)
 			let source = try beginTx()
 			let failure ?error = none
@@ -215,7 +231,7 @@ partial module adm.database.store {
 		}
 
 		internal def copyInto(out os.File, base Meta) !none {
-			let page = encodeMeta(base)
+			let page = try encodeMeta(base, core.sealer)
 			try out.writeAt(page, 0)
 			try out.writeAt(page, base.pageSize)
 			let id = 2
@@ -239,18 +255,31 @@ partial module adm.database.store {
 	//
 	// Fails with a StoreError: ErrorKind.Storage when the file cannot be
 	// opened, ErrorKind.Busy when another process has it open,
-	// ErrorKind.Corrupt when it is not a database, and ErrorKind.Argument
-	// for a page size that is not a power of two from 4096 to 65536.
+	// ErrorKind.Corrupt when it is not a database, ErrorKind.Key when it
+	// is encrypted and `Options.key` or `Options.password` does not open
+	// it (or it is not encrypted and one of them is given), and
+	// ErrorKind.Argument for a page size that is not a power of two from
+	// 4096 to 65536, a key that is not 32 bytes, both a key and a
+	// password, or fewer than one password round.
 	def open(path string, options ?Options = none) !Database {
 		let settings = Options{}
 		settings = options unless options is none
+		return try openFile(path, settings, none)
+	}
+
+	// `open`, with the key a new file takes from the database it copies.
+	internal def openFile(path string, settings Options, inherit ?Sealer) !Database {
 		let size = settings.pageSize
 		fail errorOf(ErrorKind.Argument, "store: the page size {size} is not a power of two from 4096 to 65536") when size < 4096 || size > 65536 || (size & (size - 1)) != 0
+		let keyBytes = settings.key.reveal().len()
+		fail errorOf(ErrorKind.Argument, "store: the key must be 32 bytes, not {keyBytes}") when keyBytes != 0 && keyBytes != 32
+		fail errorOf(ErrorKind.Argument, "store: a key and a password were both given") when keyBytes != 0 && settings.password.reveal() != ""
+		fail errorOf(ErrorKind.Argument, "store: {settings.passwordRounds} password rounds") when settings.passwordRounds < 1
 		let file = os.open(path, settings.readOnly ?? ("r", "r+")) onerror (err error) {
 			fail errorOf(ErrorKind.Storage, "store: {path} cannot be opened: {err.message}", err)
 		}
 		let failure ?error = none
-		let core = opened(file, path, settings) onerror (err error) {
+		let core = opened(file, path, settings, inherit) onerror (err error) {
 			failure = err
 			recover none
 		}
@@ -262,8 +291,9 @@ partial module adm.database.store {
 		return new Database(core)
 	}
 
-	// Locks an open file and reads, or writes, its first pages.
-	internal def opened(file os.File, path string, settings Options) !?Core {
+	// Locks an open file and reads, or writes, its first pages. `inherit`
+	// is the key a new file takes from the database it is a copy of.
+	internal def opened(file os.File, path string, settings Options, inherit ?Sealer = none) !?Core {
 		let held = file.lock(!settings.readOnly, false) onerror (err error) {
 			fail errorOf(ErrorKind.Storage, "store: {path} cannot be locked: {err.message}", err)
 		}
@@ -271,23 +301,29 @@ partial module adm.database.store {
 		let info = file.stat() onerror (err error) {
 			fail errorOf(ErrorKind.Storage, "store: {path}: {err.message}", err)
 		}
-		let base ?Meta = none
 		if info.size == 0 {
 			fail errorOf(ErrorKind.Corrupt, "store: {path} is empty") when settings.readOnly
+			let sealer = inherit
+			sealer = try newSealer(settings.key.reveal(), settings.password.reveal(), settings.passwordRounds) when sealer is none
 			let first = Meta{pageSize: settings.pageSize, root: 2, pages: 3, txid: 1}
-			let root = new Node(true)
-			try file.writeAt(root.pack(first.pageSize), 2 * first.pageSize)
+			let core = new Core(file, path, first, false, settings.cachePages, sealer)
+			core.durable = settings.sync
+			try core.writePages(2, try core.sealed(2, new Node(true).pack(core.room)))
 			let older = copyOf(first)
 			older.txid = 0
-			try file.writeAt(encodeMeta(older), 0)
-			try file.writeAt(encodeMeta(first), first.pageSize)
-			try file.sync() when settings.sync
-			base = first
-		} else {
-			base = try newestMeta(file, int(info.size))
+			try core.writePages(0, try encodeMeta(older, sealer))
+			try core.writePages(1, try encodeMeta(first, sealer))
+			try core.sync()
+			return core
 		}
-		fail errorOf(ErrorKind.Corrupt, "store: {path} is not a database") when base is none
-		let core = new Core(file, path, base, settings.readOnly, settings.cachePages)
+		let found = new MetaReader(path, settings.key.reveal(), settings.password.reveal())
+		try found.read(file, int(info.size))
+		let base = found.best
+		if base is none {
+			fail errorOf(ErrorKind.Key, "store: the key or password given does not open {path}") when found.refused
+			fail errorOf(ErrorKind.Corrupt, "store: {path} is not a database")
+		}
+		let core = new Core(file, path, base, settings.readOnly, settings.cachePages, found.sealer)
 		core.durable = settings.sync
 		if base.freelist != 0 {
 			core.free = try decodeFree(try core.readRun(base.freelist), base.freelist)
@@ -296,28 +332,69 @@ partial module adm.database.store {
 		return core
 	}
 
-	// Reads both meta pages and returns the newer one that holds.
-	internal def newestMeta(file os.File, size int) !?Meta {
-		let head byte[] = []
-		head.len(64)
-		let best ?Meta = none
-		let n = try file.readAt(head, 0)
-		best = decodeMeta(head) when n == 64
-		// The second meta page sits one page in; when the first is torn
-		// its page size is unknown, so every size is tried.
-		for let pageSize = 4096; pageSize <= 65536; pageSize = pageSize * 2 {
-			continue when !(best is none) && best.pageSize != pageSize
-			continue when pageSize + 64 > size
-			let got = try file.readAt(head, pageSize)
-			continue when got != 64
-			let other = decodeMeta(head)
-			continue when other is none || other.pageSize != pageSize
-			if best is none {
-				best = other
-			} else if other.txid > best.txid {
-				best = other
-			}
+	// MetaReader finds the newer of a file's two meta pages that holds,
+	// and the key that opens it in an encrypted database.
+	internal type MetaReader {
+		path     string
+		key      byte[]
+		password string
+		sealer   ?Sealer = none
+		best     ?Meta   = none
+		// A meta page was whole and the key did not open it.
+		refused  bool
+
+		def new(path string, key byte[], password string) {
+			self.path = path
+			self.key = key
+			self.password = password
 		}
-		return best
+
+		// Fails with ErrorKind.Storage when the file cannot be read, and
+		// ErrorKind.Key when the file is encrypted and no key was given, or
+		// the other way round.
+		def read(file os.File, size int) !none {
+			let head byte[] = []
+			head.len(metaHead)
+			let n = try file.readAt(head, 0)
+			try offer(head, 0) when n == metaHead
+			// The second meta page sits one page in; when the first is torn
+			// its page size is unknown, so every size is tried.
+			let known = best
+			for let pageSize = 4096; pageSize <= 65536; pageSize = pageSize * 2 {
+				continue when !(known is none) && known.pageSize != pageSize
+				continue when pageSize + metaHead > size
+				let got = try file.readAt(head, pageSize)
+				try offer(head, pageSize) when got == metaHead
+			}
+			return none
+		}
+
+		// Takes the meta page in `head` when it is whole, opens with the
+		// key, has page size `pageSize` (0 for any) and is newer than the
+		// one held.
+		def offer(head byte[], pageSize int) !none {
+			let format = metaFormat(head)
+			return none when format == 0
+			return none when pageSize != 0 && getU32(head, 8) != pageSize
+			let given = key.len() > 0 || password != ""
+			let page ?Meta = none
+			if format == formatSealed {
+				fail errorOf(ErrorKind.Key, "store: {path} is encrypted: Options.key or Options.password opens it") unless given
+				let held = sealer
+				if held is none || !held.matches(head) {
+					held = try sealerOf(head, key, password, path)
+					sealer = held
+				}
+				page = decodeMeta(head, held)
+				refused = true when page is none
+			} else {
+				fail errorOf(ErrorKind.Key, "store: {path} is not encrypted, and a key or password was given") when given
+				page = decodeMeta(head)
+			}
+			return none when page is none
+			let newest = best
+			best = page when newest is none || page.txid > newest.txid
+			return none
+		}
 	}
 }

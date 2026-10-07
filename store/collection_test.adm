@@ -1,0 +1,775 @@
+partial module adm.database.store {
+	use (
+		std.data.encoding
+		std.os
+		std.reflection
+		std.testing
+		std.time
+	)
+
+	enum Level {
+		Low,
+		Middle,
+		High,
+	}
+
+	struct User {
+		@key(auto = true)
+		id int
+		@index(unique = true)
+		email string
+		@index
+		city string
+		@index
+		age ?int
+		name string
+		tags string[]
+		level Level = Level.Middle
+		balance float
+	}
+
+	// A key of two fields, and an index over two.
+	struct Visit {
+		@key
+		day string
+		@key
+		visitor int
+		@index(name = "place")
+		country string
+		@index(name = "place")
+		town string
+		pages int
+	}
+
+	// One index per kind of value a key can hold.
+	struct Sample {
+		@key
+		id int
+		@index
+		whole int
+		@index
+		small int16
+		@index
+		natural uint
+		@index
+		real float
+		@index
+		text string
+		@index
+		raw byte[]
+		@index
+		flag bool
+		@index
+		at time.Time
+		@index
+		level Level
+		@index
+		wait duration
+	}
+
+	// The records of "members" as first stored, and as a later version of
+	// the program declares them.
+	struct MemberV1 {
+		@key
+		id int
+		@index
+		team string
+		nick string
+	}
+
+	struct MemberV2 {
+		@key
+		id int
+		team string
+		@index(unique = true)
+		nick string
+		@index
+		joined int = 2026
+	}
+
+	struct MemberRekeyed {
+		@key
+		nick string
+		id int
+	}
+
+	// Every kind of field a record is written field by field for.
+	struct Plain {
+		@key
+		id int
+		flag bool
+		tiny int8
+		short int16
+		medium int32
+		whole int
+		byte1 uint8
+		word2 uint16
+		word4 uint32
+		large uint
+		real float
+		single float32
+		text string
+		raw byte[]
+		at time.Time
+		level Level
+		wait duration
+		maybe ?int
+		note ?string
+		ratio ?float
+		sure ?bool
+		seen ?time.Time
+		rank ?Level
+	}
+
+	// The same record with fields gone, added and moved.
+	struct PlainLater {
+		text string
+		@key
+		id int
+		extra string = "new"
+		whole int
+		maybe ?int
+	}
+
+	struct NoKey {
+		id int
+	}
+
+	struct BadKey {
+		@key
+		tags string[]
+	}
+
+	struct OptionalKey {
+		@key
+		id ?int
+	}
+
+	struct BadAuto {
+		@key(auto = true)
+		id string
+	}
+
+	// The kind an action fails with, "ok" when it does not.
+	def refusal(action def () !none) string {
+		let kind = "ok"
+		action() onerror (err error) {
+			kind = kindOfFailure(err).value
+			recover none
+		}
+		return kind
+	}
+
+	def namesOf(users User[]) string {
+		let names string[] = []
+		for let user in users {
+			names.push(user.name)
+		}
+		return names.join(",")
+	}
+
+	def idsOf(samples Sample[]) string {
+		let ids string[] = []
+		for let sample in samples {
+			ids.push(sample.id.str())
+		}
+		return ids.join(",")
+	}
+
+	def person(name string, city string, age ?int = none) User {
+		return User{email: "{name.lower()}@example.com", city: city, age: age, name: name}
+	}
+
+	check "Collection" {
+		@test()
+		def TestPutGetDeleteReopen() !none {
+			let path = scratch("col-basic")
+			let db = try open(path)
+			try db.write(def (tx Transaction) !none {
+				let users = try tx.collection<User>("users")
+				let ana = person("Ana", "Cluj", 31)
+				ana.tags = ["admin", "ops"]
+				ana.balance = 12.5
+				ana.level = Level.High
+				try users.put(ana)
+				assert ana.id == 1
+				let bob = person("Bob", "Iasi")
+				try users.insert(bob)
+				assert bob.id == 2
+				// A key given by hand is kept, and the numbering goes on
+				// from its own count.
+				let zoe = person("Zoe", "Cluj", 19)
+				zoe.id = 40
+				try users.put(zoe)
+				let dan = person("Dan", "Arad", 52)
+				try users.put(dan)
+				assert dan.id == 3
+				assert (try users.count()) == 4
+				assert try users.has(40)
+				assert !(try users.has(41))
+				// Storing a record again replaces it.
+				ana.name = "Ana Maria"
+				try users.put(ana)
+				assert (try users.count()) == 4
+				return none
+			})
+			try db.close()
+			db = try open(path)
+			try db.read(def (tx Transaction) !none {
+				let users = try tx.collection<User>("users")
+				let ana = try users.get(1)
+				fail "no ana" when ana is none
+				assert ana.name == "Ana Maria"
+				assert ana.email == "ana@example.com"
+				assert ana.tags.join("+") == "admin+ops"
+				assert ana.balance == 12.5
+				assert ana.level == Level.High
+				let age = ana.age
+				fail "no age" when age is none
+				assert age == 31
+				let bob = try users.get(2)
+				fail "no bob" when bob is none
+				assert bob.age is none
+				assert bob.level == Level.Middle
+				assert (try users.get(7)) is none
+				assert namesOf(try users.all()) == "Ana Maria,Bob,Dan,Zoe"
+				return none
+			})
+			try db.write(def (tx Transaction) !none {
+				let users = try tx.collection<User>("users")
+				try users.delete(2)
+				try users.delete(2)
+				try users.delete(999)
+				assert (try users.get(2)) is none
+				assert (try users.first("email", "bob@example.com")) is none
+				assert namesOf(try users.find("city", "Iasi")) == ""
+				assert (try users.count()) == 3
+				return none
+			})
+			try db.close()
+			try os.remove(path)
+			return none
+		}
+
+		@test()
+		def TestIndexes() !none {
+			let path = scratch("col-index")
+			let db = try open(path)
+			try db.write(def (tx Transaction) !none {
+				let users = try tx.collection<User>("users")
+				try users.put(person("Ana", "Cluj", 31))
+				try users.put(person("Bob", "Iasi"))
+				try users.put(person("Cora", "Cluj", 19))
+				try users.put(person("Dan", "Arad", 52))
+				try users.put(person("Eva", "Clu", 31))
+				try users.put(person("Fane", "Cluj-Napoca", 44))
+				// By value: a city that starts with another is not it.
+				assert namesOf(try users.find("city", "Cluj")) == "Ana,Cora"
+				assert namesOf(try users.find("city", "Clu")) == "Eva"
+				assert namesOf(try users.find("city", "Bucuresti")) == ""
+				let cora = try users.first("email", "cora@example.com")
+				fail "no cora" when cora is none
+				assert cora.id == 3
+				// In the order of the index, then of the key.
+				assert namesOf(try users.find("city")) == "Dan,Eva,Ana,Cora,Fane,Bob"
+				assert namesOf(try users.between("city", "Clu", "Cluj")) == "Eva,Ana,Cora"
+				assert namesOf(try users.between("city", "Cluj", none)) == "Ana,Cora,Fane,Bob"
+				assert namesOf(try users.between("city", none, "B")) == "Dan"
+				// A record with none in the field is not in the index.
+				assert namesOf(try users.find("age")) == "Cora,Ana,Eva,Fane,Dan"
+				assert namesOf(try users.between("age", 30, 44)) == "Ana,Eva,Fane"
+				assert namesOf(try users.find("age", 31)) == "Ana,Eva"
+				// By key.
+				assert namesOf(try users.between("", 2, 4)) == "Bob,Cora,Dan"
+				assert namesOf(try users.between("", 5, none)) == "Eva,Fane"
+				// A change moves the record in its indexes.
+				cora.city = "Iasi"
+				cora.age = none
+				try users.put(cora)
+				assert namesOf(try users.find("city", "Cluj")) == "Ana"
+				assert namesOf(try users.find("city", "Iasi")) == "Bob,Cora"
+				assert namesOf(try users.find("age")) == "Ana,Eva,Fane,Dan"
+				return none
+			})
+			try db.read(def (tx Transaction) !none {
+				let users = try tx.collection<User>("users")
+				let cursor = try users.cursor("city")
+				let seen string[] = []
+				let user = try cursor.seek("Cluj")
+				for {
+					break when user is none
+					seen.push(user.name)
+					user = try cursor.next()
+				}
+				assert seen.join(",") == "Ana,Fane,Bob,Cora"
+				let last = try cursor.last()
+				fail "no last" when last is none
+				assert last.name == "Cora"
+				let before = try cursor.previous()
+				fail "no previous" when before is none
+				assert before.name == "Bob"
+				let byKey = try users.cursor()
+				let third = try byKey.seek(3)
+				fail "no third" when third is none
+				assert third.name == "Cora"
+				let fresh = try users.cursor("age")
+				let youngest = try fresh.next()
+				fail "no youngest" when youngest is none
+				assert youngest.name == "Ana"
+				assert (try (try users.cursor("email")).seek("zzz")) is none
+				return none
+			})
+			try db.close()
+			try os.remove(path)
+			return none
+		}
+
+		@test()
+		def TestUniqueIndex() !none {
+			let path = scratch("col-unique")
+			let db = try open(path)
+			try db.write(def (tx Transaction) !none {
+				let users = try tx.collection<User>("users")
+				let ana = person("Ana", "Cluj")
+				try users.put(ana)
+				try users.put(person("Bob", "Iasi"))
+				// Another record with a taken address is refused and leaves
+				// nothing behind.
+				let twin = person("Ana", "Arad", 20)
+				twin.name = "Twin"
+				assert refusal(def () !none {
+					return try users.put(twin)
+				}) == "duplicate"
+				assert (try users.count()) == 2
+				assert namesOf(try users.find("city", "Arad")) == ""
+				assert namesOf(try users.find("age")) == ""
+				// The key of a new record must be free.
+				let again = person("Carol", "Arad")
+				again.id = 1
+				assert refusal(def () !none {
+					return try users.insert(again)
+				}) == "duplicate"
+				// The record itself keeps its address, and gives it up when
+				// it changes.
+				try users.put(ana)
+				ana.email = "ana.maria@example.com"
+				try users.put(ana)
+				twin.id = 0
+				try users.put(twin)
+				let holder = try users.first("email", "ana@example.com")
+				fail "no holder" when holder is none
+				assert holder.name == "Twin"
+				// Swapping a record onto a taken address is refused too.
+				let bob = try users.get(2)
+				fail "no bob" when bob is none
+				bob.email = "ana.maria@example.com"
+				assert refusal(def () !none {
+					return try users.put(bob)
+				}) == "duplicate"
+				let kept = try users.first("email", "bob@example.com")
+				fail "bob lost his address" when kept is none
+				assert kept.id == 2
+				return none
+			})
+			try db.close()
+			try os.remove(path)
+			return none
+		}
+
+		@test()
+		def TestSeveralFields() !none {
+			let path = scratch("col-several")
+			let db = try open(path)
+			try db.write(def (tx Transaction) !none {
+				let visits = try tx.collection<Visit>("visits")
+				try visits.put(Visit{day: "2026-10-07", visitor: 7, country: "RO", town: "Cluj", pages: 3})
+				try visits.put(Visit{day: "2026-10-07", visitor: -2, country: "RO", town: "Iasi", pages: 1})
+				try visits.put(Visit{day: "2026-10-06", visitor: 7, country: "R", town: "OCluj", pages: 9})
+				try visits.put(Visit{day: "2026-10-07", visitor: 300, country: "FR", town: "Lyon", pages: 4})
+				try visits.put(Visit{day: "2026-10-07", visitor: 7, country: "RO", town: "Cluj", pages: 5})
+				assert (try visits.count()) == 4
+				let seven = try visits.get("2026-10-07", 7)
+				fail "no visit" when seven is none
+				assert seven.pages == 5
+				assert (try visits.get("2026-10-07", 8)) is none
+				assert try visits.has("2026-10-06", 7)
+				// Key order: the day, then the visitor as a number.
+				let order string[] = []
+				for let visit in try visits.all() {
+					order.push("{visit.day}/{visit.visitor}")
+				}
+				assert order.join(" ") == "2026-10-06/7 2026-10-07/-2 2026-10-07/7 2026-10-07/300"
+				// The whole index value, or its first field.
+				assert (try visits.find("place", "RO", "Cluj")).len() == 1
+				assert (try visits.find("place", "RO")).len() == 2
+				assert (try visits.find("place", "R")).len() == 1
+				assert (try visits.find("place", "RO", "Clu")).len() == 0
+				assert (try visits.between("place", "FR", "R")).len() == 2
+				let towns string[] = []
+				for let visit in try visits.find("place") {
+					towns.push(visit.town)
+				}
+				assert towns.join(",") == "Lyon,OCluj,Cluj,Iasi"
+				try visits.delete("2026-10-07", 7)
+				assert (try visits.find("place", "RO", "Cluj")).len() == 0
+				assert refusal(def () !none {
+					return try visits.delete("2026-10-07")
+				}) == "argument"
+				assert refusal(def () !none {
+					return try visits.delete(7, "2026-10-07")
+				}) == "argument"
+				return none
+			})
+			try db.close()
+			try os.remove(path)
+			return none
+		}
+
+		@test()
+		def TestValueOrder() !none {
+			let path = scratch("col-order")
+			let db = try open(path)
+			let wholes = [0, -1, 1, -9000000000, 9000000000, 255, 256, -256, 65536, -65536]
+			let reals = [0.0, -0.5, 0.5, -1e30, 1e30, 3.25, -3.25, 1e-30, -1e-30, 100.0]
+			let texts = ["", "a", "ab", "b", "A", "a b", "aa", "é", "z", "ab "]
+			try db.write(def (tx Transaction) !none {
+				let samples = try tx.collection<Sample>("samples")
+				for let i = 0; i < 10; i++ {
+					let raw byte[] = []
+					for let k = 0; k < i % 4; k++ {
+						raw.push(byte((i * 7 + k) % 3))
+					}
+					try samples.put(Sample{id: i + 1, whole: wholes[i], small: int16(wholes[i] % 1000), natural: uint(i * 37 % 11), real: reals[i], text: texts[i], raw: raw, flag: i % 3 == 0, at: time.fromUnixNs(int64(wholes[i]) * 1000), level: i % 3 == 0 ?? (Level.High, i % 3 == 1 ?? (Level.Low, Level.Middle)), wait: duration(wholes[i])})
+				}
+				return none
+			})
+			try db.read(def (tx Transaction) !none {
+				let samples = try tx.collection<Sample>("samples")
+				assert idsOf(try samples.find("whole")) == "4,10,8,2,1,3,6,7,9,5"
+				assert idsOf(try samples.find("at")) == "4,10,8,2,1,3,6,7,9,5"
+				assert idsOf(try samples.find("wait")) == "4,10,8,2,1,3,6,7,9,5"
+				assert idsOf(try samples.find("small")) == "10,8,2,1,4,5,3,6,7,9"
+				assert idsOf(try samples.find("real")) == "4,7,2,9,1,8,3,6,10,5"
+				assert idsOf(try samples.find("text")) == "1,5,2,6,7,3,10,4,9,8"
+				assert idsOf(try samples.find("flag")) == "2,3,5,6,8,9,1,4,7,10"
+				assert idsOf(try samples.find("level")) == "2,5,8,3,6,9,1,4,7,10"
+				// Values of every kind are found again.
+				assert idsOf(try samples.find("whole", -9000000000)) == "4"
+				assert idsOf(try samples.find("small", int16(-256))) == "8"
+				assert idsOf(try samples.find("natural", 4)) == "2"
+				assert idsOf(try samples.find("real", -3.25)) == "7"
+				assert idsOf(try samples.find("real", 100)) == "10"
+				assert idsOf(try samples.find("text", "")) == "1"
+				assert idsOf(try samples.find("text", "ab")) == "3"
+				assert idsOf(try samples.find("flag", true)) == "1,4,7,10"
+				assert idsOf(try samples.find("at", time.fromUnixNs(int64(256000)))) == "7"
+				assert idsOf(try samples.find("wait", duration(65536))) == "9"
+				assert idsOf(try samples.find("level", 2)) == "1,4,7,10"
+				let two byte[] = [byte(2), byte(0)]
+				assert idsOf(try samples.find("raw", two)) == "3"
+				let nothing byte[] = []
+				assert idsOf(try samples.find("raw", nothing)) == "1,5,9"
+				assert idsOf(try samples.between("real", -1, 1)) == "2,9,1,8,3"
+				assert idsOf(try samples.between("text", "a", "ab")) == "2,6,7,3"
+				// A value of another type is refused.
+				assert refusal(def () !none {
+					try samples.find("whole", "seven")
+					return none
+				}) == "argument"
+				assert refusal(def () !none {
+					try samples.find("text", 7)
+					return none
+				}) == "argument"
+				assert refusal(def () !none {
+					try samples.find("nothing", 7)
+					return none
+				}) == "argument"
+				assert refusal(def () !none {
+					try samples.get("one")
+					return none
+				}) == "argument"
+				return none
+			})
+			try db.close()
+			try os.remove(path)
+			return none
+		}
+
+		@test()
+		def TestTypeChanges() !none {
+			let path = scratch("col-change")
+			let db = try open(path)
+			try db.write(def (tx Transaction) !none {
+				let members = try tx.collection<MemberV1>("members")
+				try members.put(MemberV1{id: 1, team: "red", nick: "ana"})
+				try members.put(MemberV1{id: 2, team: "blue", nick: "bob"})
+				try members.put(MemberV1{id: 3, team: "red", nick: "cora"})
+				assert (try members.find("team", "red")).len() == 2
+				return none
+			})
+			// A reader sees the records at once; an index the file does
+			// not hold yet waits for a writer.
+			try db.read(def (tx Transaction) !none {
+				let members = try tx.collection<MemberV2>("members")
+				let bob = try members.get(2)
+				fail "no bob" when bob is none
+				assert bob.nick == "bob" && bob.team == "blue"
+				// A field the stored record lacks is as a new record has it.
+				assert bob.joined == 2026
+				assert refusal(def () !none {
+					try members.first("nick", "bob")
+					return none
+				}) == "argument"
+				return none
+			})
+			try db.write(def (tx Transaction) !none {
+				let members = try tx.collection<MemberV2>("members")
+				let cora = try members.first("nick", "cora")
+				fail "no cora" when cora is none
+				assert cora.id == 3
+				assert (try members.find("joined", 2026)).len() == 3
+				assert refusal(def () !none {
+					try members.find("team", "red")
+					return none
+				}) == "argument"
+				let holder = try tx.bucket("members")
+				fail "no bucket" when holder is none
+				let held = try holder.bucket("indexes")
+				fail "no indexes" when held is none
+				assert (try held.bucket("team")) is none
+				assert (try held.count()) == 2
+				try members.put(MemberV2{id: 4, team: "red", nick: "dan", joined: 2027})
+				return none
+			})
+			try db.read(def (tx Transaction) !none {
+				let members = try tx.collection<MemberV2>("members")
+				let dan = try members.first("nick", "dan")
+				fail "no dan" when dan is none
+				assert dan.joined == 2027
+				// The key of a collection stays.
+				assert refusal(def () !none {
+					try tx.collection<MemberRekeyed>("members")
+					return none
+				}) == "argument"
+				// A collection nobody wrote is empty.
+				let nobody = try tx.collection<User>("nobody")
+				assert (try nobody.count()) == 0
+				assert (try nobody.get(1)) is none
+				assert (try nobody.all()).len() == 0
+				assert (try nobody.find("city", "Cluj")).len() == 0
+				assert (try (try nobody.cursor("city")).first()) is none
+				assert refusal(def () !none {
+					return try nobody.put(person("Ana", "Cluj"))
+				}) == "readonly"
+				assert refusal(def () !none {
+					return try members.put(MemberV2{id: 9, nick: "eve"})
+				}) == "readonly"
+				return none
+			})
+			// An index that cannot be unique over what is stored is refused,
+			// and the transaction with it.
+			assert refusal(def () !none {
+				return try db.write(def (tx Transaction) !none {
+					let members = try tx.collection<MemberV2>("members")
+					try members.put(MemberV2{id: 5, team: "blue", nick: "eve", joined: 2027})
+					try tx.collection<MemberV1>("members")
+					let again = try tx.collection<MemberV1>("members")
+					try again.put(MemberV1{id: 6, team: "red", nick: "eve"})
+					try tx.collection<MemberV2>("members")
+					return none
+				})
+			}) == "duplicate"
+			try db.read(def (tx Transaction) !none {
+				let members = try tx.collection<MemberV2>("members")
+				assert (try members.count()) == 4
+				assert (try members.find("joined", 2027)).len() == 1
+				return none
+			})
+			try db.close()
+			try os.remove(path)
+			return none
+		}
+
+		// A plain record is the bytes the general codec writes for it, and
+		// each of the two reads what the other wrote.
+		@test()
+		def TestPlainRecords() !none {
+			let codec = new encoding.MsgPack()
+			let columns = columnsOf(new Plain())
+			fail "Plain is not plain" when columns is none
+			assert columnsOf(new User()) is none
+			let wholes = [0, 1, 127, 128, 255, 256, 65535, 65536, 4294967295, 4294967296, 9223372036854775807, -1, -32, -33, -128, -129, -32768, -32769, -2147483648, -2147483649, -9223372036854775807 - 1]
+			let moments = [0, 5000000000, 5000000007, 4294967295000000000, 4294967296000000000, 9223372036854775807, -1, -5000000000, -9223372036854775807, -9223372036854775807 - 1]
+			let texts = ["", "a", "é and more", filler(3, 31), filler(4, 32), filler(5, 255), filler(6, 256), filler(7, 70000)]
+			for let round = 0; round < 60; round++ {
+				let whole = wholes[round % wholes.len()]
+				let record = new Plain()
+				record.id = round
+				record.flag = round % 2 == 1
+				record.tiny = int8(whole % 128)
+				record.short = int16(whole % 32768)
+				record.medium = int32(whole % 2147483648)
+				record.whole = whole
+				record.byte1 = uint8(round * 5 % 256)
+				record.word2 = uint16(round * 1111 % 65536)
+				record.word4 = uint32(round * 71582788)
+				record.large = round % 7 == 0 ?? (uint(18446744073709551615), uint(round) * uint(307445734561825860))
+				record.real = float(whole) / 3.0
+				record.single = float32(round) * float32(0.25)
+				record.text = texts[round % texts.len()]
+				for let k = 0; k < round * 9; k++ {
+					record.raw.push(byte(k * 31 % 256))
+				}
+				record.at = time.fromUnixNs(int64(moments[round % moments.len()]))
+				record.level = round % 3 == 0 ?? (Level.High, Level.Low)
+				record.wait = duration(whole)
+				if round % 4 != 0 {
+					record.maybe = whole
+					record.note = texts[(round + 3) % texts.len()]
+					record.ratio = float(round) * -0.5
+					record.sure = round % 8 < 4
+					record.seen = time.fromUnixNs(int64(moments[(round + 2) % moments.len()]))
+					record.rank = Level.Middle
+				}
+				let fast = packRecord(columns, reflection.fields(record))
+				let general = codec.encode(record)
+				assert fast.equals(general)
+				// The plain reader on the general codec's bytes.
+				let back = new Plain()
+				assert unpackRecord(columns, reflection.fields(back), general)
+				assert codec.encode(back).equals(general)
+				// The general codec on the plain writer's bytes.
+				let other = new Plain()
+				try codec.decode(fast, other)
+				assert codec.encode(other).equals(general)
+				// Bytes cut short are left to the general codec.
+				if fast.len() > 3 {
+					let cut = new Plain()
+					assert !unpackRecord(columns, reflection.fields(cut), fast[0:fast.len() - 1])
+					assert !unpackRecord(columns, reflection.fields(cut), fast[0:fast.len() / 2])
+				}
+			}
+			// A type that changed reads what it still has.
+			let record = new Plain()
+			record.id = 7
+			record.text = "kept"
+			record.whole = -5
+			record.maybe = 12
+			record.raw = [byte(1), byte(2)]
+			let later = columnsOf(new PlainLater())
+			fail "PlainLater is not plain" when later is none
+			let changed = new PlainLater()
+			assert unpackRecord(later, reflection.fields(changed), packRecord(columns, reflection.fields(record)))
+			assert changed.id == 7 && changed.text == "kept" && changed.whole == -5 && changed.extra == "new"
+			let maybe = changed.maybe
+			fail "no maybe" when maybe is none
+			assert maybe == 12
+			return none
+		}
+
+		@test()
+		def TestDeclarations() !none {
+			let path = scratch("col-declare")
+			let db = try open(path)
+			try db.write(def (tx Transaction) !none {
+				assert refusal(def () !none {
+					try tx.collection<NoKey>("a")
+					return none
+				}) == "argument"
+				assert refusal(def () !none {
+					try tx.collection<BadKey>("b")
+					return none
+				}) == "argument"
+				assert refusal(def () !none {
+					try tx.collection<OptionalKey>("c")
+					return none
+				}) == "argument"
+				assert refusal(def () !none {
+					try tx.collection<BadAuto>("d")
+					return none
+				}) == "argument"
+				assert refusal(def () !none {
+					try tx.collection<User>("")
+					return none
+				}) == "argument"
+				assert (try tx.buckets()).len() == 0
+				return none
+			})
+			try db.close()
+			try os.remove(path)
+			return none
+		}
+
+		@test()
+		def TestAgainstModel() !none {
+			let path = scratch("col-model")
+			let db = try open(path)
+			let dice = new Dice(20261007)
+			let cities = ["Arad", "Cluj", "Iasi", "Oradea", "Sibiu"]
+			// What the collection should hold: id -> "city/age/email", age
+			// -1 for none.
+			let model map<int, string> = {}
+			for let round = 0; round < 40; round++ {
+				try db.write(def (tx Transaction) !none {
+					let users = try tx.collection<User>("users")
+					for let step = 0; step < 25; step++ {
+						let id = dice.roll(120) + 1
+						if dice.roll(4) == 0 {
+							try users.delete(id)
+							model.delete(id)
+							continue
+						}
+						let city = cities[dice.roll(cities.len())]
+						let age = dice.roll(6) == 0 ?? (-1, 18 + dice.roll(5))
+						let user = User{id: id, email: "user{id}@example.com", city: city, name: "user{id}"}
+						user.age = age unless age < 0
+						try users.put(user)
+						model[id] = "{city}/{age}"
+					}
+					return none
+				})
+				if round % 13 == 12 {
+					try db.close()
+					db = try open(path)
+				}
+				try db.write(def (tx Transaction) !none {
+					let users = try tx.collection<User>("users")
+					try users.reindex() when round == 20
+					return none
+				})
+			}
+			try db.read(def (tx Transaction) !none {
+				let users = try tx.collection<User>("users")
+				assert (try users.count()) == model.len()
+				let ids = model.keys().sort((a, b) => a < b)
+				for let city in cities {
+					let want string[] = []
+					for let id in ids {
+						want.push("user{id}") when model[id].startsWith("{city}/")
+					}
+					assert namesOf(try users.find("city", city)) == want.join(",")
+				}
+				for let age = 18; age < 23; age++ {
+					let want string[] = []
+					for let id in ids {
+						want.push("user{id}") when model[id].endsWith("/{age}")
+					}
+					assert namesOf(try users.find("age", age)) == want.join(",")
+				}
+				let aged = 0
+				for let id in ids {
+					aged++ unless model[id].endsWith("/-1")
+					let found = try users.first("email", "user{id}@example.com")
+					fail "user{id} has no address" when found is none
+					assert found.id == id
+				}
+				assert (try users.find("age")).len() == aged
+				assert (try users.find("email")).len() == ids.len()
+				return none
+			})
+			try db.close()
+			try os.remove(path)
+			return none
+		}
+	}
+}

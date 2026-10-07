@@ -55,6 +55,22 @@ partial module adm.database.store {
 			return none
 		}
 
+		// The collection of that name, holding records of type T. A write
+		// transaction creates it and brings its indexes in step with T; a
+		// read transaction of a database without it gets an empty one.
+		// Fails as `bucket` does, and with ErrorKind.Argument when T
+		// declares no key, a key or index field of a type they cannot
+		// hold, or another key than the collection was stored with.
+		def collection<T>(name string) !Collection<T> {
+			try alive()
+			let sample = new T()
+			// Not a lambda: its result would be T, and the table takes any.
+			let table = try openTable(self, name, sample, def () any {
+				return new T()
+			})
+			return new Collection<T>(table)
+		}
+
 		// The names of the buckets, in order.
 		// Fails as `bucket` does.
 		def buckets() !string[] {

@@ -1,0 +1,109 @@
+// Keys of typed collections: values written so that the byte order of
+// the keys is the order of the values.
+internal partial module adm.database.store.engine {
+	use std.bytes
+
+	// PartKind is how one value of a key is written.
+	enum PartKind {
+		// One byte, 0 or 1.
+		Bool  = "bool",
+		// Eight bytes, most significant first, the sign bit flipped.
+		Int   = "int",
+		// Eight bytes, most significant first.
+		Uint  = "uint",
+		// The eight bytes of the float64, the sign bit flipped for a
+		// positive number and every bit for a negative one.
+		Float = "float",
+		// The UTF-8 bytes.
+		Text  = "text",
+		// The bytes.
+		Bytes = "bytes",
+		// Nanoseconds since 1970 as Int.
+		Time  = "time",
+	}
+
+	// Appends eight bytes, most significant first.
+	def appendWord(out byte[], bits uint64) {
+		for let shift = 56; shift >= 0; shift -= 8 {
+			out.push(byte((bits >> shift) & 0xFF))
+		}
+	}
+
+	def appendInt(out byte[], value int) {
+		appendWord(out, uint64(value) ^ (uint64(1) << 63))
+	}
+
+	def appendFloat(out byte[], value float) {
+		// Minus zero equals zero and gets its key.
+		let plain = value == 0.0 ?? (0.0, value)
+		let raw = float64(plain).bytes(bytes.Endian.Big)
+		if (raw[0] & 0x80) != 0 {
+			for let b in raw {
+				out.push(b ^ 0xFF)
+			}
+			return
+		}
+		out.push(raw[0] ^ 0x80)
+		for let i = 1; i < raw.len(); i++ {
+			out.push(raw[i])
+		}
+	}
+
+	// Appends text or bytes. A closed part can be followed by another: a
+	// zero byte in it is written 00 FF and it ends with 00 01, so a shorter
+	// value still sorts before a longer one that starts with it.
+	def appendRun(out byte[], data byte[], closed bool) {
+		if !closed {
+			out.push(...data)
+			return
+		}
+		for let b in data {
+			out.push(b)
+			out.push(byte(0xFF)) when b == 0
+		}
+		out.push(byte(0))
+		out.push(byte(1))
+	}
+
+	// Where the closed part that starts at `at` ends; -1 when the key is
+	// too short for it.
+	def partEnd(key byte[], at int, kind PartKind) int {
+		match kind {
+			case PartKind.Bool:
+				return at + 1 <= key.len() ?? (at + 1, -1)
+			case PartKind.Text, PartKind.Bytes:
+				let i = at
+				for i + 1 < key.len() {
+					if key[i] != 0 {
+						i++
+						continue
+					}
+					return i + 2 when key[i + 1] == 1
+					i += 2
+				}
+				return -1
+			default:
+				return at + 8 <= key.len() ?? (at + 8, -1)
+		}
+	}
+
+	// Whether `key` starts with `prefix`.
+	def hasPrefix(key byte[], prefix byte[]) bool {
+		return false when key.len() < prefix.len()
+		for let (i, b) in prefix {
+			return false when key[i] != b
+		}
+		return true
+	}
+
+	// Compares the first bytes of `key`, as many as `bound` has, with
+	// `bound`.
+	def compareLead(key byte[], bound byte[]) int {
+		let n = key.len().min(bound.len())
+		for let i = 0; i < n; i++ {
+			let d = int(key[i]) - int(bound[i])
+			return d when d != 0
+		}
+		return key.len() < bound.len() ?? (-1, 0)
+	}
+}

@@ -382,6 +382,50 @@ partial module adm.database.store {
 			return none
 		}
 
+		// A change two buckets down, in a transaction that changes nothing
+		// in the buckets above it, is committed with them.
+		@test()
+		def TestNestedChangeAlone() !none {
+			let path = scratch("deep")
+			let db = try open(path)
+			try db.write(def (tx Transaction) !none {
+				let shop = try tx.createBucket("shop")
+				let orders = try shop.createBucket("orders")
+				let lines = try orders.createBucket("lines")
+				try lines.put("a", "1")
+				try orders.put("note", "first")
+				return none
+			})
+			for let round = 0; round < 5; round++ {
+				try db.write(def (tx Transaction) !none {
+					let shop = try tx.createBucket("shop")
+					let orders = try shop.createBucket("orders")
+					let lines = try orders.createBucket("lines")
+					try lines.put("round-{round}", filler(round, 300))
+					try lines.nextSequence()
+					return none
+				})
+				try db.close()
+				db = try open(path)
+				try db.read(def (tx Transaction) !none {
+					let shop = try tx.bucket("shop")
+					fail "no shop" when shop is none
+					let orders = try shop.bucket("orders")
+					fail "no orders" when orders is none
+					let lines = try orders.bucket("lines")
+					fail "no lines" when lines is none
+					assert (try lines.count()) == round + 2
+					assert (try textOf(lines, "round-{round}")) == filler(round, 300)
+					assert (try lines.sequence()) == round + 1
+					assert (try textOf(orders, "note")) == "first"
+					return none
+				})
+			}
+			try db.close()
+			try os.remove(path)
+			return none
+		}
+
 		@test()
 		def TestNestedBuckets() !none {
 			let path = scratch("nested")

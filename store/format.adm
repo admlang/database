@@ -1,5 +1,6 @@
 // The file format: two meta pages, then pages that hold a B+tree node or
-// the free list, each a run of one or more whole pages with a checksum.
+// the free list, each a run of one or more whole pages. The pager adds
+// the checksum of a run, or seals it in an encrypted database (seal.adm).
 internal partial module adm.database.store.engine {
 	use (
 		std.crypto.hash
@@ -9,6 +10,10 @@ internal partial module adm.database.store.engine {
 	// "ADMS" in the first four bytes of both meta pages.
 	const magic = 0x534D4441
 	const formatVersion = 1
+	// The format of an encrypted database.
+	const formatSealed = 2
+	// How many bytes at the start of a meta page say all it holds.
+	const metaHead = 128
 	const headerSize = 16
 	const kindBranch = 1
 	const kindLeaf = 2
@@ -104,28 +109,72 @@ internal partial module adm.database.store.engine {
 		return int(hash.crc32c(buf[headerSize:], head))
 	}
 
-	def encodeMeta(base Meta) byte[] {
+	// Writes a meta page. In an encrypted database the fields below the
+	// page size are sealed:
+	//
+	//	0   magic, format, page size (4 each)
+	//	12  key derivation (4), salt (16), rounds (4), 8 spare
+	//	44  nonce (12), sealed fields (40), tag (16)
+	//	112 checksum of all before it (4)
+	//
+	// The checksum tells a torn page from one the key does not open.
+	// Fails with ErrorKind.Storage when a nonce cannot be drawn.
+	def encodeMeta(base Meta, sealer ?Sealer = none) !byte[] {
 		let buf byte[] = []
 		buf.len(base.pageSize)
 		putU32(buf, 0, magic)
-		putU32(buf, 4, formatVersion)
 		putU32(buf, 8, base.pageSize)
-		putU64(buf, 16, base.root)
-		putU64(buf, 24, base.sequence)
-		putU64(buf, 32, base.freelist)
-		putU64(buf, 40, base.pages)
-		putU64(buf, 48, base.txid)
-		putU32(buf, 56, int(hash.crc32c(buf[0:56])))
+		if sealer is none {
+			putU32(buf, 4, formatVersion)
+			putMetaFields(buf, 16, base)
+			putU32(buf, 56, int(hash.crc32c(buf[0:56])))
+			return buf
+		}
+		putU32(buf, 4, formatSealed)
+		sealer.describe(buf)
+		let fields byte[] = []
+		fields.len(40)
+		putMetaFields(fields, 0, base)
+		try sealer.sealMeta(buf, fields)
+		putU32(buf, 112, int(hash.crc32c(buf[0:112])))
 		return buf
 	}
 
-	// Reads a meta page; none when it is not one or its checksum fails.
-	def decodeMeta(buf byte[]) ?Meta {
-		return none when buf.len() < 64 || getU32(buf, 0) != magic || getU32(buf, 4) != formatVersion
-		return none when getU32(buf, 56) != int(hash.crc32c(buf[0:56]))
+	def putMetaFields(buf byte[], at int, base Meta) {
+		putU64(buf, at, base.root)
+		putU64(buf, at + 8, base.sequence)
+		putU64(buf, at + 16, base.freelist)
+		putU64(buf, at + 24, base.pages)
+		putU64(buf, at + 32, base.txid)
+	}
+
+	def metaFields(buf byte[], at int, size int) Meta {
+		return Meta{pageSize: size, root: getU64(buf, at), sequence: getU64(buf, at + 8), freelist: getU64(buf, at + 16), pages: getU64(buf, at + 24), txid: getU64(buf, at + 32)}
+	}
+
+	// What the first `metaHead` bytes of a meta page are: `formatVersion`
+	// or `formatSealed` for a whole meta page of that format, 0 for
+	// anything else (a torn write among them).
+	def metaFormat(buf byte[]) int {
+		return 0 when buf.len() < metaHead || getU32(buf, 0) != magic
 		let size = getU32(buf, 8)
-		return none when size < 4096 || size > 65536 || (size & (size - 1)) != 0
-		return Meta{pageSize: size, root: getU64(buf, 16), sequence: getU64(buf, 24), freelist: getU64(buf, 32), pages: getU64(buf, 40), txid: getU64(buf, 48)}
+		return 0 when size < 4096 || size > 65536 || (size & (size - 1)) != 0
+		let format = getU32(buf, 4)
+		if format == formatVersion {
+			return getU32(buf, 56) == int(hash.crc32c(buf[0:56])) ?? (format, 0)
+		}
+		return 0 when format != formatSealed
+		return getU32(buf, 112) == int(hash.crc32c(buf[0:112])) ?? (format, 0)
+	}
+
+	// Reads a meta page `metaFormat` accepted; none when the sealer's key
+	// does not open it.
+	def decodeMeta(buf byte[], sealer ?Sealer = none) ?Meta {
+		let size = getU32(buf, 8)
+		return metaFields(buf, 16, size) when sealer is none
+		let fields = sealer.openMeta(buf)
+		return none when fields is none
+		return metaFields(fields, 0, size)
 	}
 
 	// Reads the varint at an offset of a page.
@@ -366,8 +415,9 @@ internal partial module adm.database.store.engine {
 			return total
 		}
 
-		// Packs the edited node into the bytes of its page run and returns
-		// them. The node is a node of the file from then on.
+		// Packs the edited node into the bytes of its page run, `pageSize`
+		// to a page, and returns them. The node is a node of the file from
+		// then on.
 		def pack(pageSize int) byte[] {
 			let size = measure()
 			let n = count()
@@ -400,7 +450,6 @@ internal partial module adm.database.store.engine {
 					at += 8
 				}
 			}
-			putU32(out, 12, checksumOf(out))
 			buf = out
 			offs = starts
 			packed = true
@@ -421,10 +470,10 @@ internal partial module adm.database.store.engine {
 		return getU32(first, 8)
 	}
 
-	// Reads a node from the bytes of its page run, which the node keeps.
-	// Fails with ErrorKind.Corrupt when the checksum or the layout is off.
+	// Reads a node from the bytes of its page run, which the node keeps;
+	// `pageSize` is what one page holds of them.
+	// Fails with ErrorKind.Corrupt when the layout is off.
 	def decodeNode(buf byte[], id int, pageSize int) !Node {
-		fail errorOf(ErrorKind.Corrupt, "store: page {id} fails its checksum") when getU32(buf, 12) != checksumOf(buf)
 		let kind = int(buf[0])
 		fail errorOf(ErrorKind.Corrupt, "store: page {id} holds no tree node") unless kind := kindBranch || kindLeaf
 		let node = new Node(kind == kindLeaf)
@@ -464,7 +513,6 @@ internal partial module adm.database.store.engine {
 		for let i = 0; i < ids.len(); i++ {
 			putU64(buf, headerSize + 8 + i * 8, ids[i])
 		}
-		putU32(buf, 12, checksumOf(buf))
 		return buf
 	}
 
@@ -475,7 +523,7 @@ internal partial module adm.database.store.engine {
 
 	// Reads the free list. Fails with ErrorKind.Corrupt.
 	def decodeFree(buf byte[], id int) !int[] {
-		fail errorOf(ErrorKind.Corrupt, "store: the free list at page {id} fails its checksum") when getU32(buf, 12) != checksumOf(buf) || int(buf[0]) != kindFree
+		fail errorOf(ErrorKind.Corrupt, "store: page {id} holds no free list") when int(buf[0]) != kindFree
 		let count = getU64(buf, headerSize)
 		fail errorOf(ErrorKind.Corrupt, "store: the free list at page {id} is cut short") when headerSize + 8 + count * 8 > buf.len()
 		let ids int[] = []

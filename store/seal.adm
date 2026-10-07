@@ -1,0 +1,182 @@
+// Encryption of a database file: every page run and both meta pages are
+// sealed with ChaCha20-Poly1305 under one key, each write under a fresh
+// random nonce.
+internal partial module adm.database.store.engine {
+	use (
+		std.crypto
+		std.crypto.cipher
+		std.crypto.hash
+		adm.database.store::*
+	)
+
+	// What a sealed page run spends on its nonce and tag beyond the four
+	// bytes of a plain run's checksum: a page of an encrypted file holds
+	// that much less.
+	const sealOverhead = 24
+	const nonceSize = 12
+	const tagSize = 16
+	const keySize = 32
+	const saltSize = 16
+	// How the key came to be: given as it is, or made from a password
+	// with PBKDF2 over HMAC-SHA-256.
+	const kdfNone = 0
+	const kdfPBKDF2 = 1
+
+	// Sealer holds the key of an encrypted database and what its meta
+	// pages say about where the key comes from.
+	//
+	// A sealed page run of `span` pages is, in the file:
+	//
+	//	0   nonce (12)
+	//	12  span - 1 (4), in the clear: a reader needs it to fetch the run
+	//	16  ciphertext of the node's kind and count (8) and its entries
+	//	..  tag (16), then zeros up to the end of the last page
+	//
+	// The page number and the span are authenticated with it, so a run
+	// copied to another place in the file does not open there.
+	type Sealer {
+		aead   cipher.ChaCha20Poly1305
+		kdf    int
+		salt   byte[]
+		rounds int
+
+		def new(aead cipher.ChaCha20Poly1305, kdf int, salt byte[], rounds int) {
+			self.aead = aead
+			self.kdf = kdf
+			self.salt = salt
+			self.rounds = rounds
+		}
+
+		// True when the meta page in `head` names this sealer's key.
+		def matches(head byte[]) bool {
+			return getU32(head, 12) == kdf && getU32(head, 32) == rounds && head[16:16 + saltSize].equals(salt)
+		}
+
+		// Writes where the key comes from into a meta page.
+		def describe(head byte[]) {
+			putU32(head, 12, kdf)
+			salt.copy(head[16:])
+			putU32(head, 32, rounds)
+		}
+
+		// A nonce no write has used. Fails with ErrorKind.Storage when the
+		// system has no random bytes to give.
+		def nonce() !byte[] {
+			return crypto.rand(nonceSize) onerror (err error) {
+				fail errorOf(ErrorKind.Storage, "store: no random bytes for a nonce: {err.message}", err)
+			}
+		}
+
+		// The bytes authenticated with a page run: where it is and how
+		// long.
+		def placeOf(id int, more int) byte[] {
+			let place byte[] = []
+			place.len(12)
+			putU64(place, 0, id)
+			putU32(place, 8, more)
+			return place
+		}
+
+		// Seals the bytes of a node's page run for page `id` and returns
+		// what goes into the file: whole pages of `pageSize`.
+		// Fails with ErrorKind.Storage without random bytes.
+		def sealRun(id int, run byte[], pageSize int) !byte[] {
+			let more = getU32(run, 8)
+			let plain = run[0:8] + run[headerSize:]
+			let fresh = try nonce()
+			let sealed = aead.seal(fresh, plain, placeOf(id, more))
+			let out byte[] = []
+			out.len((more + 1) * pageSize)
+			fresh.copy(out)
+			putU32(out, nonceSize, more)
+			sealed.copy(out[headerSize:])
+			return out
+		}
+
+		// Opens the pages of a run read from page `id`, each of them
+		// holding `room` bytes of a node, and returns the node's bytes.
+		// Fails with ErrorKind.Corrupt when the run is not what was
+		// sealed there.
+		def openRun(id int, pages byte[], room int) !byte[] {
+			let more = getU32(pages, nonceSize)
+			let size = (more + 1) * room
+			let last = headerSize + size - 8 + tagSize
+			fail errorOf(ErrorKind.Corrupt, "store: page {id} is cut short") when last > pages.len()
+			let plain = aead.open(pages[0:nonceSize], pages[headerSize:last], placeOf(id, more)) onerror (err error) {
+				fail errorOf(ErrorKind.Corrupt, "store: page {id} fails its authentication", err)
+			}
+			let run byte[] = []
+			run.len(size)
+			plain[0:8].copy(run)
+			putU32(run, 8, more)
+			plain[8:].copy(run[headerSize:])
+			return run
+		}
+
+		// Seals the fields of a meta page (root, sequence, free list,
+		// pages, transaction) into `buf`, whose first 44 bytes are
+		// authenticated with them.
+		def sealMeta(buf byte[], fields byte[]) !none {
+			let fresh = try nonce()
+			fresh.copy(buf[44:])
+			aead.seal(fresh, fields, buf[0:44]).copy(buf[56:])
+			return none
+		}
+
+		// The fields of a sealed meta page; none when the key does not
+		// open it.
+		def openMeta(buf byte[]) ?byte[] {
+			let fields = aead.open(buf[44:56], buf[56:112], buf[0:44]) onerror recover []
+			return none when fields.len() == 0
+			return fields
+		}
+	}
+
+	// The sealer of a database being created: none when neither a key nor
+	// a password is given.
+	// Fails with ErrorKind.Storage without random bytes.
+	def newSealer(key byte[], password string, rounds int) !?Sealer {
+		if key.len() > 0 {
+			return try sealerWith(key, kdfNone, zeroBytes(saltSize), 0)
+		}
+		return none when password == ""
+		let salt = crypto.rand(saltSize) onerror (err error) {
+			fail errorOf(ErrorKind.Storage, "store: no random bytes for a salt: {err.message}", err)
+		}
+		return try sealerWith(stretched(password, salt, rounds), kdfPBKDF2, salt, rounds)
+	}
+
+	// The sealer of an existing database, from what its meta page in
+	// `head` says and the key or password given to `open`.
+	// Fails with ErrorKind.Key when the file wants the other of the two.
+	def sealerOf(head byte[], key byte[], password string, path string) !Sealer {
+		let kdf = getU32(head, 12)
+		let salt = head[16:16 + saltSize].clone()
+		let rounds = getU32(head, 32)
+		if kdf == kdfNone {
+			fail errorOf(ErrorKind.Key, "store: {path} is encrypted with a key, not a password") when key.len() == 0
+			return try sealerWith(key, kdf, salt, rounds)
+		}
+		fail errorOf(ErrorKind.Corrupt, "store: {path} names a key derivation this version does not know") when kdf != kdfPBKDF2 || rounds < 1
+		fail errorOf(ErrorKind.Key, "store: {path} is encrypted with a password, not a key") when password == ""
+		return try sealerWith(stretched(password, salt, rounds), kdf, salt, rounds)
+	}
+
+	def sealerWith(key byte[], kdf int, salt byte[], rounds int) !Sealer {
+		let aead = cipher.newChaCha20Poly1305(key) onerror (err error) {
+			fail errorOf(ErrorKind.Argument, "store: the key must be {keySize} bytes", err)
+		}
+		return new Sealer(aead, kdf, salt, rounds)
+	}
+
+	// The key a password stands for in a database with that salt.
+	def stretched(password string, salt byte[], rounds int) byte[] {
+		return hash.pbkdf2(hash.Hash.SHA256, password.bytes(), salt, rounds, keySize)
+	}
+
+	def zeroBytes(count int) byte[] {
+		let out byte[] = []
+		out.len(count)
+		return out
+	}
+}

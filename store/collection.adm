@@ -1,0 +1,313 @@
+partial module adm.database.store {
+	use (
+		std.reflection
+		adm.database.store.engine::*
+	)
+
+	// key marks the field a collection stores its records under. Two
+	// records with the same key are the same record. Several fields marked
+	// make the key together, in the order they are declared.
+	//
+	//     auto  the collection numbers the records: a record stored with 0
+	//           here gets the next number, written back into the field.
+	//           For a key of one integer field.
+	//
+	// A key field is a bool, an integer, a float, a string, an enum, a
+	// `byte[]` or a `time.Time`, and not optional.
+	meta def key(ctx reflection.FieldMetaContext, auto bool = false) {}
+
+	// index marks a field records are found and ordered by, besides the
+	// key.
+	//
+	//     unique  no two records hold the same value
+	//     name    the index's name instead of the field's; fields that
+	//             share a name make one index over all of them, in the
+	//             order they are declared
+	//
+	// An index field has one of the types a key field has, or an optional
+	// of one. A record whose field holds none is not in the index.
+	meta def index(ctx reflection.FieldMetaContext, unique bool = false, name string = "") {}
+
+	// Collection holds the records of one type in a bucket of a
+	// transaction: each a struct or a type, stored under the field marked
+	// `@store.key`, found again by the fields marked `@store.index`.
+	//
+	// ```
+	// struct User {
+	//     @store.key(auto = true)
+	//     id    int
+	//     @store.index(unique = true)
+	//     email string
+	//     @store.index
+	//     city  string
+	//     name  string
+	// }
+	//
+	// try db.write(def (tx store.Transaction) !none {
+	//     let users = try tx.collection<User>("users")
+	//     let ana = User{email: "ana@example.com", city: "Cluj", name: "Ana"}
+	//     try users.put(ana)                                 // ana.id is 1 now
+	//     let found = try users.first("email", "ana@example.com")
+	//     let locals = try users.find("city", "Cluj")
+	//     return none
+	// })
+	// ```
+	//
+	// A record is stored as MessagePack with its field names, so fields can
+	// be added to the type and removed from it later: a stored record
+	// without a field leaves it as a new T has it. T needs a constructor
+	// without arguments.
+	//
+	// The indexes follow the type. Opening the collection in a write
+	// transaction builds an index the type declares and the file does not
+	// hold, and drops one the type no longer declares. The key cannot
+	// change.
+	//
+	// Records come back as copies: storing one again is what changes the
+	// database.
+	//
+	// Methods fail with a StoreError as `Bucket` methods do, with
+	// ErrorKind.Argument for a key or an index value of the wrong type and
+	// for an index the type does not declare, and with ErrorKind.Corrupt
+	// for a stored record that does not read as a T.
+	type Collection<T> {
+		name           string
+		internal table Table
+
+		def new(table Table) {
+			self.table = table
+			name = table.name
+		}
+
+		// put stores a record, replacing the one with the same key.
+		// Fails as the type says, and with ErrorKind.Duplicate when
+		// another record holds the same value in a unique index.
+		def put(record T) !none {
+			return try table.save(record, false)
+		}
+
+		// insert stores a new record.
+		// Fails as `put` does, and with ErrorKind.Duplicate when the key
+		// is taken.
+		def insert(record T) !none {
+			return try table.save(record, true)
+		}
+
+		// The record under a key; none when there is none. A key of
+		// several fields takes a value for each.
+		// Fails as the type says.
+		def get(key ...any) !?T {
+			let data = try table.raw(try table.keyFrom(key))
+			return none when data is none
+			return try decoded(data)
+		}
+
+		// Whether a record has that key. Fails as the type says.
+		def has(key ...any) !bool {
+			return !((try table.raw(try table.keyFrom(key))) is none)
+		}
+
+		// delete removes the record under a key; one that is not there is
+		// not an error. Fails as the type says.
+		def delete(key ...any) !none {
+			return try table.erase(try table.keyFrom(key))
+		}
+
+		// The records that hold these values in an index, in the order of
+		// the index. An index over several fields takes a value for each,
+		// or for the first of them.
+		// Fails as the type says.
+		def find(index string, values ...any) !T[] {
+			return try matching(index, values, 0)
+		}
+
+		// The first record `find` returns; none when there is none.
+		// Fails as the type says.
+		def first(index string, values ...any) !?T {
+			let found = try matching(index, values, 1)
+			return none when found.len() == 0
+			return found[0]
+		}
+
+		// The records whose value in an index is from `low` to `high`,
+		// both included, in the order of the index; none for either leaves
+		// that end open. An index over several fields is compared by its
+		// first one. "" as the index is the key.
+		// Fails as the type says.
+		def between(index string, low ?any, high ?any) !T[] {
+			let access = try table.access(index)
+			let out T[] = []
+			return out when table.records is none
+			let source = try table.entries(access)
+			let entry ?Entry = none
+			if low is none {
+				entry = try source.first()
+			} else {
+				entry = try source.seek(try table.lead(access, [low]))
+			}
+			let bound byte[] = []
+			bound = try table.lead(access, [high]) unless high is none
+			for {
+				break when entry is none
+				if !(high is none) {
+					// A key of one part is not closed: a longer key that
+					// starts with the bound is past it.
+					let past = access.closed ?? (compareLead(entry.key, bound) > 0, compareKeys(entry.key, bound) > 0)
+					break when past
+				}
+				out.push(try decoded(try table.stored(access, entry)))
+				entry = try source.next()
+			}
+			return out
+		}
+
+		// Every record, in key order. Fails as the type says.
+		def all() !T[] {
+			return try between("", none, none)
+		}
+
+		// How many records the collection holds. It walks them.
+		// Fails as the type says.
+		def count() !int {
+			let rows = table.records
+			return 0 when rows is none
+			return try rows.count()
+		}
+
+		// A cursor over the records in the order of an index, or of the
+		// key when none is named.
+		// Fails as the type says.
+		def cursor(index string = "") !RecordCursor<T> {
+			return new RecordCursor<T>(table, try table.access(index))
+		}
+
+		// reindex builds every index again from the records: for a file
+		// whose index is damaged.
+		// Fails as `put` does.
+		def reindex() !none {
+			return try table.build(table.plan.indexes)
+		}
+
+		// Names the collection.
+		def str() string {
+			return "store.Collection({name})"
+		}
+
+		internal def decoded(data byte[]) !T {
+			let item = new T()
+			try table.load(data, item)
+			return item
+		}
+
+		// The records whose entries start with the values, at most `limit`
+		// of them when that is not 0.
+		internal def matching(index string, values any[], limit int) !T[] {
+			let access = try table.access(index)
+			let out T[] = []
+			return out when table.records is none
+			let lead = try table.lead(access, values)
+			if access.unique && values.len() == access.parts.len() {
+				// One record at most: no cursor is needed to find it.
+				let data = try table.single(access, lead)
+				out.push(try decoded(data)) unless data is none
+				return out
+			}
+			let whole = !access.closed && values.len() == access.parts.len()
+			let source = try table.entries(access)
+			let entry = try source.seek(lead)
+			for {
+				break when entry is none
+				if whole {
+					break when compareKeys(entry.key, lead) != 0
+				} else {
+					break unless hasPrefix(entry.key, lead)
+				}
+				out.push(try decoded(try table.stored(access, entry)))
+				break when limit > 0 && out.len() >= limit
+				entry = try source.next()
+			}
+			return out
+		}
+	}
+
+	// RecordCursor walks the records of a collection in the order of its
+	// key or of one index, forwards or backwards. Each move returns the
+	// record it lands on, or none past either end.
+	//
+	// ```
+	// let byCity = try users.cursor("city")
+	// let user = try byCity.seek("Cluj")
+	// for {
+	//     break when user is none || user.city != "Cluj"
+	//     print(user.name)
+	//     user = try byCity.next()
+	// }
+	// ```
+	//
+	// Moves fail with a StoreError as `Collection` methods do.
+	type RecordCursor<T> {
+		internal table  Table
+		internal access Access
+		internal source ?Cursor
+
+		def new(table Table, access Access) {
+			self.table = table
+			self.access = access
+		}
+
+		// Goes to the first record. Fails as the type says.
+		def first() !?T {
+			let cursor = try opened()
+			return none when cursor is none
+			return try landed(try cursor.first())
+		}
+
+		// Goes to the last record. Fails as the type says.
+		def last() !?T {
+			let cursor = try opened()
+			return none when cursor is none
+			return try landed(try cursor.last())
+		}
+
+		// Goes to the first record whose values are not below these: a
+		// value for each field of the index, or for the first of them.
+		// Fails as the type says.
+		def seek(values ...any) !?T {
+			let cursor = try opened()
+			return none when cursor is none
+			return try landed(try cursor.seek(try table.lead(access, values)))
+		}
+
+		// Goes to the next record; to the first one on a cursor that has
+		// not moved yet. Fails as the type says.
+		def next() !?T {
+			let cursor = try opened()
+			return none when cursor is none
+			return try landed(try cursor.next())
+		}
+
+		// Goes to the record before; to the last one on a cursor that has
+		// not moved yet. Fails as the type says.
+		def previous() !?T {
+			let cursor = try opened()
+			return none when cursor is none
+			return try landed(try cursor.previous())
+		}
+
+		// The cursor over the entries; none while the collection holds
+		// nothing.
+		internal def opened() !?Cursor {
+			return source unless source is none
+			return none when table.records is none
+			source = try table.entries(access)
+			return source
+		}
+
+		internal def landed(entry ?Entry) !?T {
+			return none when entry is none
+			let item = new T()
+			try table.load(try table.stored(access, entry), item)
+			return item
+		}
+	}
+}

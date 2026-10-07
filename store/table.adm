@@ -1,0 +1,590 @@
+// What a typed collection does without knowing its record type: the plan
+// read from the type's annotations, the keys, the index buckets.
+partial module adm.database.store {
+	use (
+		std.data.encoding
+		std.reflection
+		std.time
+		adm.database.store.engine::*
+	)
+
+	internal const keyAttr = "adm.database.store.key"
+	internal const indexAttr = "adm.database.store.index"
+	// The names inside a collection's bucket.
+	internal const schemaKey = "schema"
+	internal const recordsName = "records"
+	internal const indexesName = "indexes"
+
+	// KeyPart is one field of a key.
+	internal struct KeyPart {
+		// The field's position in the record and its name.
+		field int
+		name  string
+		kind  PartKind
+	}
+
+	// Access is one order the records can be reached in: the primary key
+	// or an index.
+	internal struct Access {
+		// "" for the primary key.
+		name    string
+		parts   KeyPart[]
+		unique  bool
+		// Whether every part is written closed: all but a key of one part.
+		closed  bool
+		primary bool
+	}
+
+	// The line of the stored schema that describes an access.
+	internal def signature(access Access) string {
+		let fields string[] = []
+		for let part in access.parts {
+			fields.push("{part.name}:{part.kind.value}")
+		}
+		return "key {fields.join(",")}" when access.primary
+		return "index {access.name} {access.unique ?? ("unique", "many")} {fields.join(",")}"
+	}
+
+	// How a field is written in a key; none for a type keys cannot hold.
+	internal def partKindOf(f reflection.Field) ?PartKind {
+		let kind = f.kind == reflection.FieldKind.Optional ?? (f.elemKind, f.kind)
+		let typeName = f.typeName.trimPrefix("?")
+		return PartKind.Int when typeName == "duration"
+		match kind {
+			case reflection.FieldKind.Bool:
+				return PartKind.Bool
+			case reflection.FieldKind.Int, reflection.FieldKind.Enum:
+				return PartKind.Int
+			case reflection.FieldKind.Uint:
+				return PartKind.Uint
+			case reflection.FieldKind.Float:
+				return PartKind.Float
+			case reflection.FieldKind.String:
+				return PartKind.Text
+			case reflection.FieldKind.Array:
+				return PartKind.Bytes when typeName := "byte[]" || "uint8[]"
+				return none
+			case reflection.FieldKind.Struct:
+				return PartKind.Time when typeName == "std.time.Time"
+				return none
+			default:
+				return none
+		}
+	}
+
+	internal def validName(name string) bool {
+		return false when name == ""
+		for let b in name.bytes() {
+			let fine = (b >= byte('a') && b <= byte('z')) || (b >= byte('A') && b <= byte('Z')) || (b >= byte('0') && b <= byte('9')) || b == byte('_') || b == byte('-') || b == byte('.')
+			return false unless fine
+		}
+		return true
+	}
+
+	// Plan is what the annotations of a record type say.
+	internal type Plan {
+		typeName string
+		key      Access
+		// The key is one integer the collection numbers itself.
+		auto     bool
+		indexes  Access[]
+		// The fields of a type whose records are written field by field;
+		// none for a type the general codec writes.
+		columns  ?Column[]
+
+		def new(typeName string) {
+			self.typeName = typeName
+			key = Access{name: "", parts: [], unique: true, closed: false, primary: true}
+			indexes = []
+		}
+
+		def schema() string {
+			let lines string[] = [signature(key)]
+			for let access in indexes {
+				lines.push(signature(access))
+			}
+			return lines.join("\n")
+		}
+
+		// The position of an index by name; -1 when there is none.
+		def find(name string) int {
+			for let (i, access) in indexes {
+				return i when access.name == name
+			}
+			return -1
+		}
+	}
+
+	// Reads the plan of a record type from one of its instances.
+	internal def planOf(sample any) !Plan {
+		let typeName = reflection.typeName(sample)
+		let plan = new Plan(typeName)
+		for let (at, f) in reflection.fields(sample) {
+			let keyed = f.hasAttr(keyAttr)
+			let indexed = f.hasAttr(indexAttr)
+			continue unless keyed || indexed
+			let kind = partKindOf(f)
+			fail errorOf(ErrorKind.Argument, "store: {typeName}.{f.name} is a {f.typeName}: a key or an index takes bool, integer, float, string, enum, byte[] and time.Time fields") when kind is none
+			let part = KeyPart{field: at, name: f.name, kind: kind}
+			if keyed {
+				fail errorOf(ErrorKind.Argument, "store: {typeName}.{f.name} is optional: a record always has its key") when f.kind == reflection.FieldKind.Optional
+				plan.key.parts.push(part)
+				plan.auto = true when f.attr(keyAttr, "auto") == "true"
+			}
+			if indexed {
+				let name = f.attr(indexAttr, "name")
+				name = f.name when name == ""
+				fail errorOf(ErrorKind.Argument, "store: '{name}' on {typeName}.{f.name} cannot name an index: use letters, digits, '_', '-' and '.'") unless validName(name)
+				let slot = plan.find(name)
+				if slot < 0 {
+					plan.indexes.push(Access{name: name, parts: [], unique: false, closed: true, primary: false})
+					slot = plan.indexes.len() - 1
+				}
+				plan.indexes[slot].parts.push(part)
+				plan.indexes[slot].unique = true when f.attr(indexAttr, "unique") == "true"
+			}
+		}
+		fail errorOf(ErrorKind.Argument, "store: {typeName} has no key: mark a field with @store.key") when plan.key.parts.len() == 0
+		plan.columns = columnsOf(sample)
+		plan.key.closed = plan.key.parts.len() > 1
+		if plan.auto {
+			let only = plan.key.parts[0].kind
+			fail errorOf(ErrorKind.Argument, "store: {typeName} asks for a numbered key: that takes one integer field") unless plan.key.parts.len() == 1 && (only == PartKind.Int || only == PartKind.Uint)
+		}
+		return plan
+	}
+
+	internal def wholeOf(value any, what string) !int {
+		match value {
+			case int:
+				return value
+			case int32:
+				return int(value)
+			case int16:
+				return int(value)
+			case int8:
+				return int(value)
+			case uint:
+				return int(value)
+			case uint32:
+				return int(value)
+			case uint16:
+				return int(value)
+			case uint8:
+				return int(value)
+			case duration:
+				return int(value)
+			default:
+				fail errorOf(ErrorKind.Argument, "store: {what} is an integer, not a {reflection.typeName(value)}")
+		}
+	}
+
+	// Appends a value given in a call as the part says.
+	internal def appendValue(out byte[], part KeyPart, value any, closed bool) !none {
+		let what = "'{part.name}'"
+		match part.kind {
+			case PartKind.Bool:
+				fail errorOf(ErrorKind.Argument, "store: {what} is a bool, not a {reflection.typeName(value)}") unless value is bool
+				out.push(byte(value ?? (1, 0)))
+			case PartKind.Int:
+				appendInt(out, try wholeOf(value, what))
+			case PartKind.Uint:
+				appendWord(out, uint64(try wholeOf(value, what)))
+			case PartKind.Float:
+				if value is float {
+					appendFloat(out, value)
+				} else if value is float32 {
+					appendFloat(out, float(value))
+				} else {
+					appendFloat(out, float(try wholeOf(value, what)))
+				}
+			case PartKind.Text:
+				fail errorOf(ErrorKind.Argument, "store: {what} is a string, not a {reflection.typeName(value)}") unless value is string
+				appendRun(out, value.bytes(), closed)
+			case PartKind.Bytes:
+				fail errorOf(ErrorKind.Argument, "store: {what} is a byte[], not a {reflection.typeName(value)}") unless value is byte[]
+				appendRun(out, value, closed)
+			case PartKind.Time:
+				fail errorOf(ErrorKind.Argument, "store: {what} is a time.Time, not a {reflection.typeName(value)}") unless value is time.Time
+				appendInt(out, int(value.unixNs()))
+		}
+		return none
+	}
+
+	// Appends the value a record holds in a field. False when the field is
+	// an optional that holds none.
+	internal def appendField(out byte[], part KeyPart, f reflection.Field, closed bool) bool {
+		if f.kind == reflection.FieldKind.Optional {
+			return false when f.value() is none
+		}
+		match part.kind {
+			case PartKind.Bool:
+				out.push(byte(f.asBool() ?? (1, 0)))
+			case PartKind.Int:
+				appendInt(out, f.asInt())
+			case PartKind.Uint:
+				appendWord(out, uint64(f.asUint()))
+			case PartKind.Float:
+				appendFloat(out, f.asFloat())
+			case PartKind.Text:
+				appendRun(out, f.asString().bytes(), closed)
+			case PartKind.Bytes:
+				let n = f.len()
+				let data byte[] = []
+				data.cap(n)
+				for let i = 0; i < n; i++ {
+					data.push(byte(f.at(i).asUint()))
+				}
+				appendRun(out, data, closed)
+			case PartKind.Time:
+				let held = f.value()
+				if held is time.Time {
+					appendInt(out, int(held.unixNs()))
+				} else {
+					appendInt(out, 0)
+				}
+		}
+		return true
+	}
+
+	// The key of a record in an access; none when one of its fields holds
+	// none.
+	internal def entryOf(access Access, fields reflection.Field[]) ?byte[] {
+		let out byte[] = []
+		for let part in access.parts {
+			return none unless appendField(out, part, fields[part.field], access.closed)
+		}
+		return out
+	}
+
+	internal def sameBytes(a ?byte[], b ?byte[]) bool {
+		return b is none when a is none
+		return false when b is none
+		return compareKeys(a, b) == 0
+	}
+
+	// Table is a collection without its record type: records as objects
+	// behind `any`.
+	internal type Table {
+		name    string
+		plan    Plan
+		// The collection's bucket and the two inside it; none in a read
+		// transaction of a database that has no such collection yet.
+		home    ?Bucket
+		records ?Bucket
+		held    ?Bucket
+		// Per index of the plan, whether its bucket holds what the plan
+		// says. A read transaction cannot build one that does not.
+		built   bool[]
+		codec   encoding.MsgPack
+		// Makes an empty record.
+		make    def () any
+
+		def new(name string, plan Plan, make def () any) {
+			self.name = name
+			self.plan = plan
+			self.make = make
+			codec = new encoding.MsgPack()
+			built = []
+			for let _ in plan.indexes {
+				built.push(false)
+			}
+		}
+
+		// The bucket of an index.
+		def bucketOf(access Access) !Bucket {
+			let at = plan.find(access.name)
+			let all = held
+			fail errorOf(ErrorKind.Argument, "store: the index '{access.name}' of {name} is not built yet: open the collection in a write transaction once") when all is none || at < 0 || !built[at]
+			let found = try all.bucket(access.name)
+			fail errorOf(ErrorKind.Corrupt, "store: the index '{access.name}' of {name} is missing") when found is none
+			return found
+		}
+
+		// The access of that name: "" is the primary key.
+		def access(index string) !Access {
+			return plan.key when index == ""
+			let at = plan.find(index)
+			fail errorOf(ErrorKind.Argument, "store: {plan.typeName} has no index '{index}'") when at < 0
+			return plan.indexes[at]
+		}
+
+		// The key the values name: all the parts of the primary key.
+		def keyFrom(values any[]) !byte[] {
+			let parts = plan.key.parts
+			fail errorOf(ErrorKind.Argument, "store: the key of {name} has {parts.len()} parts, not {values.len()}") when values.len() != parts.len()
+			return try lead(plan.key, values)
+		}
+
+		// The start of the keys of an access whose first parts are the
+		// values.
+		def lead(access Access, values any[]) !byte[] {
+			fail errorOf(ErrorKind.Argument, "store: '{access.name}' of {name} has {access.parts.len()} parts, not {values.len()}") when values.len() > access.parts.len()
+			let out byte[] = []
+			for let (i, value) in values {
+				try appendValue(out, access.parts[i], value, access.closed)
+			}
+			return out
+		}
+
+		// The key of a record, numbering it first when the collection
+		// numbers its records and this one has no number.
+		def keyOf(fields reflection.Field[], number bool) !byte[] {
+			if number && plan.auto {
+				let f = fields[plan.key.parts[0].field]
+				let unset = plan.key.parts[0].kind == PartKind.Uint ?? (f.asUint() == 0, f.asInt() == 0)
+				if unset {
+					let rows = records
+					fail errorOf(ErrorKind.ReadOnly, "store: a read transaction cannot write") when rows is none
+					let id = try rows.nextSequence()
+					if plan.key.parts[0].kind == PartKind.Uint {
+						f.setUint(uint(id))
+					} else {
+						f.setInt(id)
+					}
+				}
+			}
+			let key = entryOf(plan.key, fields)
+			fail errorOf(ErrorKind.Argument, "store: a record of {name} has no key") when key is none || key.len() == 0
+			return key
+		}
+
+		// The primary key an index entry names.
+		def keyAt(access Access, entry Entry) !byte[] {
+			return entry.key when access.primary
+			return entry.value when access.unique
+			let at = 0
+			for let part in access.parts {
+				at = partEnd(entry.key, at, part.kind)
+				fail errorOf(ErrorKind.Corrupt, "store: an entry of the index '{access.name}' of {name} is damaged") when at < 0
+			}
+			return entry.key.slice(at, entry.key.len())
+		}
+
+		// The key and the value of a record's entry in an index.
+		def placed(access Access, lead byte[], key byte[]) (byte[], byte[]) {
+			return (lead, key) when access.unique
+			let whole = lead.clone()
+			whole.push(...key)
+			let nothing byte[] = []
+			return (whole, nothing)
+		}
+
+		// A cursor over the entries of an access.
+		def entries(access Access) !Cursor {
+			return (try bucketOf(access)).cursor() unless access.primary
+			let rows = records
+			fail errorOf(ErrorKind.NoBucket, "store: {name} holds nothing yet") when rows is none
+			return rows.cursor()
+		}
+
+		// The stored bytes of the record an entry of an access stands for.
+		def stored(access Access, entry Entry) !byte[] {
+			return entry.value when access.primary
+			let data = try raw(try keyAt(access, entry))
+			fail errorOf(ErrorKind.Corrupt, "store: the index '{access.name}' of {name} names a record that is not there") when data is none
+			return data
+		}
+
+		// The stored bytes of the one record a whole value of a unique
+		// access names.
+		def single(access Access, lead byte[]) !?byte[] {
+			return none when lead.len() == 0
+			return try raw(lead) when access.primary
+			let key = try (try bucketOf(access)).get(lead)
+			return none when key is none
+			let data = try raw(key)
+			fail errorOf(ErrorKind.Corrupt, "store: the index '{access.name}' of {name} names a record that is not there") when data is none
+			return data
+		}
+
+		// The stored bytes of the record under a key.
+		def raw(key byte[]) !?byte[] {
+			let rows = records
+			return none when rows is none
+			return try rows.get(key)
+		}
+
+		// Fills `target` from stored bytes.
+		def load(data byte[], target any) !none {
+			let columns = plan.columns
+			if !(columns is none) {
+				return none when unpackRecord(columns, reflection.fields(target), data)
+			}
+			codec.decode(data, target) onerror (err error) {
+				fail errorOf(ErrorKind.Corrupt, "store: a record of {name} does not read as a {plan.typeName}: {err.message}", err)
+			}
+			return none
+		}
+
+		// Stores a record and brings every index in step. `fresh` refuses a
+		// key that is taken.
+		def save(record any, fresh bool) !none {
+			let rows = records
+			fail errorOf(ErrorKind.ReadOnly, "store: a read transaction cannot write") when rows is none
+			let fields = reflection.fields(record)
+			let key = try keyOf(fields, true)
+			let before = try rows.get(key)
+			fail errorOf(ErrorKind.Duplicate, "store: {name} already holds a record with this key") when fresh && !(before is none)
+			let old reflection.Field[] = []
+			if !(before is none) && plan.indexes.len() > 0 {
+				let previous = make()
+				try load(before, previous)
+				old = reflection.fields(previous)
+			}
+			// Every unique index is checked before anything is written, so
+			// a refused record leaves the collection as it was.
+			let leaving array<?byte[]> = []
+			let coming array<?byte[]> = []
+			for let access in plan.indexes {
+				let was ?byte[] = none
+				was = entryOf(access, old) when old.len() > 0
+				let now = entryOf(access, fields)
+				leaving.push(was)
+				coming.push(now)
+				continue when now is none || !access.unique || sameBytes(was, now)
+				let owner = try (try bucketOf(access)).get(now)
+				fail errorOf(ErrorKind.Duplicate, "store: another record of {name} has the same '{access.name}'") unless owner is none || compareKeys(owner, key) == 0
+			}
+			for let (i, access) in plan.indexes {
+				let was = leaving[i]
+				let now = coming[i]
+				continue when sameBytes(was, now)
+				let bucket = try bucketOf(access)
+				if !(was is none) {
+					let (at, _) = placed(access, was, key)
+					try bucket.delete(at)
+				}
+				if !(now is none) {
+					let (at, value) = placed(access, now, key)
+					try bucket.put(at, value)
+				}
+			}
+			let columns = plan.columns
+			return try rows.put(key, codec.encode(record)) when columns is none
+			return try rows.put(key, packRecord(columns, fields))
+		}
+
+		// Removes the record under a key with its index entries.
+		def erase(key byte[]) !none {
+			let rows = records
+			fail errorOf(ErrorKind.ReadOnly, "store: a read transaction cannot write") when rows is none
+			let before = try rows.get(key)
+			return none when before is none
+			if plan.indexes.len() > 0 {
+				let previous = make()
+				try load(before, previous)
+				let old = reflection.fields(previous)
+				for let access in plan.indexes {
+					let was = entryOf(access, old)
+					continue when was is none
+					let (at, _) = placed(access, was, key)
+					try (try bucketOf(access)).delete(at)
+				}
+			}
+			return try rows.delete(key)
+		}
+
+		// Empties the indexes named and fills them from the records.
+		def build(which Access[]) !none {
+			let rows = records
+			let all = held
+			fail errorOf(ErrorKind.ReadOnly, "store: a read transaction cannot write") when rows is none || all is none
+			let buckets Bucket[] = []
+			for let access in which {
+				try all.deleteBucket(access.name)
+				buckets.push(try all.createBucket(access.name))
+				built[plan.find(access.name)] = true
+			}
+			return none when which.len() == 0
+			let cursor = rows.cursor()
+			let entry = try cursor.first()
+			for {
+				break when entry is none
+				let record = make()
+				try load(entry.value, record)
+				let fields = reflection.fields(record)
+				for let (i, access) in which {
+					let lead = entryOf(access, fields)
+					continue when lead is none
+					let (at, value) = placed(access, lead, entry.key)
+					if access.unique {
+						fail errorOf(ErrorKind.Duplicate, "store: two records of {name} have the same '{access.name}', which is declared unique") when try buckets[i].has(at)
+					}
+					try buckets[i].put(at, value)
+				}
+				entry = try cursor.next()
+			}
+			return none
+		}
+
+		// Brings the stored schema in step with the plan: drops the
+		// indexes the type no longer declares and builds the ones it
+		// declares that are not stored as declared.
+		def migrate(stored string) !none {
+			let top = home
+			let all = held
+			fail errorOf(ErrorKind.ReadOnly, "store: a read transaction cannot write") when top is none || all is none
+			let known = try compare(stored)
+			let missing Access[] = []
+			for let (i, access) in plan.indexes {
+				missing.push(access) unless built[i]
+			}
+			for let line in known {
+				let words = line.split(" ")
+				continue unless words.len() == 4 && words[0] == "index"
+				let at = plan.find(words[1])
+				try all.deleteBucket(words[1]) when at < 0 || !built[at]
+			}
+			try build(missing)
+			return try top.put(schemaKey, plan.schema())
+		}
+
+		// Reads the stored schema: marks the indexes stored as the plan
+		// declares them and returns its lines.
+		// Fails when the records were stored under another key.
+		def compare(stored string) !string[] {
+			let lines string[] = []
+			return lines when stored == ""
+			lines = stored.split("\n")
+			let own = signature(plan.key)
+			fail errorOf(ErrorKind.Argument, "store: {name} was stored with '{lines[0]}' and {plan.typeName} declares '{own}': a collection keeps its key") when lines[0] != own
+			for let (i, access) in plan.indexes {
+				built[i] = lines.includes(signature(access))
+			}
+			return lines
+		}
+	}
+
+	// Opens the collection `name` of a transaction for the record type of
+	// `sample`.
+	internal def openTable(tx Transaction, name string, sample any, make def () any) !Table {
+		fail errorOf(ErrorKind.Argument, "store: a collection needs a name") when name == ""
+		let table = new Table(name, try planOf(sample), make)
+		if tx.writable() {
+			let home = try tx.createBucket(name)
+			table.home = home
+			table.records = try home.createBucket(recordsName)
+			table.held = try home.createBucket(indexesName)
+			let stored = try home.text(schemaKey)
+			let text = ""
+			text = stored unless stored is none
+			if text == table.plan.schema() {
+				for let (i, _) in table.built {
+					table.built[i] = true
+				}
+				return table
+			}
+			try table.migrate(text)
+			return table
+		}
+		let home = try tx.bucket(name)
+		return table when home is none
+		table.home = home
+		table.records = try home.bucket(recordsName)
+		table.held = try home.bucket(indexesName)
+		let stored = try home.text(schemaKey)
+		try table.compare(stored) unless stored is none
+		return table
+	}
+}
