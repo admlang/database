@@ -2,6 +2,7 @@ partial module adm.database.store {
 	use (
 		std.os
 		std.testing
+		std.time
 	)
 
 	// A 32-byte key that depends on `seed`.
@@ -324,6 +325,76 @@ partial module adm.database.store {
 			try os.remove(copy)
 			try os.remove(small)
 			try os.remove(wide)
+			return none
+		}
+	}
+
+	// Files made by version 0.1.0, whose encrypted form has 12-byte nonces:
+	// they open, read and take writes as they are, and a new file gets the
+	// form with 24-byte nonces.
+	check "Files of version 0.1.0" {
+		@test()
+		def TestOpensPublishedFiles() !none {
+			let key byte[] = []
+			key.len(32)
+			for let i = 0; i < 32; i++ {
+				key[i] = byte(i * 7 + 1)
+			}
+			let names = ["password.db", "key.db", "plain.db"]
+			let all = [Options{password:"correct horse"}, Options{key:key}, Options{}]
+			for let (n, name) in names {
+				let path = "/tmp/adm-store-old-{n}-{time.now().unixNs()}.db"
+				try os.writeFile(path, try os.readFile("{__dir__}/testdata/written-by-0.1.0/{name}"))
+				let db = try open(path, all[n])
+				let seen = 0
+				try db.read(def (tx Transaction) !none {
+					let b = try tx.bucket("people")
+					fail "no bucket in {name}" when b is none
+					for let i = 0; i < 40; i++ {
+						let v = try b.text("person-{i}")
+						seen++ when !(v is none) && v == "value of {i} written by 0.1.0"
+					}
+					return none
+				})
+				assert seen == 40
+				// Written on in its own form, many pages over.
+				try db.write(def (tx Transaction) !none {
+					let b = try tx.bucket("people")
+					fail "no bucket in {name}" when b is none
+					for let i = 0; i < 600; i++ {
+						try b.put("later-{i}", "written by this version {i}")
+					}
+					return none
+				})
+				try db.close()
+				let head = try os.readFile(path)
+				assert int(head[4]) == (n == 2 ?? (1, 2))
+				let again = try open(path, all[n])
+				let later = 0
+				try again.read(def (tx Transaction) !none {
+					let b = try tx.bucket("people")
+					fail "no bucket in {name}" when b is none
+					later++ when !((try b.text("later-599")) is none)
+					later++ when !((try b.text("person-39")) is none)
+					return none
+				})
+				assert later == 2
+				// A copy keeps the form, and opens with the same key.
+				let copy = "{path}.copy"
+				try again.compact(copy)
+				try again.close()
+				let copied = try open(copy, all[n])
+				try copied.close()
+				assert openFailure(path, n == 0 ?? (Options{password: "wrong"}, n == 1 ?? (Options{key: keyOf(3)}, Options{password: "any"}))) == "key"
+				try os.remove(path)
+				try os.remove(copy)
+			}
+			// A file made now has the wide form.
+			let fresh = "/tmp/adm-store-new-{time.now().unixNs()}.db"
+			let db = try open(fresh, Options{key: key})
+			try db.close()
+			assert int((try os.readFile(fresh))[4]) == 3
+			try os.remove(fresh)
 			return none
 		}
 	}

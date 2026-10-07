@@ -85,7 +85,8 @@ internal partial module adm.database.store.engine {
 			self.readOnly = readOnly
 			self.sealer = sealer
 			pageSize = base.pageSize
-			room = sealer is none ?? (pageSize, pageSize - sealOverhead)
+			room = pageSize
+			room = pageSize - sealer.overhead unless sealer is none
 			cache = new Cache(cachePages)
 			writer = new sync.Mutex()
 		}
@@ -174,7 +175,7 @@ internal partial module adm.database.store.engine {
 			if key is none {
 				more = try overflowOf(pages, id)
 			} else {
-				more = getU32(pages, nonceSize)
+				more = getU32(pages, key.nonceLen)
 			}
 			fail errorOf(ErrorKind.Corrupt, "store: page {id} claims a run of {more} pages") when more > (1 << 20)
 			pages = try readPages(id, more + 1) when more > 0

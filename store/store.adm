@@ -22,7 +22,7 @@ partial module adm.database.store {
 		// How many tree nodes are kept in memory once read.
 		cachePages     int            = 8192
 		// A 32-byte key that encrypts the database: every page of the file
-		// is sealed with ChaCha20-Poly1305, and a page changed outside the
+		// is sealed with XChaCha20-Poly1305, and a page changed outside the
 		// library fails to read. Creating a database with a key encrypts
 		// it; opening it takes the same key from then on.
 		key            Secret<byte[]> = []
@@ -378,7 +378,7 @@ partial module adm.database.store {
 			return none when pageSize != 0 && getU32(head, 8) != pageSize
 			let given = key.len() > 0 || password != ""
 			let page ?Meta = none
-			if format == formatSealed {
+			if format == formatSealed || format == formatSealedNarrow {
 				fail errorOf(ErrorKind.Key, "store: {path} is encrypted: Options.key or Options.password opens it") unless given
 				let held = sealer
 				if held is none || !held.matches(head) {

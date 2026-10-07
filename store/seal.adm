@@ -1,6 +1,9 @@
 // Encryption of a database file: every page run and both meta pages are
-// sealed with ChaCha20-Poly1305 under one key, each write under a fresh
-// random nonce.
+// sealed under one key, each write under a fresh random nonce. A file is
+// sealed with XChaCha20-Poly1305, whose 24-byte nonces keep random draws
+// apart for any number of writes a file can see. Files made by version
+// 0.1.0 are sealed with ChaCha20-Poly1305 and 12-byte nonces; they are
+// read and written on as they are.
 internal partial module adm.database.store.engine {
 	use (
 		std.crypto
@@ -9,11 +12,8 @@ internal partial module adm.database.store.engine {
 		adm.database.store::*
 	)
 
-	// What a sealed page run spends on its nonce and tag beyond the four
-	// bytes of a plain run's checksum: a page of an encrypted file holds
-	// that much less.
-	const sealOverhead = 24
-	const nonceSize = 12
+	// Where a sealed meta page keeps its nonce.
+	const metaNonce = 44
 	const tagSize = 16
 	const keySize = 32
 	const saltSize = 16
@@ -27,29 +27,51 @@ internal partial module adm.database.store.engine {
 	//
 	// A sealed page run of `span` pages is, in the file:
 	//
-	//	0   nonce (12)
-	//	12  span - 1 (4), in the clear: a reader needs it to fetch the run
-	//	16  ciphertext of the node's kind and count (8) and its entries
+	//	0   nonce (24)
+	//	24  span - 1 (4), in the clear: a reader needs it to fetch the run
+	//	28  ciphertext of the node's kind and count (8) and its entries
 	//	..  tag (16), then zeros up to the end of the last page
 	//
 	// The page number and the span are authenticated with it, so a run
 	// copied to another place in the file does not open there.
 	type Sealer {
-		aead   cipher.ChaCha20Poly1305
-		kdf    int
-		salt   byte[]
-		rounds int
+		aead     cipher.AEAD
+		// `formatSealed`, or `formatSealedNarrow` for a file of version
+		// 0.1.0.
+		format   int
+		kdf      int
+		salt     byte[]
+		rounds   int
+		// The length of a nonce: 24 bytes, 12 in the narrow format.
+		nonceLen int
+		// Where the sealed bytes of a page run start: after the nonce and
+		// the run's length.
+		start    int
+		// What a sealed page run spends on its nonce and tag beyond the
+		// four bytes of a plain run's checksum: a page of an encrypted
+		// file holds that much less.
+		overhead int
+		// Where a sealed meta page keeps its sealed fields, and where the
+		// checksum over everything before it.
+		metaAt   int
+		metaEnd  int
 
-		def new(aead cipher.ChaCha20Poly1305, kdf int, salt byte[], rounds int) {
+		def new(aead cipher.AEAD, format int, kdf int, salt byte[], rounds int) {
 			self.aead = aead
+			self.format = format
 			self.kdf = kdf
 			self.salt = salt
 			self.rounds = rounds
+			nonceLen = aead.nonceSize()
+			start = nonceLen + 4
+			overhead = nonceLen + 12
+			metaAt = metaNonce + nonceLen
+			metaEnd = metaAt + 40 + tagSize
 		}
 
 		// True when the meta page in `head` names this sealer's key.
 		def matches(head byte[]) bool {
-			return getU32(head, 12) == kdf && getU32(head, 32) == rounds && head[16:16 + saltSize].equals(salt)
+			return getU32(head, 4) == format && getU32(head, 12) == kdf && getU32(head, 32) == rounds && head[16:16 + saltSize].equals(salt)
 		}
 
 		// Writes where the key comes from into a meta page.
@@ -62,7 +84,7 @@ internal partial module adm.database.store.engine {
 		// A nonce no write has used. Fails with ErrorKind.Storage when the
 		// system has no random bytes to give.
 		def nonce() !byte[] {
-			return crypto.rand(nonceSize) onerror (err error) {
+			return crypto.rand(nonceLen) onerror (err error) {
 				fail errorOf(ErrorKind.Storage, "store: no random bytes for a nonce: {err.message}", err)
 			}
 		}
@@ -88,8 +110,8 @@ internal partial module adm.database.store.engine {
 			let out byte[] = []
 			out.len((more + 1) * pageSize)
 			fresh.copy(out)
-			putU32(out, nonceSize, more)
-			sealed.copy(out[headerSize:])
+			putU32(out, nonceLen, more)
+			sealed.copy(out[start:])
 			return out
 		}
 
@@ -98,11 +120,11 @@ internal partial module adm.database.store.engine {
 		// Fails with ErrorKind.Corrupt when the run is not what was
 		// sealed there.
 		def openRun(id int, pages byte[], room int) !byte[] {
-			let more = getU32(pages, nonceSize)
+			let more = getU32(pages, nonceLen)
 			let size = (more + 1) * room
-			let last = headerSize + size - 8 + tagSize
+			let last = start + size - headerSize + 8 + tagSize
 			fail errorOf(ErrorKind.Corrupt, "store: page {id} is cut short") when last > pages.len()
-			let plain = aead.open(pages[0:nonceSize], pages[headerSize:last], placeOf(id, more)) onerror (err error) {
+			let plain = aead.open(pages[0:nonceLen], pages[start:last], placeOf(id, more)) onerror (err error) {
 				fail errorOf(ErrorKind.Corrupt, "store: page {id} fails its authentication", err)
 			}
 			let run byte[] = []
@@ -118,15 +140,15 @@ internal partial module adm.database.store.engine {
 		// authenticated with them.
 		def sealMeta(buf byte[], fields byte[]) !none {
 			let fresh = try nonce()
-			fresh.copy(buf[44:])
-			aead.seal(fresh, fields, buf[0:44]).copy(buf[56:])
+			fresh.copy(buf[metaNonce:])
+			aead.seal(fresh, fields, buf[0:metaNonce]).copy(buf[metaAt:])
 			return none
 		}
 
 		// The fields of a sealed meta page; none when the key does not
 		// open it.
 		def openMeta(buf byte[]) ?byte[] {
-			let fields = aead.open(buf[44:56], buf[56:112], buf[0:44]) onerror recover []
+			let fields = aead.open(buf[metaNonce:metaAt], buf[metaAt:metaEnd], buf[0:metaNonce]) onerror recover []
 			return none when fields.len() == 0
 			return fields
 		}
@@ -137,36 +159,45 @@ internal partial module adm.database.store.engine {
 	// Fails with ErrorKind.Storage without random bytes.
 	def newSealer(key byte[], password string, rounds int) !?Sealer {
 		if key.len() > 0 {
-			return try sealerWith(key, kdfNone, zeroBytes(saltSize), 0)
+			return try sealerWith(key, formatSealed, kdfNone, zeroBytes(saltSize), 0)
 		}
 		return none when password == ""
 		let salt = crypto.rand(saltSize) onerror (err error) {
 			fail errorOf(ErrorKind.Storage, "store: no random bytes for a salt: {err.message}", err)
 		}
-		return try sealerWith(stretched(password, salt, rounds), kdfPBKDF2, salt, rounds)
+		return try sealerWith(stretched(password, salt, rounds), formatSealed, kdfPBKDF2, salt, rounds)
 	}
 
 	// The sealer of an existing database, from what its meta page in
 	// `head` says and the key or password given to `open`.
 	// Fails with ErrorKind.Key when the file wants the other of the two.
 	def sealerOf(head byte[], key byte[], password string, path string) !Sealer {
+		let format = getU32(head, 4)
 		let kdf = getU32(head, 12)
 		let salt = head[16:16 + saltSize].clone()
 		let rounds = getU32(head, 32)
 		if kdf == kdfNone {
 			fail errorOf(ErrorKind.Key, "store: {path} is encrypted with a key, not a password") when key.len() == 0
-			return try sealerWith(key, kdf, salt, rounds)
+			return try sealerWith(key, format, kdf, salt, rounds)
 		}
 		fail errorOf(ErrorKind.Corrupt, "store: {path} names a key derivation this version does not know") when kdf != kdfPBKDF2 || rounds < 1
 		fail errorOf(ErrorKind.Key, "store: {path} is encrypted with a password, not a key") when password == ""
-		return try sealerWith(stretched(password, salt, rounds), kdf, salt, rounds)
+		return try sealerWith(stretched(password, salt, rounds), format, kdf, salt, rounds)
 	}
 
-	def sealerWith(key byte[], kdf int, salt byte[], rounds int) !Sealer {
-		let aead = cipher.newChaCha20Poly1305(key) onerror (err error) {
+	// The sealer of a format: the cipher of version 0.1.0 for the narrow
+	// one, XChaCha20-Poly1305 otherwise.
+	def sealerWith(key byte[], format int, kdf int, salt byte[], rounds int) !Sealer {
+		if format == formatSealedNarrow {
+			let narrow = cipher.newChaCha20Poly1305(key) onerror (err error) {
+				fail errorOf(ErrorKind.Argument, "store: the key must be {keySize} bytes", err)
+			}
+			return new Sealer(narrow, format, kdf, salt, rounds)
+		}
+		let wide = cipher.newXChaCha20Poly1305(key) onerror (err error) {
 			fail errorOf(ErrorKind.Argument, "store: the key must be {keySize} bytes", err)
 		}
-		return new Sealer(aead, kdf, salt, rounds)
+		return new Sealer(wide, format, kdf, salt, rounds)
 	}
 
 	// The key a password stands for in a database with that salt.

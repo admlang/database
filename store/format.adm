@@ -10,8 +10,10 @@ internal partial module adm.database.store.engine {
 	// "ADMS" in the first four bytes of both meta pages.
 	const magic = 0x534D4441
 	const formatVersion = 1
-	// The format of an encrypted database.
-	const formatSealed = 2
+	// The formats of an encrypted database: with 12-byte nonces, as
+	// version 0.1.0 wrote it, and with 24-byte ones.
+	const formatSealedNarrow = 2
+	const formatSealed = 3
 	// How many bytes at the start of a meta page say all it holds.
 	const metaHead = 128
 	const headerSize = 16
@@ -114,8 +116,11 @@ internal partial module adm.database.store.engine {
 	//
 	//	0   magic, format, page size (4 each)
 	//	12  key derivation (4), salt (16), rounds (4), 8 spare
-	//	44  nonce (12), sealed fields (40), tag (16)
-	//	112 checksum of all before it (4)
+	//	44  nonce (24), sealed fields (40), tag (16)
+	//	124 checksum of all before it (4)
+	//
+	// (In the narrow format the nonce has 12 bytes and the checksum sits at
+	// 112.)
 	//
 	// The checksum tells a torn page from one the key does not open.
 	// Fails with ErrorKind.Storage when a nonce cannot be drawn.
@@ -130,13 +135,13 @@ internal partial module adm.database.store.engine {
 			putU32(buf, 56, int(hash.crc32c(buf[0:56])))
 			return buf
 		}
-		putU32(buf, 4, formatSealed)
+		putU32(buf, 4, sealer.format)
 		sealer.describe(buf)
 		let fields byte[] = []
 		fields.len(40)
 		putMetaFields(fields, 0, base)
 		try sealer.sealMeta(buf, fields)
-		putU32(buf, 112, int(hash.crc32c(buf[0:112])))
+		putU32(buf, sealer.metaEnd, int(hash.crc32c(buf[0:sealer.metaEnd])))
 		return buf
 	}
 
@@ -163,8 +168,9 @@ internal partial module adm.database.store.engine {
 		if format == formatVersion {
 			return getU32(buf, 56) == int(hash.crc32c(buf[0:56])) ?? (format, 0)
 		}
-		return 0 when format != formatSealed
-		return getU32(buf, 112) == int(hash.crc32c(buf[0:112])) ?? (format, 0)
+		return 0 unless format == formatSealed || format == formatSealedNarrow
+		let end = format == formatSealed ?? (124, 112)
+		return getU32(buf, end) == int(hash.crc32c(buf[0:end])) ?? (format, 0)
 	}
 
 	// Reads a meta page `metaFormat` accepted; none when the sealer's key

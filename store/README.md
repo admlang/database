@@ -173,7 +173,7 @@ let db = try store.open("vault.db", store.Options{password: "correct horse batte
 let keyed = try store.open("keys.db", store.Options{key: key32})    // 32 bytes of your own
 ```
 
-- Every page of the file is sealed with ChaCha20-Poly1305 under a random nonce drawn for each
+- Every page of the file is sealed with XChaCha20-Poly1305 under a random 24-byte nonce drawn for each
   write. The tag takes the place of the checksum, and the page number is authenticated with the
   page: a page changed outside the library, or copied over another one, fails to read with
   `ErrorKind.Corrupt` instead of returning other content.
@@ -185,7 +185,10 @@ let keyed = try store.open("keys.db", store.Options{key: key32})    // 32 bytes 
 - `open` fails with `ErrorKind.Key` when the key or password is missing or wrong, and when one
   is given for a file that is not encrypted.
 - `backup` and `compact` write copies that open with the same key or password.
-- A page holds 24 bytes less than in a plain file. On the measurements below encryption costs
+- A file encrypted by version 0.1.0 (ChaCha20-Poly1305 with 12-byte nonces) opens, reads and
+  is written on in that form, and its copies (`backup`, `compact`) keep it; new files get the
+  24-byte form. To move an old file over, copy its content into a new database.
+- A page holds 36 bytes less than in a plain file (24 in a file of version 0.1.0). On the measurements below encryption costs
   between 2 and 7 percent.
 
 Not covered: an attacker who can write the file can put back an older copy of the whole file or
