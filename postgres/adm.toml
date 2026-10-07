@@ -8,3 +8,7 @@ schema = 1
 [publisher]
 pubkey = "ed25519:base64:ZcfhD3m1jmc/pabbwU8U1XL8wQxCBia6+HCVV14aq50="
 repo_salt = "base64:bxaekM1p7xZpd8ktPPPp0G8Al/steX8Ww4sNF/ae9pc="
+
+# The line `adm search` shows for the library; `adm publish` files it.
+[apps."adm.database.postgres"]
+description = "PostgreSQL database driver"

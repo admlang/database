@@ -22,3 +22,7 @@ to = "sqlite/UPSTREAM"
 [publisher]
 pubkey = "ed25519:base64:ZcfhD3m1jmc/pabbwU8U1XL8wQxCBia6+HCVV14aq50="
 repo_salt = "base64:MnZ5LN9BHqKTSVjhJ26IHRLR4ygMMcXDiDNCLhYY3ZY="
+
+# The line `adm search` shows for the library; `adm publish` files it.
+[apps."adm.database.sqlite"]
+description = "SQLite database driver"
