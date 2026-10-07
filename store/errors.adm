@@ -1,0 +1,36 @@
+partial module adm.database.store {
+	use std.errors
+
+	// ErrorKind says what went wrong, for a handler that narrowed the error
+	// with `err is StoreError`.
+	enum ErrorKind {
+		// The file cannot be opened, read, written or synced.
+		Storage  = "storage",
+		// Another process has the database open.
+		Busy     = "busy",
+		// The file is not a database of this library, or a page of it
+		// fails its checksum.
+		Corrupt  = "corrupt",
+		// The database or the transaction is closed.
+		Closed   = "closed",
+		// A write in a read transaction, or in a database opened read-only.
+		ReadOnly = "readonly",
+		// The bucket does not exist.
+		NoBucket = "nobucket",
+		// The name is taken: a bucket where a value is wanted, or the
+		// other way round.
+		Exists   = "exists",
+		// An empty key, or a key or a value over the size limit.
+		Argument = "argument",
+	}
+
+	// StoreError is the payload every failure of this library carries.
+	// `code` repeats `kind.value`.
+	struct StoreError {
+		message string
+		code    string
+		cause   ?error
+		stack   errors.StackTrace
+		kind    ErrorKind
+	}
+}

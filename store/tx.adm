@@ -1,0 +1,129 @@
+partial module adm.database.store {
+	use adm.database.store.engine::*
+
+	// Transaction is one transaction. A read transaction sees the database as it
+	// was when it began, whatever commits meanwhile. A write transaction
+	// sees its own changes, and nobody else does before `commitTx`.
+	//
+	// One task uses a transaction; buckets and cursors got from it end
+	// with it. Keep read transactions short: the pages a later commit
+	// frees cannot be reused while an older reader is open.
+	type Transaction {
+		internal core     Core
+		internal state    TxState
+		internal root     Tree
+		// The committed state it started from.
+		internal snapshot int
+
+		def new(core Core, state TxState) {
+			self.core = core
+			self.state = state
+			snapshot = state.base.txid
+			root = new Tree(state, state.base.root, state.base.sequence)
+		}
+
+		// Whether the transaction may write.
+		def writable() bool {
+			return state.writable
+		}
+
+		// The bucket of that name; none when there is none.
+		// Fails with a StoreError: ErrorKind.Closed once the transaction
+		// ended, and as `Database` methods do.
+		def bucket(name string) !?Bucket {
+			try alive()
+			let tree = try root.child(name.bytes())
+			return none when tree is none
+			return new Bucket(tree, name)
+		}
+
+		// createBucket makes a bucket, or returns the one that exists.
+		// Fails as `bucket` does, with ErrorKind.ReadOnly in a read
+		// transaction and ErrorKind.Argument for an empty name.
+		def createBucket(name string) !Bucket {
+			try alive(true)
+			fail errorOf(ErrorKind.Argument, "store: a bucket needs a name") when name == ""
+			return new Bucket(try root.grow(name.bytes()), name)
+		}
+
+		// deleteBucket removes a bucket with everything in it; one that is
+		// not there is not an error.
+		// Fails as `createBucket` does.
+		def deleteBucket(name string) !none {
+			try alive(true)
+			try root.prune(name.bytes())
+			return none
+		}
+
+		// The names of the buckets, in order.
+		// Fails as `bucket` does.
+		def buckets() !string[] {
+			try alive()
+			let names string[] = []
+			let walker = new Walker(root)
+			let more = try walker.first()
+			for more {
+				names.push(string(walker.key()))
+				more = try walker.next()
+			}
+			return names
+		}
+
+		// commit makes the transaction's writes the state of the database,
+		// on the storage device before it returns. A read transaction just
+		// ends.
+		// Fails with a StoreError: ErrorKind.Closed when the transaction
+		// already ended, ErrorKind.Storage when the file cannot be written;
+		// nothing is kept then.
+		def commitTx() !none {
+			try alive()
+			if !state.writable {
+				rollbackTx()
+				return none
+			}
+			let failure ?error = none
+			seal() onerror (err error) {
+				failure = err
+				recover none
+			}
+			if !(failure is none) {
+				rollbackTx()
+				fail failure
+			}
+			core.writer.unlock()
+			return none
+		}
+
+		// rollbackTx ends the transaction and drops its writes. Doing it
+		// twice, or after `commitTx`, does nothing.
+		def rollbackTx() {
+			return when state.closed
+			let wrote = state.writable
+			state.undo()
+			if wrote {
+				core.writer.unlock()
+			} else {
+				core.leave(snapshot)
+			}
+		}
+
+		def dispose() {
+			rollbackTx()
+		}
+
+		internal def seal() !none {
+			try root.settle()
+			state.base.root = root.root
+			state.base.sequence = root.sequence
+			return try state.commit()
+		}
+
+		// Fails when the transaction ended, or cannot write when it must.
+		internal def alive(writing bool = false) !none {
+			fail errorOf(ErrorKind.Closed, "store: the transaction has ended") when state.closed
+			fail errorOf(ErrorKind.Closed, "store: {core.path} is closed") when core.closed
+			fail errorOf(ErrorKind.ReadOnly, "store: a read transaction cannot write") when writing && !state.writable
+			return none
+		}
+	}
+}

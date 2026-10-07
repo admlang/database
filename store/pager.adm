@@ -1,0 +1,420 @@
+// The file behind a database: its pages, the nodes read from them, the
+// free list, and the state of one transaction.
+internal partial module adm.database.store.engine {
+	use (
+		std.os
+		std.sync
+		adm.database.store::*
+	)
+
+	// Cache keeps the nodes read lately, in two generations: a node used
+	// again moves to the young one, and when that is full the old one is
+	// dropped.
+	type Cache {
+		young map<int, Node>
+		old   map<int, Node>
+		// How many nodes one generation holds.
+		limit int
+
+		def new(limit int) {
+			self.limit = (limit / 2).max(16)
+		}
+
+		atomic def get(id int) ?Node {
+			let found = young.get(id)
+			return found unless found is none
+			let aged = old.get(id)
+			return none when aged is none
+			keep(aged)
+			return aged
+		}
+
+		atomic def put(node Node) {
+			keep(node)
+		}
+
+		atomic def clear() {
+			young = new map<int, Node>()
+			old = new map<int, Node>()
+		}
+
+		def keep(node Node) {
+			if young.len() >= limit {
+				old = young
+				young = new map<int, Node>()
+			}
+			young.set(node.id, node)
+		}
+	}
+
+	// Core is an open database file. Any number of read transactions and
+	// one write transaction use it at a time.
+	type Core {
+		file     os.File
+		path     string
+		pageSize int
+		readOnly bool
+		// False skips the syncs: faster, and a crash may lose or break
+		// the last commits.
+		durable  bool            = true
+		cache    Cache
+		// Held by the one write transaction.
+		writer   sync.Mutex
+		// The committed state new transactions start from.
+		base     Meta
+		// Pages free to use, in order. Only the writer touches it.
+		free     int[]
+		// Pages each write transaction freed, by its id: free once no
+		// reader is left that started before it.
+		pending  map<int, int[]>
+		// How many read transactions run on each committed state.
+		readers  map<int, int>
+		closed   bool
+		// How many pages were free or waiting to be at the last commit.
+		spare    int
+
+		def new(file os.File, path string, base Meta, readOnly bool, cachePages int) {
+			self.file = file
+			self.path = path
+			self.base = base
+			self.readOnly = readOnly
+			pageSize = base.pageSize
+			cache = new Cache(cachePages)
+			writer = new sync.Mutex()
+		}
+
+		// Starts a read transaction on the committed state.
+		atomic def enter() Meta {
+			let count = readers.get(base.txid)
+			readers.set(base.txid, count is none ?? (1, count + 1))
+			return copyOf(base)
+		}
+
+		// Ends a read transaction that ran on state `txid`.
+		atomic def leave(txid int) {
+			let count = readers.get(txid)
+			return when count is none
+			if count <= 1 {
+				readers.delete(txid)
+			} else {
+				readers.set(txid, count - 1)
+			}
+		}
+
+		// The committed state, for the writer to build on.
+		atomic def current() Meta {
+			return copyOf(base)
+		}
+
+		// The oldest state a reader still runs on; -1 without readers.
+		atomic def oldestReader() int {
+			let oldest = -1
+			for let (txid, _) in readers {
+				oldest = txid when oldest < 0 || txid < oldest
+			}
+			return oldest
+		}
+
+		// Makes a commit the state new transactions start from.
+		atomic def publish(next Meta, spare int) {
+			base = copyOf(next)
+			self.spare = spare
+		}
+
+		atomic def spareNow() int {
+			return spare
+		}
+
+		// Moves the pages no reader can reach any more to the free list.
+		// The writer calls it as it starts.
+		def reclaim() {
+			let oldest = oldestReader()
+			let ready int[] = []
+			for let txid in pending.keys() {
+				continue when oldest >= 0 && txid > oldest
+				let pages = pending.get(txid)
+				ready.push(...pages) unless pages is none
+				pending.delete(txid)
+			}
+			free = merged(free, ready) when ready.len() > 0
+		}
+
+		// Reads `count` pages from page `id`.
+		// Fails with ErrorKind.Storage, and ErrorKind.Corrupt when the file
+		// ends before them.
+		def readPages(id int, count int) !byte[] {
+			let buf byte[] = []
+			buf.len(count * pageSize)
+			let got = 0
+			for got < buf.len() {
+				let n = file.readAt(buf[got:], id * pageSize + got) onerror (err error) {
+					fail errorOf(ErrorKind.Storage, "store: reading page {id} of {path}: {err.message}", err)
+				}
+				fail errorOf(ErrorKind.Corrupt, "store: {path} ends before page {id}") when n <= 0
+				got += n
+			}
+			return buf
+		}
+
+		// The page run that starts at page `id`, whatever its length.
+		def readRun(id int) !byte[] {
+			let first = try readPages(id, 1)
+			let more = try overflowOf(first, id)
+			return first when more == 0
+			fail errorOf(ErrorKind.Corrupt, "store: page {id} claims a run of {more} pages") when more > (1 << 20)
+			return try readPages(id, more + 1)
+		}
+
+		// The node stored at page `id`.
+		// Fails with ErrorKind.Storage or ErrorKind.Corrupt.
+		def node(id int) !Node {
+			let cached = cache.get(id)
+			return cached unless cached is none
+			let node = try decodeNode(try readRun(id), id, pageSize)
+			cache.put(node)
+			return node
+		}
+
+		// Writes bytes at a page. Fails with ErrorKind.Storage.
+		def writePages(id int, buf byte[]) !none {
+			let done = 0
+			for done < buf.len() {
+				let n = file.writeAt(buf[done:], id * pageSize + done) onerror (err error) {
+					fail errorOf(ErrorKind.Storage, "store: writing page {id} of {path}: {err.message}", err)
+				}
+				fail errorOf(ErrorKind.Storage, "store: {path} takes no more bytes") when n <= 0
+				done += n
+			}
+			return none
+		}
+
+		// Pushes what was written to the device. Fails with
+		// ErrorKind.Storage.
+		def sync() !none {
+			return none unless durable
+			file.sync(true) onerror (err error) {
+				fail errorOf(ErrorKind.Storage, "store: syncing {path}: {err.message}", err)
+			}
+			return none
+		}
+	}
+
+	// Two ordered id lists as one.
+	def merged(a int[], b int[]) int[] {
+		let extra = b.clone().sort((x, y int) => x < y)
+		let out int[] = []
+		out.len(a.len() + extra.len())
+		let i = 0
+		let j = 0
+		let k = 0
+		for i < a.len() || j < extra.len() {
+			if j >= extra.len() || (i < a.len() && a[i] <= extra[j]) {
+				out[k] = a[i]
+				i++
+			} else {
+				out[k] = extra[j]
+				j++
+			}
+			k++
+		}
+		return out
+	}
+
+	// TxState is one transaction: the state it reads, and for a write
+	// transaction the nodes it changed and the pages it took and freed.
+	type TxState {
+		core     Core
+		base     Meta
+		writable bool
+		closed   bool
+		// Nodes this transaction changed or made, by their negative id.
+		dirty    map<int, Node>
+		nextTemp int            = -1
+		// Pages this transaction stopped using.
+		freed    int[]
+		// Pages it took from the free list, to give back on a rollback.
+		taken    int[]
+		// Page runs to write at the commit, and the nodes they hold.
+		writeIds int[]
+		writeBuf byte[][]
+		settled  Node[]
+
+		def new(core Core, base Meta, writable bool) {
+			self.core = core
+			self.base = base
+			self.writable = writable
+		}
+
+		// The node with that id: one of the transaction's own, or one of
+		// the file's.
+		def node(id int) !Node {
+			if id < 0 {
+				let own = dirty.get(id)
+				fail errorOf(ErrorKind.Corrupt, "store: the transaction lost node {id}") when own is none
+				return own
+			}
+			return try core.node(id)
+		}
+
+		// A new, empty node of the transaction's own.
+		def fresh(leaf bool) Node {
+			let node = new Node(leaf)
+			node.id = nextTemp
+			nextTemp--
+			dirty.set(node.id, node)
+			return node
+		}
+
+		// The node with that id as one the transaction may change: a copy
+		// of a node of the file, whose pages are then free at the commit.
+		def edit(id int) !Node {
+			let node = try self.node(id)
+			return node when id < 0
+			let copy = node.editable(nextTemp)
+			nextTemp--
+			dirty.set(copy.id, copy)
+			release(node)
+			return copy
+		}
+
+		// Gives up the pages of a node of the file.
+		def release(node Node) {
+			return when node.id < 0
+			for let i = 0; i < node.span; i++ {
+				freed.push(node.id + i)
+			}
+		}
+
+		// Forgets a node of the transaction's own.
+		def discard(id int) {
+			dirty.delete(id) when id < 0
+		}
+
+		// Takes `span` pages in a row: from the free list when it has such
+		// a run, else at the end of the file.
+		def allocate(span int) int {
+			let free = core.free
+			let run = 0
+			for let i = 0; i < free.len(); i++ {
+				run = i > 0 && free[i] == free[i - 1] + 1 ?? (run + 1, 1)
+				continue when run < span
+				let start = i - span + 1
+				let id = free[start]
+				for let j = 0; j < span; j++ {
+					taken.push(id + j)
+				}
+				core.free = free[:start] + free[i + 1:]
+				return id
+			}
+			let id = base.pages
+			base.pages += span
+			return id
+		}
+
+		// Queues a node for writing at a page run of its own and returns
+		// the page.
+		def place(node Node) int {
+			let size = node.measure()
+			let span = ((size + core.pageSize - 1) / core.pageSize).max(1)
+			discard(node.id)
+			node.id = allocate(span)
+			writeIds.push(node.id)
+			writeBuf.push(node.pack(core.pageSize))
+			settled.push(node)
+			return node.id
+		}
+
+		// Writes the free list, the queued pages and the meta page, and
+		// makes the result the committed state.
+		// Fails with ErrorKind.Storage; nothing is committed then.
+		def commit() !none {
+			let txid = base.txid + 1
+			// The old free list's own pages are free from here on.
+			if base.freelist != 0 {
+				let old = try core.readRun(base.freelist)
+				for let i = 0; i < old.len() / core.pageSize; i++ {
+					freed.push(base.freelist + i)
+				}
+			}
+			// Everything not in use goes into the file's list: after a
+			// restart no reader is left to need the pending pages.
+			let waiting int[] = []
+			for let (_, pages) in core.pending {
+				waiting.push(...pages)
+			}
+			waiting.push(...freed)
+			base.freelist = 0
+			if core.free.len() + waiting.len() > 0 {
+				// Taking the list's pages can only shorten the list.
+				let span = freeSpan(core.free.len() + waiting.len(), core.pageSize)
+				base.freelist = allocate(span)
+				let buf = encodeFree(merged(core.free, waiting), core.pageSize)
+				let padded byte[] = []
+				padded.len(span * core.pageSize)
+				buf.copy(padded)
+				putU32(padded, 8, span - 1)
+				putU32(padded, 12, checksumOf(padded))
+				writeIds.push(base.freelist)
+				writeBuf.push(padded)
+			}
+			base.txid = txid
+			try flush()
+			try core.sync()
+			try core.writePages(txid % 2, encodeMeta(base))
+			try core.sync()
+			for let node in settled {
+				core.cache.put(node)
+			}
+			core.pending.set(txid, freed) when freed.len() > 0
+			let spare = core.free.len()
+			for let (_, pages) in core.pending {
+				spare += pages.len()
+			}
+			core.publish(base, spare)
+			closed = true
+			return none
+		}
+
+		// Writes the queued page runs in file order, neighbours in one
+		// write.
+		def flush() !none {
+			let order int[] = []
+			order.len(writeIds.len())
+			for let i = 0; i < order.len(); i++ {
+				order[i] = i
+			}
+			let ids = writeIds
+			order = order.sort((a, b int) => ids[a] < ids[b])
+			let i = 0
+			for i < order.len() {
+				let start = writeIds[order[i]]
+				let batch = writeBuf[order[i]]
+				let next = start + batch.len() / core.pageSize
+				let j = i + 1
+				let joined ?byte[] = none
+				for j < order.len() && writeIds[order[j]] == next && next - start < 256 {
+					let more = writeBuf[order[j]]
+					joined = batch.clone() when joined is none
+					joined.push(...more) unless joined is none
+					next += more.len() / core.pageSize
+					j++
+				}
+				if joined is none {
+					try core.writePages(start, batch)
+				} else {
+					try core.writePages(start, joined)
+				}
+				i = j
+			}
+			return none
+		}
+
+		// Drops what the transaction did.
+		def undo() {
+			return when closed
+			closed = true
+			core.free = merged(core.free, taken) when taken.len() > 0
+			dirty = new map<int, Node>()
+		}
+	}
+}

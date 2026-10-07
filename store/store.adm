@@ -1,0 +1,323 @@
+// An embedded key-value database: one file, buckets of ordered keys,
+// transactions that are all-or-nothing and survive a crash. Written in
+// ADM; nothing to install and no server to run.
+partial module adm.database.store {
+	use (
+		std.os
+		adm.database.store.engine::*
+	)
+
+	// Options are the settings of `open`.
+	struct Options {
+		// Open an existing database for reading only. Other processes may
+		// read it at the same time.
+		readOnly   bool = false
+		// The page size of a database being created: a power of two from
+		// 4096 to 65536. An existing database keeps its own.
+		pageSize   int  = 4096
+		// False skips the two syncs of every commit. Much faster for a
+		// bulk load, and a crash or a power cut may lose the last commits
+		// or leave the file unreadable.
+		sync       bool = true
+		// How many tree nodes are kept in memory once read.
+		cachePages int  = 8192
+	}
+
+	// Stats describes the file.
+	struct Stats {
+		pageSize  int
+		// Pages in the file, and how many of them are free for reuse.
+		pages     int
+		freePages int
+		// The size of the file in bytes.
+		size      int
+		// How many transactions have committed.
+		commits   int
+	}
+
+	// Database is an open database file.
+	//
+	// ```
+	// let db = try store.open("app.db")
+	// try db.write(def (tx store.Transaction) !none {
+	//     let users = try tx.createBucket("users")
+	//     try users.put("ana", "ana@example.com")
+	//     return none
+	// })
+	// try db.read(def (tx store.Transaction) !none {
+	//     let users = try tx.bucket("users")
+	//     print(try users.text("ana")) unless users is none
+	//     return none
+	// })
+	// try db.close()
+	// ```
+	//
+	// Any number of tasks read at the same time, each on the state of the
+	// database as it was when its transaction began; one task writes at a
+	// time, and the others wait in `write` or `beginTx`. A commit is on the
+	// storage device before it returns, and a crash at any point leaves the
+	// database as the last commit made it.
+	//
+	// One process has the file open for writing; `Options.readOnly` shares
+	// it among readers.
+	//
+	// Methods fail with a StoreError: ErrorKind.Storage when the file
+	// cannot be read or written, ErrorKind.Corrupt when it is damaged,
+	// ErrorKind.Closed after `close`.
+	type Database {
+		internal core Core
+
+		def new(core Core) {
+			self.core = core
+		}
+
+		// begin starts a transaction: end it with `commitTx` or `rollbackTx`.
+		// A write transaction waits for the one before it to end. `read`
+		// and `write` do this around a function.
+		// Fails with a StoreError as the type says, and with
+		// ErrorKind.ReadOnly for a write in a read-only database.
+		def beginTx(write bool = false) !Transaction {
+			fail errorOf(ErrorKind.Closed, "store: {core.path} is closed") when core.closed
+			return new Transaction(core, new TxState(core, core.enter(), false)) unless write
+			fail errorOf(ErrorKind.ReadOnly, "store: {core.path} is open read-only") when core.readOnly
+			core.writer.lock()
+			if core.closed {
+				core.writer.unlock()
+				fail errorOf(ErrorKind.Closed, "store: {core.path} is closed")
+			}
+			core.reclaim()
+			return new Transaction(core, new TxState(core, core.current(), true))
+		}
+
+		// read runs `body` in a read transaction.
+		// Fails with a StoreError as the type says, and with whatever
+		// `body` fails with.
+		def read(body def (Transaction) !none) !none {
+			let tx = try beginTx()
+			let failure ?error = none
+			body(tx) onerror (err error) {
+				failure = err
+				recover none
+			}
+			tx.rollbackTx()
+			fail failure unless failure is none
+			return none
+		}
+
+		// write runs `body` in a write transaction and commits it; when
+		// `body` fails nothing it did is kept.
+		// Fails with a StoreError as the type says, and with whatever
+		// `body` fails with.
+		def write(body def (Transaction) !none) !none {
+			let tx = try beginTx(true)
+			let failure ?error = none
+			body(tx) onerror (err error) {
+				failure = err
+				recover none
+			}
+			if !(failure is none) {
+				tx.rollbackTx()
+				fail failure
+			}
+			return try tx.commitTx()
+		}
+
+		// What the file looks like now.
+		// Fails with ErrorKind.Storage when the file cannot be read.
+		def stats() !Stats {
+			let base = core.current()
+			let info = core.file.stat() onerror (err error) {
+				fail errorOf(ErrorKind.Storage, "store: {core.path}: {err.message}", err)
+			}
+			return Stats{pageSize: base.pageSize, pages: base.pages, freePages: core.spareNow(), size: int(info.size), commits: base.txid - 1}
+		}
+
+		// backup writes the database as it is now to a new file, while
+		// other transactions go on.
+		// Fails with a StoreError as the type says, and with
+		// ErrorKind.Storage when the copy cannot be written.
+		def backup(path string) !none {
+			let state = new TxState(core, core.enter(), false)
+			let failure ?error = none
+			copyPages(state.base, path) onerror (err error) {
+				failure = err
+				recover none
+			}
+			core.leave(state.base.txid)
+			fail failure unless failure is none
+			return none
+		}
+
+		// compact writes the content of the database to a new file with no
+		// free pages in it: the way to shrink a file after large deletes.
+		// Fails with a StoreError as the type says, with ErrorKind.Exists
+		// when `path` already holds something, and ErrorKind.Storage when
+		// the copy cannot be written.
+		def compact(path string) !none {
+			let present = os.exists(path) onerror recover false
+			fail errorOf(ErrorKind.Exists, "store: {path} already exists") when present
+			let target = try open(path, Options{pageSize: core.pageSize, sync: false})
+			let copier = new Copier(target)
+			let source = try beginTx()
+			let failure ?error = none
+			copier.run(source) onerror (err error) {
+				failure = err
+				recover none
+			}
+			source.rollbackTx()
+			target.core.durable = true
+			if failure is none {
+				target.core.file.sync() onerror (err error) {
+					failure = errorOf(ErrorKind.Storage, "store: syncing {path}: {err.message}", err)
+				}
+			}
+			target.close() onerror recover none
+			fail failure unless failure is none
+			return none
+		}
+
+		// close waits for the write transaction to end and closes the
+		// file. Read transactions still open fail from then on.
+		// Never fails.
+		def close() !none {
+			return none when core.closed
+			core.writer.lock()
+			core.closed = true
+			core.writer.unlock()
+			core.file.unlock() onerror recover none
+			core.file.close() onerror recover none
+			core.cache.clear()
+			return none
+		}
+
+		def dispose() {
+			close() onerror recover none
+		}
+
+		// Names the database by its file.
+		def str() string {
+			return "store.Database({core.path})"
+		}
+
+		// Copies the pages of one committed state to a file.
+		internal def copyPages(base Meta, path string) !none {
+			let out = os.open(path, "w") onerror (err error) {
+				fail errorOf(ErrorKind.Storage, "store: {path} cannot be written: {err.message}", err)
+			}
+			let failure ?error = none
+			copyInto(out, base) onerror (err error) {
+				failure = errorOf(ErrorKind.Storage, "store: writing {path}: {err.message}", err)
+				recover none
+			}
+			out.close() onerror recover none
+			fail failure unless failure is none
+			return none
+		}
+
+		internal def copyInto(out os.File, base Meta) !none {
+			let page = encodeMeta(base)
+			try out.writeAt(page, 0)
+			try out.writeAt(page, base.pageSize)
+			let id = 2
+			for id < base.pages {
+				let count = (base.pages - id).min(256)
+				let buf = try core.readPages(id, count)
+				try out.writeAt(buf, id * base.pageSize)
+				id += count
+			}
+			try out.sync()
+			return none
+		}
+	}
+
+	// open opens the database file at `path`, creating it when there is
+	// none.
+	//
+	// ```
+	// let db = try store.open("cache.db", store.Options{sync: false})
+	// ```
+	//
+	// Fails with a StoreError: ErrorKind.Storage when the file cannot be
+	// opened, ErrorKind.Busy when another process has it open,
+	// ErrorKind.Corrupt when it is not a database, and ErrorKind.Argument
+	// for a page size that is not a power of two from 4096 to 65536.
+	def open(path string, options ?Options = none) !Database {
+		let settings = Options{}
+		settings = options unless options is none
+		let size = settings.pageSize
+		fail errorOf(ErrorKind.Argument, "store: the page size {size} is not a power of two from 4096 to 65536") when size < 4096 || size > 65536 || (size & (size - 1)) != 0
+		let file = os.open(path, settings.readOnly ?? ("r", "r+")) onerror (err error) {
+			fail errorOf(ErrorKind.Storage, "store: {path} cannot be opened: {err.message}", err)
+		}
+		let failure ?error = none
+		let core = opened(file, path, settings) onerror (err error) {
+			failure = err
+			recover none
+		}
+		if core is none {
+			file.close() onerror recover none
+			fail errorOf(ErrorKind.Storage, "store: {path} cannot be opened") when failure is none
+			fail failure
+		}
+		return new Database(core)
+	}
+
+	// Locks an open file and reads, or writes, its first pages.
+	internal def opened(file os.File, path string, settings Options) !?Core {
+		let held = file.lock(!settings.readOnly, false) onerror (err error) {
+			fail errorOf(ErrorKind.Storage, "store: {path} cannot be locked: {err.message}", err)
+		}
+		fail errorOf(ErrorKind.Busy, "store: another process has {path} open") unless held
+		let info = file.stat() onerror (err error) {
+			fail errorOf(ErrorKind.Storage, "store: {path}: {err.message}", err)
+		}
+		let base ?Meta = none
+		if info.size == 0 {
+			fail errorOf(ErrorKind.Corrupt, "store: {path} is empty") when settings.readOnly
+			let first = Meta{pageSize: settings.pageSize, root: 2, pages: 3, txid: 1}
+			let root = new Node(true)
+			try file.writeAt(root.pack(first.pageSize), 2 * first.pageSize)
+			let older = copyOf(first)
+			older.txid = 0
+			try file.writeAt(encodeMeta(older), 0)
+			try file.writeAt(encodeMeta(first), first.pageSize)
+			try file.sync() when settings.sync
+			base = first
+		} else {
+			base = try newestMeta(file, int(info.size))
+		}
+		fail errorOf(ErrorKind.Corrupt, "store: {path} is not a database") when base is none
+		let core = new Core(file, path, base, settings.readOnly, settings.cachePages)
+		core.durable = settings.sync
+		if base.freelist != 0 {
+			core.free = try decodeFree(try core.readRun(base.freelist), base.freelist)
+			core.spare = core.free.len()
+		}
+		return core
+	}
+
+	// Reads both meta pages and returns the newer one that holds.
+	internal def newestMeta(file os.File, size int) !?Meta {
+		let head byte[] = []
+		head.len(64)
+		let best ?Meta = none
+		let n = try file.readAt(head, 0)
+		best = decodeMeta(head) when n == 64
+		// The second meta page sits one page in; when the first is torn
+		// its page size is unknown, so every size is tried.
+		for let pageSize = 4096; pageSize <= 65536; pageSize = pageSize * 2 {
+			continue when !(best is none) && best.pageSize != pageSize
+			continue when pageSize + 64 > size
+			let got = try file.readAt(head, pageSize)
+			continue when got != 64
+			let other = decodeMeta(head)
+			continue when other is none || other.pageSize != pageSize
+			if best is none {
+				best = other
+			} else if other.txid > best.txid {
+				best = other
+			}
+		}
+		return best
+	}
+}

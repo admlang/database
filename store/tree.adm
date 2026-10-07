@@ -1,0 +1,522 @@
+// One bucket's B+tree inside a transaction: lookups, edits on copies of
+// the nodes on the way down, and the commit-time pass that merges, splits
+// and places what changed.
+internal partial module adm.database.store.engine {
+	use adm.database.store::*
+
+	// Part is a node placed in the file: its lowest key and its page.
+	struct Part {
+		key byte[]
+		id  int
+	}
+
+	// Found is a leaf entry.
+	struct Found {
+		value byte[]
+		flag  int
+	}
+
+	// Tree is a bucket as a transaction sees it.
+	type Tree {
+		state    TxState
+		// The root node: a page, or a node of the transaction's own.
+		root     int
+		// The bucket's counter for `nextSequence`.
+		sequence int
+		// Its key in the bucket it is nested in; empty for the root
+		// bucket.
+		name     byte[]
+		// The nested buckets this transaction opened, by the hex of
+		// their name.
+		opened   map<string, Tree>
+		// Set once the root or the sequence differs from what the parent
+		// stores.
+		changed  bool
+		// Counts edits, so a cursor knows its place may have moved.
+		edits    int
+		// Set when the bucket was deleted in this transaction.
+		dropped  bool
+		// The branches `leafFor` went through last, root first, and the
+		// child index taken in each.
+		path     Node[]
+		slots    int[]
+
+		def new(state TxState, root int, sequence int) {
+			self.state = state
+			self.root = root
+			self.sequence = sequence
+		}
+
+		// The entry under `key`; none when there is none.
+		// Fails with ErrorKind.Storage or ErrorKind.Corrupt.
+		def lookup(key byte[]) !?Found {
+			let node = try state.node(root)
+			for !node.leaf {
+				node = try state.node(node.childAt(node.route(key)))
+			}
+			let (i, found) = node.search(key)
+			return none unless found
+			return Found{value: node.valueAt(i), flag: node.flagAt(i)}
+		}
+
+		// The leaf `key` belongs in, as a node the transaction may change,
+		// with every node on the way to it. `key` must outlive the call: it
+		// may become a branch's lower bound.
+		def leafFor(key byte[]) !Node {
+			let node = try state.edit(root)
+			root = node.id
+			path = []
+			slots = []
+			for !node.leaf {
+				let i = node.route(key)
+				// A branch's first key stays a lower bound of everything
+				// below it: it is what the branch above is told.
+				node.keys[0] = key when i == 0 && compareKeys(key, node.keys[0]) < 0
+				let child = try state.edit(node.children[i])
+				node.children[i] = child.id
+				path.push(node)
+				slots.push(i)
+				node = child
+			}
+			changed = true
+			edits++
+			return node
+		}
+
+		// Stores an entry, replacing the one under the key.
+		// Fails with ErrorKind.Storage or ErrorKind.Corrupt, and with
+		// ErrorKind.Exists when a value is to replace a nested bucket.
+		def store(key byte[], value byte[], flag int) !none {
+			let leaf = try leafFor(key)
+			let (i, found) = leaf.search(key)
+			if found {
+				fail errorOf(ErrorKind.Exists, "store: '{string(key)}' is a bucket, not a value") when flag != flagBucket && leaf.flagAt(i) == flagBucket
+				leaf.replace(i, value, flag)
+				return none
+			}
+			leaf.insert(i, key, value, flag)
+			divide(leaf, i == leaf.count() - 1) when leaf.count() > maxFanout
+			return none
+		}
+
+		// Halves a node of the transaction's own that grew past
+		// `maxFanout` entries, and the branches above it that grow past it
+		// in turn: an insert then never moves more than that many entries,
+		// however much one transaction writes. The pages are cut at the
+		// commit.
+		// After an append the lower part keeps everything but the last
+		// entry, so keys written in order leave full nodes behind.
+		def divide(node Node, appended bool) {
+			let lower = node
+			let atEnd = appended
+			for let level = path.len() - 1;; level-- {
+				let half = atEnd ?? (lower.count() - 1, lower.count() / 2)
+				let upper = state.fresh(lower.leaf)
+				upper.take(lower, half, lower.count())
+				lower.truncate(half)
+				if level < 0 {
+					// The root itself: a new root above the two halves.
+					let above = state.fresh(false)
+					above.keys = [lower.keyAt(0), upper.keyAt(0)]
+					above.children = [lower.id, upper.id]
+					root = above.id
+					return
+				}
+				let parent = path[level]
+				let slot = slots[level]
+				parent.insertChild(slot + 1, upper.keyAt(0), upper.id)
+				return when parent.count() <= maxFanout
+				atEnd = slot + 1 == parent.keys.len() - 1
+				lower = parent
+			}
+		}
+
+		// Removes the entry under `key`; false when there was none.
+		// Fails with ErrorKind.Storage or ErrorKind.Corrupt.
+		def remove(key byte[]) !bool {
+			let leaf = try leafFor(key.clone())
+			let (i, found) = leaf.search(key)
+			return false unless found
+			leaf.removeAt(i)
+			return true
+		}
+
+		// The nested bucket under `name`; none when there is none.
+		// Fails with ErrorKind.Exists when the key holds a value, and with
+		// ErrorKind.Storage or ErrorKind.Corrupt.
+		def child(name byte[]) !?Tree {
+			let id = name.hex()
+			let known = opened.get(id)
+			if !(known is none) {
+				return none when known.dropped
+				return known
+			}
+			let entry = try lookup(name)
+			return none when entry is none
+			fail errorOf(ErrorKind.Exists, "store: '{string(name)}' is a value, not a bucket") when entry.flag != flagBucket
+			let tree = new Tree(state, getU64(entry.value, 0), getU64(entry.value, 8))
+			tree.name = name
+			opened.set(id, tree)
+			return tree
+		}
+
+		// Makes the nested bucket `name`, or returns the one that exists.
+		// Fails as `child` does.
+		def grow(name byte[]) !Tree {
+			let existing = try child(name)
+			return existing unless existing is none
+			let tree = new Tree(state, state.fresh(true).id, 0)
+			tree.name = name
+			tree.changed = true
+			opened.set(name.hex(), tree)
+			// The entry is rewritten with the root's page at the commit.
+			try store(name, rootRecord(0, 0), flagBucket)
+			return tree
+		}
+
+		// Deletes the nested bucket `name` with everything in it; false
+		// when there is none. Fails as `child` does.
+		def prune(name byte[]) !bool {
+			let tree = try child(name)
+			return false when tree is none
+			try tree.free()
+			tree.dropped = true
+			try remove(name)
+			return true
+		}
+
+		// Gives up every page of the tree and of the buckets nested in it.
+		def free() !none {
+			try freeNode(root)
+			for let (_, nested) in opened {
+				nested.dropped = true
+			}
+			return none
+		}
+
+		def freeNode(id int) !none {
+			let node = try state.node(id)
+			if node.leaf {
+				for let i = 0; i < node.count(); i++ {
+					continue when node.flagAt(i) != flagBucket
+					let known = opened.get(node.keyAt(i).hex())
+					if known is none {
+						let nested = new Tree(state, getU64(node.valueAt(i), 0), 0)
+						try nested.free()
+					} else if !known.dropped {
+						try known.free()
+					}
+				}
+			} else {
+				for let i = 0; i < node.count(); i++ {
+					try freeNode(node.childAt(i))
+				}
+			}
+			state.release(node)
+			state.discard(id)
+			return none
+		}
+
+		// settle gives every changed node of this bucket and of the
+		// buckets nested in it a place in the file, and leaves `root` a
+		// page.
+		// Fails with ErrorKind.Storage or ErrorKind.Corrupt.
+		def settle() !none {
+			for let (_, nested) in opened {
+				continue when nested.dropped || !nested.changed
+				try nested.settle()
+				try store(nested.name, rootRecord(nested.root, nested.sequence), flagBucket)
+				nested.changed = false
+			}
+			return none when root >= 0
+			try rebalance(root)
+			// A root with one child is that child.
+			for root < 0 {
+				let node = try state.node(root)
+				if !node.leaf && node.children.len() == 0 {
+					state.discard(root)
+					root = state.fresh(true).id
+					break
+				}
+				break when node.leaf || node.children.len() != 1
+				state.discard(root)
+				root = node.children[0]
+			}
+			return none when root >= 0
+			let parts = try spill(root)
+			for parts.len() > 1 {
+				let above = state.fresh(false)
+				for let part in parts {
+					above.keys.push(part.key)
+					above.children.push(part.id)
+				}
+				parts = try spill(above.id)
+			}
+			root = parts[0].id
+			return none
+		}
+
+		// Below a changed branch: drops the children left empty and merges
+		// the ones left under a quarter of a page into a neighbour.
+		def rebalance(id int) !none {
+			let node = try state.node(id)
+			return none when node.leaf
+			for let childId in node.children {
+				try rebalance(childId) when childId < 0
+			}
+			let low = state.core.pageSize / 4
+			let i = 0
+			for i < node.children.len() {
+				let childId = node.children[i]
+				if childId >= 0 {
+					i++
+					continue
+				}
+				let child = try state.node(childId)
+				if child.count() == 0 {
+					node.keys.remove(i)
+					node.children.remove(i)
+					state.discard(childId)
+					continue
+				}
+				let size = child.measure()
+				// Two changed neighbours that fit one page become one.
+				if i + 1 < node.children.len() && node.children[i + 1] < 0 {
+					let after = try state.node(node.children[i + 1])
+					if after.count() > 0 && size + after.measure() - headerSize <= state.core.pageSize {
+						child.take(after, 0, after.count())
+						state.discard(after.id)
+						node.keys.remove(i + 1)
+						node.children.remove(i + 1)
+						continue
+					}
+				}
+				if size < low && node.children.len() > 1 {
+					let j = i > 0 ?? (i - 1, i + 1)
+					let sibling = try state.edit(node.children[j])
+					let left = j < i ?? (sibling, child)
+					let right = j < i ?? (child, sibling)
+					left.take(right, 0, right.count())
+					let at = i.min(j)
+					node.children[at] = left.id
+					node.keys.remove(at + 1)
+					node.children.remove(at + 1)
+					state.discard(right.id)
+					i = at
+					continue
+				}
+				node.keys[i] = child.keyAt(0)
+				i++
+			}
+			return none
+		}
+
+		// Places a changed node, its changed children first, in as many
+		// pages as it needs, and returns what the parent must point at.
+		def spill(id int) !Part[] {
+			let node = try state.node(id)
+			if !node.leaf {
+				let keys byte[][] = []
+				let children int[] = []
+				for let i = 0; i < node.children.len(); i++ {
+					let childId = node.children[i]
+					if childId >= 0 {
+						keys.push(node.keys[i])
+						children.push(childId)
+						continue
+					}
+					for let part in try spill(childId) {
+						keys.push(part.key)
+						children.push(part.id)
+					}
+				}
+				node.keys = keys
+				node.children = children
+			}
+			let pageSize = state.core.pageSize
+			let total = node.measure()
+			let count = node.count()
+			let parts Part[] = []
+			if total <= pageSize || count <= 1 {
+				let lowest byte[] = []
+				lowest = node.keyAt(0) when count > 0
+				parts.push(Part{key: lowest, id: state.place(node)})
+				return parts
+			}
+			// Cut into pieces of about the same size, none over a page
+			// unless one entry alone is.
+			let pieces = (total - headerSize + pageSize - headerSize - 1) / (pageSize - headerSize)
+			let target = (total - headerSize) / pieces
+			let start = 0
+			let size = 0
+			for let i = 0; i <= count; i++ {
+				let entry = i < count ?? (node.entrySize(i), 0)
+				let full = i > start && (size + entry > pageSize - headerSize || size >= target)
+				if i == count || full {
+					let piece = new Node(node.leaf)
+					piece.id = state.nextTemp
+					state.nextTemp--
+					piece.take(node, start, i)
+					let lowest = piece.keyAt(0)
+					parts.push(Part{key: lowest, id: state.place(piece)})
+					start = i
+					size = 0
+				}
+				size += entry
+			}
+			state.discard(id)
+			return parts
+		}
+	}
+
+	// What a bucket's entry in its parent holds: the root page and the
+	// sequence.
+	def rootRecord(root int, sequence int) byte[] {
+		let out byte[] = []
+		out.len(16)
+		putU64(out, 0, root)
+		putU64(out, 8, sequence)
+		return out
+	}
+
+	// Walker moves over the entries of a tree in key order.
+	type Walker {
+		tree  Tree
+		// The nodes from the root to the current leaf, and the index
+		// taken in each.
+		nodes Node[]
+		at    int[]
+		// False before the first move and once the walk left the tree.
+		valid bool
+
+		def new(tree Tree) {
+			self.tree = tree
+		}
+
+		def key() byte[] {
+			return nodes[nodes.len() - 1].keyAt(at[at.len() - 1])
+		}
+
+		def value() byte[] {
+			return nodes[nodes.len() - 1].valueAt(at[at.len() - 1])
+		}
+
+		def flag() int {
+			return nodes[nodes.len() - 1].flagAt(at[at.len() - 1])
+		}
+
+		// Goes to the first entry. Returns whether there is one.
+		def first() !bool {
+			nodes = []
+			at = []
+			try descend(tree.root, true)
+			valid = true
+			return try settleForward()
+		}
+
+		// Goes to the last entry. Returns whether there is one.
+		def last() !bool {
+			nodes = []
+			at = []
+			try descend(tree.root, false)
+			valid = true
+			return try settleBackward()
+		}
+
+		// Goes to the first entry whose key is not below `key`.
+		def seek(key byte[]) !bool {
+			nodes = []
+			at = []
+			let node = try tree.state.node(tree.root)
+			for !node.leaf {
+				let i = node.route(key)
+				nodes.push(node)
+				at.push(i)
+				node = try tree.state.node(node.childAt(i))
+			}
+			let (i, _) = node.search(key)
+			nodes.push(node)
+			at.push(i)
+			valid = true
+			return try settleForward()
+		}
+
+		// Goes to the next entry.
+		def next() !bool {
+			return false unless valid
+			at[at.len() - 1] = at[at.len() - 1] + 1
+			return try settleForward()
+		}
+
+		// Goes to the entry before.
+		def previous() !bool {
+			return false unless valid
+			at[at.len() - 1] = at[at.len() - 1] - 1
+			return try settleBackward()
+		}
+
+		// Pushes the leftmost (or rightmost) path below a node.
+		def descend(id int, leftmost bool) !none {
+			let node = try tree.state.node(id)
+			for {
+				nodes.push(node)
+				if node.leaf {
+					at.push(leftmost ?? (0, node.count() - 1))
+					break
+				}
+				let i = leftmost ?? (0, node.count() - 1)
+				at.push(i)
+				break when i < 0
+				node = try tree.state.node(node.childAt(i))
+			}
+			return none
+		}
+
+		// From an index that may lie past its leaf, or in a leaf a write
+		// transaction emptied: moves on to the next entry there is.
+		def settleForward() !bool {
+			for {
+				let depth = nodes.len() - 1
+				let leaf = nodes[depth]
+				return true when leaf.leaf && at[depth] >= 0 && at[depth] < leaf.count()
+				// Climb to a node that has a child to the right.
+				let level = depth - 1
+				for level >= 0 && at[level] + 1 >= nodes[level].count() {
+					level--
+				}
+				if level < 0 {
+					valid = false
+					return false
+				}
+				let nextIndex = at[level] + 1
+				nodes = nodes[:level + 1].clone()
+				at = at[:level + 1].clone()
+				at[level] = nextIndex
+				try descend(nodes[level].childAt(nextIndex), true)
+			}
+			return false
+		}
+
+		def settleBackward() !bool {
+			for {
+				let depth = nodes.len() - 1
+				let leaf = nodes[depth]
+				return true when leaf.leaf && at[depth] >= 0 && at[depth] < leaf.count()
+				let level = depth - 1
+				for level >= 0 && at[level] <= 0 {
+					level--
+				}
+				if level < 0 {
+					valid = false
+					return false
+				}
+				let nextIndex = at[level] - 1
+				nodes = nodes[:level + 1].clone()
+				at = at[:level + 1].clone()
+				at[level] = nextIndex
+				try descend(nodes[level].childAt(nextIndex), false)
+			}
+			return false
+		}
+	}
+}

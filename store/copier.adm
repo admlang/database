@@ -1,0 +1,77 @@
+partial module adm.database.store {
+	// Copier writes the content of one database into another, committing
+	// as it goes so that the copy never holds the whole database in
+	// memory.
+	internal type Copier {
+		target  Database
+		tx      ?Transaction = none
+		// Bytes written since the last commit.
+		pending int
+		limit   int          = 32 * 1024 * 1024
+
+		def new(target Database) {
+			self.target = target
+		}
+
+		// Copies every bucket a read transaction of the source sees.
+		def run(source Transaction) !none {
+			for let name in try source.buckets() {
+				let from = try source.bucket(name)
+				continue when from is none
+				try copy(from, [name])
+			}
+			let open = tx
+			try open.commitTx() unless open is none
+			tx = none
+			return none
+		}
+
+		// The bucket at `path` in the target, in the current transaction.
+		def at(path string[]) !Bucket {
+			let open = try writer()
+			let bucket = try open.createBucket(path[0])
+			for let i = 1; i < path.len(); i++ {
+				bucket = try bucket.createBucket(path[i])
+			}
+			return bucket
+		}
+
+		// The target's open write transaction, begun when there is none.
+		def writer() !Transaction {
+			let open = tx
+			return open unless open is none
+			let begun = try target.beginTx(true)
+			tx = begun
+			return begun
+		}
+
+		def copy(from Bucket, path string[]) !none {
+			let to = try at(path)
+			let last = try from.sequence()
+			try to.sequence(last)
+			let cursor = from.cursor()
+			let entry = try cursor.first()
+			for {
+				break when entry is none
+				if entry.bucket {
+					let name = string(entry.key)
+					let nested = try from.bucket(name)
+					try copy(nested, path + [name]) unless nested is none
+					to = try at(path)
+				} else {
+					try to.put(entry.key, entry.value)
+					pending += entry.key.len() + entry.value.len()
+					if pending >= limit {
+						let open = tx
+						try open.commitTx() unless open is none
+						tx = none
+						pending = 0
+						to = try at(path)
+					}
+				}
+				entry = try cursor.next()
+			}
+			return none
+		}
+	}
+}

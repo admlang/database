@@ -1,0 +1,499 @@
+// The file format: two meta pages, then pages that hold a B+tree node or
+// the free list, each a run of one or more whole pages with a checksum.
+internal partial module adm.database.store.engine {
+	use (
+		std.crypto.hash
+		adm.database.store::*
+	)
+
+	// "ADMS" in the first four bytes of both meta pages.
+	const magic = 0x534D4441
+	const formatVersion = 1
+	const headerSize = 16
+	const kindBranch = 1
+	const kindLeaf = 2
+	const kindFree = 3
+	// A leaf entry that names a nested bucket instead of holding a value.
+	const flagBucket = 1
+	// How many entries a node may hold while a write transaction edits it.
+	const maxFanout = 128
+	const maxKeySize = 32768
+	const maxValueSize = 1 << 30
+
+	// Meta is the root of one committed state of the database. The file
+	// holds the last two; the one with the higher `txid` whose checksum
+	// holds is the database.
+	struct Meta {
+		pageSize int
+		// The page of the root bucket's tree, and that bucket's sequence.
+		root     int
+		sequence int
+		// The page of the free list; 0 when no page is free.
+		freelist int
+		// How many pages the file holds, the meta pages among them.
+		pages    int
+		txid     int
+	}
+
+	// A Meta of its own: a struct is shared by reference, and a write
+	// transaction changes its copy.
+	def copyOf(base Meta) Meta {
+		return Meta{pageSize: base.pageSize, root: base.root, sequence: base.sequence, freelist: base.freelist, pages: base.pages, txid: base.txid}
+	}
+
+	// errorOf builds the StoreError the library fails with.
+	def errorOf(kind ErrorKind, message string, cause ?error = none) StoreError {
+		return StoreError{message: message, code: kind.value, kind: kind, cause: cause}
+	}
+
+	def putU32(buf byte[], at int, value int) {
+		buf[at] = byte(value & 255)
+		buf[at + 1] = byte((value >> 8) & 255)
+		buf[at + 2] = byte((value >> 16) & 255)
+		buf[at + 3] = byte((value >> 24) & 255)
+	}
+
+	def getU32(buf byte[], at int) int {
+		return int(buf[at]) | (int(buf[at + 1]) << 8) | (int(buf[at + 2]) << 16) | (int(buf[at + 3]) << 24)
+	}
+
+	def putU64(buf byte[], at int, value int) {
+		putU32(buf, at, value & 0xFFFFFFFF)
+		putU32(buf, at + 4, (value >> 32) & 0xFFFFFFFF)
+	}
+
+	def getU64(buf byte[], at int) int {
+		return getU32(buf, at) | (getU32(buf, at + 4) << 32)
+	}
+
+	// How many bytes a length takes as a varint.
+	def varintSize(value int) int {
+		return 1 when value < 128
+		return 2 when value < 16384
+		return 3 when value < 2097152
+		return 4 when value < 268435456
+		return 5
+	}
+
+	// Writes a length as a varint and returns the offset after it.
+	def putVarint(buf byte[], at int, value int) int {
+		let v = value
+		let i = at
+		for v >= 128 {
+			buf[i] = byte((v & 127) | 128)
+			v = v >> 7
+			i++
+		}
+		buf[i] = byte(v)
+		return i + 1
+	}
+
+	// Compares keys byte by byte: negative, zero or positive.
+	def compareKeys(a byte[], b byte[]) int {
+		let n = a.len().min(b.len())
+		for let i = 0; i < n; i++ {
+			let d = int(a[i]) - int(b[i])
+			return d when d != 0
+		}
+		return a.len() - b.len()
+	}
+
+	// The checksum of a page run: every byte but the checksum's own four.
+	def checksumOf(buf byte[]) int {
+		let head = hash.crc32c(buf[0:12])
+		return int(hash.crc32c(buf[headerSize:], head))
+	}
+
+	def encodeMeta(base Meta) byte[] {
+		let buf byte[] = []
+		buf.len(base.pageSize)
+		putU32(buf, 0, magic)
+		putU32(buf, 4, formatVersion)
+		putU32(buf, 8, base.pageSize)
+		putU64(buf, 16, base.root)
+		putU64(buf, 24, base.sequence)
+		putU64(buf, 32, base.freelist)
+		putU64(buf, 40, base.pages)
+		putU64(buf, 48, base.txid)
+		putU32(buf, 56, int(hash.crc32c(buf[0:56])))
+		return buf
+	}
+
+	// Reads a meta page; none when it is not one or its checksum fails.
+	def decodeMeta(buf byte[]) ?Meta {
+		return none when buf.len() < 64 || getU32(buf, 0) != magic || getU32(buf, 4) != formatVersion
+		return none when getU32(buf, 56) != int(hash.crc32c(buf[0:56]))
+		let size = getU32(buf, 8)
+		return none when size < 4096 || size > 65536 || (size & (size - 1)) != 0
+		return Meta{pageSize: size, root: getU64(buf, 16), sequence: getU64(buf, 24), freelist: getU64(buf, 32), pages: getU64(buf, 40), txid: getU64(buf, 48)}
+	}
+
+	// Reads the varint at an offset of a page.
+	def varintAt(buf byte[], at int) int {
+		let out = 0
+		let shift = 0
+		for let i = at; i < buf.len(); i++ {
+			let b = int(buf[i])
+			out = out | ((b & 127) << shift)
+			return out when b < 128
+			shift += 7
+		}
+		return out
+	}
+
+	// Compares `length` bytes of a page from `start` with a key.
+	def compareRange(buf byte[], start int, length int, key byte[]) int {
+		let n = length.min(key.len())
+		for let i = 0; i < n; i++ {
+			let d = int(buf[start + i]) - int(key[i])
+			return d when d != 0
+		}
+		return length - key.len()
+	}
+
+	// Node is one node of a bucket's B+tree, in one of two forms. A node
+	// of the file is packed: the bytes of its pages and where each entry
+	// starts in them. It never changes, and transactions share it. A node
+	// a write transaction edits holds its entries in arrays and carries a
+	// negative `id` until the commit packs it into pages.
+	type Node {
+		id       int
+		leaf     bool
+		// How many pages the node takes in the file.
+		span     int      = 1
+		// Packed: the page run, and the offset of each entry in it.
+		packed   bool
+		buf      byte[]
+		offs     int[]
+		// Edited branch: the lower bound and the id of each child, in
+		// order.
+		keys     byte[][]
+		children int[]
+		// Edited leaf: `keys`, `values` and `flags` (`flagBucket` for a
+		// nested bucket) hold the entries in the order they arrived, and
+		// `order` lists them by key. An insert then moves numbers, not
+		// references.
+		values   byte[][]
+		flags    byte[]
+		order    int[]
+
+		def new(leaf bool) {
+			self.leaf = leaf
+		}
+
+		// How many entries (leaf) or children (branch) it holds.
+		def count() int {
+			return offs.len() when packed
+			return leaf ?? (order.len(), keys.len())
+		}
+
+		// Where the key of packed entry `i` starts.
+		def keyStart(i int) int {
+			let at = offs[i]
+			if leaf {
+				let k = varintAt(buf, at + 1)
+				let after = at + 1 + varintSize(k)
+				return after + varintSize(varintAt(buf, after))
+			}
+			return at + varintSize(varintAt(buf, at))
+		}
+
+		def keySize(i int) int {
+			return varintAt(buf, leaf ?? (offs[i] + 1, offs[i]))
+		}
+
+		// The key of entry `i`: a view of the page when packed.
+		def keyAt(i int) byte[] {
+			return leaf ?? (keys[order[i]], keys[i]) unless packed
+			let start = keyStart(i)
+			return buf[start:start + keySize(i)]
+		}
+
+		// Leaf: the value of entry `i`: a view of the page when packed.
+		def valueAt(i int) byte[] {
+			return values[order[i]] unless packed
+			let k = keySize(i)
+			let after = offs[i] + 1 + varintSize(k)
+			let v = varintAt(buf, after)
+			let start = after + varintSize(v) + k
+			return buf[start:start + v]
+		}
+
+		// Leaf: `flagBucket` when entry `i` names a nested bucket.
+		def flagAt(i int) int {
+			return int(flags[order[i]]) unless packed
+			return int(buf[offs[i]])
+		}
+
+		// Branch: the id of child `i`.
+		def childAt(i int) int {
+			return children[i] unless packed
+			return getU64(buf, keyStart(i) + keySize(i))
+		}
+
+		// The order of key `i` against `key`.
+		def compareAt(i int, key byte[]) int {
+			if !packed {
+				return compareKeys(keys[order[i]], key) when leaf
+				return compareKeys(keys[i], key)
+			}
+			return compareRange(buf, keyStart(i), keySize(i), key)
+		}
+
+		// A copy a write transaction may change. Its keys and values are
+		// views of this node's pages.
+		def editable(id int) Node {
+			let out = new Node(leaf)
+			out.id = id
+			out.take(self, 0, count())
+			return out
+		}
+
+		// Edited leaf: puts an entry in at index `i`.
+		def insert(i int, key byte[], value byte[], flag int) {
+			keys.push(key)
+			values.push(value)
+			flags.push(byte(flag))
+			order = inserted(order, i, keys.len() - 1)
+		}
+
+		// Edited leaf: gives entry `i` another value.
+		def replace(i int, value byte[], flag int) {
+			values[order[i]] = value
+			flags[order[i]] = byte(flag)
+		}
+
+		// Edited branch: puts a child in at index `i`.
+		def insertChild(i int, key byte[], child int) {
+			keys = inserted(keys, i, key)
+			children = inserted(children, i, child)
+		}
+
+		// Edited: takes entry or child `i` out.
+		def removeAt(i int) {
+			if leaf {
+				order.remove(i)
+				tidy() when keys.len() > 2 * order.len() + 32
+				return
+			}
+			keys.remove(i)
+			children.remove(i)
+		}
+
+		// Edited: appends entries `from` up to `to` of another node.
+		def take(other Node, from int, to int) {
+			for let i = from; i < to; i++ {
+				keys.push(other.keyAt(i))
+				if leaf {
+					values.push(other.valueAt(i))
+					flags.push(byte(other.flagAt(i)))
+					order.push(keys.len() - 1)
+				} else {
+					children.push(other.childAt(i))
+				}
+			}
+		}
+
+		// Edited: keeps the first `n` entries.
+		def truncate(n int) {
+			if leaf {
+				order = order[:n].clone()
+				tidy()
+				return
+			}
+			keys = keys[:n].clone()
+			children = children[:n].clone()
+		}
+
+		// Edited leaf: drops the entries `order` no longer names.
+		def tidy() {
+			let kept = new Node(true)
+			kept.take(self, 0, order.len())
+			keys = kept.keys
+			values = kept.values
+			flags = kept.flags
+			order = kept.order
+		}
+
+		// Leaf: the index of the first key that is not below `key`, and
+		// whether it is `key` itself.
+		def search(key byte[]) (int, bool) {
+			let low = 0
+			let high = count()
+			for low < high {
+				let mid = (low + high) / 2
+				let sign = compareAt(mid, key)
+				return (mid, true) when sign == 0
+				if sign < 0 {
+					low = mid + 1
+				} else {
+					high = mid
+				}
+			}
+			return (low, false)
+		}
+
+		// Branch: the index of the child whose range holds `key`.
+		def route(key byte[]) int {
+			let low = 0
+			let high = count()
+			for low < high {
+				let mid = (low + high) / 2
+				if compareAt(mid, key) <= 0 {
+					low = mid + 1
+				} else {
+					high = mid
+				}
+			}
+			return low == 0 ?? (0, low - 1)
+		}
+
+		// How many bytes edited entry `i` takes in a page.
+		def entrySize(i int) int {
+			let k = keyAt(i).len()
+			return varintSize(k) + k + 8 unless leaf
+			let v = valueAt(i).len()
+			return 1 + varintSize(k) + varintSize(v) + k + v
+		}
+
+		// How many bytes the edited node takes in a page, header included.
+		def measure() int {
+			let total = headerSize
+			let n = count()
+			for let i = 0; i < n; i++ {
+				total += entrySize(i)
+			}
+			return total
+		}
+
+		// Packs the edited node into the bytes of its page run and returns
+		// them. The node is a node of the file from then on.
+		def pack(pageSize int) byte[] {
+			let size = measure()
+			let n = count()
+			span = ((size + pageSize - 1) / pageSize).max(1)
+			let out byte[] = []
+			out.len(span * pageSize)
+			out[0] = byte(leaf ?? (kindLeaf, kindBranch))
+			putU32(out, 4, n)
+			putU32(out, 8, span - 1)
+			let starts int[] = []
+			starts.len(n)
+			let at = headerSize
+			for let i = 0; i < n; i++ {
+				let key = keyAt(i)
+				starts[i] = at
+				if leaf {
+					let value = valueAt(i)
+					out[at] = byte(flagAt(i))
+					at = putVarint(out, at + 1, key.len())
+					at = putVarint(out, at, value.len())
+					key.copy(out[at:])
+					at += key.len()
+					value.copy(out[at:])
+					at += value.len()
+				} else {
+					at = putVarint(out, at, key.len())
+					key.copy(out[at:])
+					at += key.len()
+					putU64(out, at, children[i])
+					at += 8
+				}
+			}
+			putU32(out, 12, checksumOf(out))
+			buf = out
+			offs = starts
+			packed = true
+			keys = []
+			values = []
+			flags = []
+			children = []
+			order = []
+			return out
+		}
+	}
+
+	// How many pages past the first the run that starts with this page
+	// has; fails when the page is not the start of a node.
+	def overflowOf(first byte[], id int) !int {
+		let kind = int(first[0])
+		fail errorOf(ErrorKind.Corrupt, "store: page {id} holds no tree node") unless kind := kindBranch || kindLeaf || kindFree
+		return getU32(first, 8)
+	}
+
+	// Reads a node from the bytes of its page run, which the node keeps.
+	// Fails with ErrorKind.Corrupt when the checksum or the layout is off.
+	def decodeNode(buf byte[], id int, pageSize int) !Node {
+		fail errorOf(ErrorKind.Corrupt, "store: page {id} fails its checksum") when getU32(buf, 12) != checksumOf(buf)
+		let kind = int(buf[0])
+		fail errorOf(ErrorKind.Corrupt, "store: page {id} holds no tree node") unless kind := kindBranch || kindLeaf
+		let node = new Node(kind == kindLeaf)
+		node.id = id
+		node.span = buf.len() / pageSize
+		node.packed = true
+		node.buf = buf
+		let count = getU32(buf, 4)
+		node.offs.len(count)
+		let at = headerSize
+		for let i = 0; i < count; i++ {
+			fail errorOf(ErrorKind.Corrupt, "store: page {id} ends inside an entry") when at + 3 > buf.len()
+			node.offs[i] = at
+			if node.leaf {
+				let k = varintAt(buf, at + 1)
+				at += 1 + varintSize(k)
+				let v = varintAt(buf, at)
+				at += varintSize(v) + k + v
+			} else {
+				let k = varintAt(buf, at)
+				at += varintSize(k) + k + 8
+			}
+			fail errorOf(ErrorKind.Corrupt, "store: page {id} ends inside an entry") when at > buf.len()
+		}
+		return node
+	}
+
+	// The free list as the bytes of its page run: page ids in order.
+	def encodeFree(ids int[], pageSize int) byte[] {
+		let size = headerSize + 8 + ids.len() * 8
+		let span = (size + pageSize - 1) / pageSize
+		let buf byte[] = []
+		buf.len(span * pageSize)
+		buf[0] = byte(kindFree)
+		putU32(buf, 8, span - 1)
+		putU64(buf, headerSize, ids.len())
+		for let i = 0; i < ids.len(); i++ {
+			putU64(buf, headerSize + 8 + i * 8, ids[i])
+		}
+		putU32(buf, 12, checksumOf(buf))
+		return buf
+	}
+
+	// How many pages a free list of `count` ids takes.
+	def freeSpan(count int, pageSize int) int {
+		return (headerSize + 8 + count * 8 + pageSize - 1) / pageSize
+	}
+
+	// Reads the free list. Fails with ErrorKind.Corrupt.
+	def decodeFree(buf byte[], id int) !int[] {
+		fail errorOf(ErrorKind.Corrupt, "store: the free list at page {id} fails its checksum") when getU32(buf, 12) != checksumOf(buf) || int(buf[0]) != kindFree
+		let count = getU64(buf, headerSize)
+		fail errorOf(ErrorKind.Corrupt, "store: the free list at page {id} is cut short") when headerSize + 8 + count * 8 > buf.len()
+		let ids int[] = []
+		ids.len(count)
+		for let i = 0; i < count; i++ {
+			ids[i] = getU64(buf, headerSize + 8 + i * 8)
+		}
+		return ids
+	}
+
+	// Puts `value` into `items` before index `at`, moving the rest up, and
+	// returns `items`.
+	def inserted<T>(items T[], at int, value T) T[] {
+		items.push(value)
+		for let i = items.len() - 1; i > at; i-- {
+			items[i] = items[i - 1]
+		}
+		items[at] = value
+		return items
+	}
+}

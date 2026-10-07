@@ -1,0 +1,880 @@
+partial module adm.database.store {
+	use (
+		std.os
+		std.testing
+		std.time
+	)
+
+	// A path for a database nothing else uses.
+	def scratch(name string) string {
+		return "/tmp/adm-store-test-{name}-{time.now().unixNs()}.db"
+	}
+
+	def kindOfFailure(err error) ErrorKind {
+		return err.kind when err is StoreError
+		return ErrorKind.Storage
+	}
+
+	// The text under a key, `(none)` when there is none.
+	def textOf(bucket Bucket, key string) !string {
+		let value = try bucket.text(key)
+		return "(none)" when value is none
+		return value
+	}
+
+	// A generator of numbers that is the same on every run.
+	type Dice {
+		state uint32
+
+		def new(seed int) {
+			state = uint32(seed)
+		}
+
+		def roll(below int) int {
+			state = state ^ (state << 13)
+			state = state ^ (state >> 17)
+			state = state ^ (state << 5)
+			return int(state) % below
+		}
+	}
+
+	// Text of `length` characters that depends on `seed`.
+	def filler(seed int, length int) string {
+		let unit = "{seed}-abcdefghijklmnopqrstuvwxyz-"
+		return unit.repeat(length / unit.len() + 1).slice(0, length)
+	}
+
+	// Every key and value of a bucket, in cursor order, as `key=value`
+	// lines.
+	def dump(bucket Bucket) !string[] {
+		let out string[] = []
+		let cursor = bucket.cursor()
+		let entry = try cursor.first()
+		for {
+			break when entry is none
+			out.push("{string(entry.key)}={string(entry.value)}")
+			entry = try cursor.next()
+		}
+		return out
+	}
+
+	// The same lines from a model map.
+	def expected(model map<string, string>) string[] {
+		let keys = model.keys().sort((a, b string) => a.compare(b) < 0)
+		let out string[] = []
+		for let key in keys {
+			out.push("{key}={model[key]}")
+		}
+		return out
+	}
+
+	def sameLines(a string[], b string[]) bool {
+		return false when a.len() != b.len()
+		for let i = 0; i < a.len(); i++ {
+			return false when a[i] != b[i]
+		}
+		return true
+	}
+
+	// One read transaction over the bucket `b`: "" when every key of the
+	// state it saw holds the same round, `done` once `stop` is among them,
+	// else what was wrong.
+	def look(db Database) !string {
+		let tx = try db.beginTx()
+		let failure ?error = none
+		let lines string[] = []
+		lines = watched(tx) onerror (err error) {
+			failure = err
+			recover lines
+		}
+		tx.rollbackTx()
+		fail failure unless failure is none
+		let round = ""
+		let done = false
+		for let line in lines {
+			let cut = line.indexOf("=")
+			if line.startsWith("stop=") {
+				done = true
+				continue
+			}
+			round = line.slice(cut + 1) when round == ""
+			return "a reader saw {round} and {line} in one state" when line.slice(cut + 1) != round
+		}
+		return done ?? ("done", "")
+	}
+
+	// Looks until the writer says stop. Returns "" or what was wrong.
+	async def watch(db Database) async string {
+		for {
+			let verdict = look(db) onerror (err error) {
+				recover "a read failed: {err.message}"
+			}
+			return "" when verdict == "done"
+			return verdict when verdict != ""
+		}
+		return "the loop ended"
+	}
+
+	def watched(tx Transaction) !string[] {
+		let bucket = try tx.bucket("b")
+		let nothing string[] = []
+		return nothing when bucket is none
+		return try dump(bucket)
+	}
+
+	check "Database" {
+		@test()
+		def TestPutGetReopen() !none {
+			let path = scratch("basic")
+			let db = try open(path)
+			try db.write(def (tx Transaction) !none {
+				assert tx.writable()
+				let users = try tx.createBucket("users")
+				try users.put("ana", "ana@example.com")
+				try users.put("bob", "bob@example.com".bytes())
+				try users.put("empty", "")
+				assert (try textOf(users, "ana")) == "ana@example.com"
+				return none
+			})
+			try db.read(def (tx Transaction) !none {
+				assert !tx.writable()
+				let users = try tx.bucket("users")
+				fail "no bucket" when users is none
+				assert (try textOf(users, "bob")) == "bob@example.com"
+				assert (try textOf(users, "empty")) == ""
+				assert (try users.get("carol")) is none
+				assert try users.has("ana")
+				assert !(try users.has("carol"))
+				assert (try users.count()) == 3
+				assert (try tx.bucket("nobody")) is none
+				assert (try tx.buckets()).join(",") == "users"
+				return none
+			})
+			assert db.str() == "store.Database({path})"
+			try db.close()
+			try db.close()
+
+			let again = try open(path)
+			try again.write(def (tx Transaction) !none {
+				let users = try tx.createBucket("users")
+				assert (try textOf(users, "ana")) == "ana@example.com"
+				try users.delete("bob")
+				try users.delete("never-there")
+				try users.put("ana", "ana@example.org")
+				return none
+			})
+			try again.read(def (tx Transaction) !none {
+				let users = try tx.bucket("users")
+				fail "no bucket" when users is none
+				assert (try dump(users)).join(";") == "ana=ana@example.org;empty="
+				return none
+			})
+			let stats = try again.stats()
+			assert stats.pageSize == 4096
+			assert stats.commits == 2
+			assert stats.size == stats.pages * 4096
+			try again.close()
+			try os.remove(path)
+			return none
+		}
+
+		@test()
+		def TestAgainstAModel() !none {
+			let path = scratch("model")
+			let db = try open(path, Options{sync: false})
+			let model map<string, string>
+			let dice = new Dice(20261007)
+			for let round = 0; round < 60; round++ {
+				let tx = try db.beginTx(true)
+				let bucket = try tx.createBucket("data")
+				for let step = 0; step < 250; step++ {
+					let key = "key-{dice.roll(3000).str().padStart(5, "0")}"
+					let action = dice.roll(10)
+					if action < 3 {
+						try bucket.delete(key)
+						model.delete(key)
+						continue
+					}
+					let length = dice.roll(400)
+					// Now and then a value of several pages.
+					length = 5000 + dice.roll(9000) when dice.roll(60) == 0
+					let value = filler(round * 1000 + step, length)
+					try bucket.put(key, value)
+					model.set(key, value)
+				}
+				// A round in four is thrown away.
+				if round % 4 == 3 {
+					tx.rollbackTx()
+					let seen = try db.beginTx()
+					let kept = try seen.bucket("data")
+					fail "no bucket" when kept is none
+					model = new map<string, string>()
+					for let line in try dump(kept) {
+						let cut = line.indexOf("=")
+						model.set(line.slice(0, cut), line.slice(cut + 1))
+					}
+					seen.rollbackTx()
+					continue
+				}
+				assert sameLines(try dump(bucket), expected(model))
+				try tx.commitTx()
+				if round % 10 == 9 {
+					try db.close()
+					db = try open(path, Options{sync: false})
+				}
+				let check_ = try db.beginTx()
+				let stored = try check_.bucket("data")
+				fail "no bucket" when stored is none
+				assert sameLines(try dump(stored), expected(model))
+				check_.rollbackTx()
+			}
+			assert model.len() > 1000
+			// Emptying the bucket key by key leaves a tree of one page.
+			try db.write(def (tx Transaction) !none {
+				let bucket = try tx.createBucket("data")
+				let cursor = bucket.cursor()
+				let entry = try cursor.first()
+				for {
+					break when entry is none
+					try bucket.delete(entry.key)
+					entry = try cursor.next()
+				}
+				assert (try bucket.count()) == 0
+				return none
+			})
+			let stats = try db.stats()
+			assert stats.pages - stats.freePages < 12
+			try db.close()
+			try os.remove(path)
+			return none
+		}
+
+		@test()
+		def TestLargeValues() !none {
+			let path = scratch("large")
+			let db = try open(path)
+			let big = filler(7, 3 * 1024 * 1024)
+			try db.write(def (tx Transaction) !none {
+				let files = try tx.createBucket("files")
+				try files.put("a", "small")
+				try files.put("big", big)
+				try files.put("z", "small too")
+				return none
+			})
+			try db.close()
+			db = try open(path)
+			try db.write(def (tx Transaction) !none {
+				let files = try tx.createBucket("files")
+				let back = try files.text("big")
+				fail "no value" when back is none
+				assert back.len() == big.len()
+				assert back == big
+				assert (try textOf(files, "a")) == "small"
+				try files.put("big", "now small")
+				return none
+			})
+			// The pages of the big value are free again.
+			let stats = try db.stats()
+			assert stats.freePages > 700
+			try db.read(def (tx Transaction) !none {
+				let files = try tx.bucket("files")
+				fail "no bucket" when files is none
+				assert (try dump(files)).join(";") == "a=small;big=now small;z=small too"
+				return none
+			})
+			try db.close()
+			try os.remove(path)
+			return none
+		}
+
+		@test()
+		def TestRollback() !none {
+			let path = scratch("rollback")
+			let db = try open(path)
+			try db.write(def (tx Transaction) !none {
+				try (try tx.createBucket("kept")).put("k", "v")
+				return none
+			})
+			let message = ""
+			db.write(def (tx Transaction) !none {
+				let kept = try tx.createBucket("kept")
+				try kept.put("k", "changed")
+				try kept.put("more", "data")
+				try tx.createBucket("dropped")
+				fail "the body gave up"
+			}) onerror (err error) {
+				message = err.message
+				recover none
+			}
+			assert message == "the body gave up"
+			try db.read(def (tx Transaction) !none {
+				assert (try tx.buckets()).join(",") == "kept"
+				let kept = try tx.bucket("kept")
+				fail "no bucket" when kept is none
+				assert (try dump(kept)).join(";") == "k=v"
+				return none
+			})
+			// The writer is free again after a failed body.
+			try db.write(def (tx Transaction) !none {
+				try (try tx.createBucket("kept")).put("k", "v2")
+				return none
+			})
+			try db.close()
+			try os.remove(path)
+			return none
+		}
+
+		@test()
+		def TestReadersKeepTheirState() !none {
+			let path = scratch("snapshot")
+			let db = try open(path, Options{sync: false})
+			try db.write(def (tx Transaction) !none {
+				let bucket = try tx.createBucket("b")
+				for let i = 0; i < 500; i++ {
+					try bucket.put("k{i.str().padStart(4, "0")}", "first")
+				}
+				return none
+			})
+			let reader = try db.beginTx()
+			// Twenty commits rewrite every page the reader stands on.
+			for let round = 0; round < 20; round++ {
+				try db.write(def (tx Transaction) !none {
+					let bucket = try tx.createBucket("b")
+					for let i = 0; i < 500; i++ {
+						try bucket.put("k{i.str().padStart(4, "0")}", "round {round}")
+					}
+					try bucket.put("new-{round}", "x")
+					return none
+				})
+			}
+			let old = try reader.bucket("b")
+			fail "no bucket" when old is none
+			let lines = try dump(old)
+			assert lines.len() == 500
+			for let line in lines {
+				assert line.endsWith("=first")
+			}
+			let grown = try db.stats()
+			reader.rollbackTx()
+			reader.rollbackTx()
+			// With the reader gone its pages are used again: the file stops
+			// growing.
+			for let round = 0; round < 20; round++ {
+				try db.write(def (tx Transaction) !none {
+					let bucket = try tx.createBucket("b")
+					for let i = 0; i < 500; i++ {
+						try bucket.put("k{i.str().padStart(4, "0")}", "again {round}")
+					}
+					return none
+				})
+			}
+			let settled = try db.stats()
+			assert settled.pages <= grown.pages
+			try db.read(def (tx Transaction) !none {
+				let bucket = try tx.bucket("b")
+				fail "no bucket" when bucket is none
+				assert (try textOf(bucket, "k0499")) == "again 19"
+				assert (try bucket.count()) == 520
+				return none
+			})
+			try db.close()
+			try os.remove(path)
+			return none
+		}
+
+		@test()
+		def TestNestedBuckets() !none {
+			let path = scratch("nested")
+			let db = try open(path)
+			try db.write(def (tx Transaction) !none {
+				let shop = try tx.createBucket("shop")
+				let orders = try shop.createBucket("orders")
+				let lines = try orders.createBucket("lines")
+				assert (try orders.nextSequence()) == 1
+				assert (try orders.nextSequence()) == 2
+				try orders.put("0002", "two")
+				for let i = 0; i < 2000; i++ {
+					try lines.put("line-{i.str().padStart(5, "0")}", filler(i, 60))
+				}
+				try shop.put("name", "corner shop")
+				try tx.createBucket("other")
+				return none
+			})
+			try db.close()
+			db = try open(path)
+			let before = try db.stats()
+			try db.write(def (tx Transaction) !none {
+				assert (try tx.buckets()).join(",") == "other,shop"
+				let shop = try tx.createBucket("shop")
+				let orders = try shop.bucket("orders")
+				fail "no bucket" when orders is none
+				assert (try orders.nextSequence()) == 3
+				assert (try orders.sequence()) == 3
+				try orders.sequence(40)
+				assert (try orders.nextSequence()) == 41
+				let lines = try orders.bucket("lines")
+				fail "no bucket" when lines is none
+				assert (try lines.count()) == 2000
+				assert (try textOf(lines, "line-01999")) == filler(1999, 60)
+				// A bucket is not a value, and a value is not a bucket.
+				assert (try shop.get("orders")) is none
+				let kind = ErrorKind.Storage
+				shop.put("orders", "x") onerror (err error) {
+					kind = kindOfFailure(err)
+					recover none
+				}
+				assert kind == ErrorKind.Exists
+				kind = ErrorKind.Storage
+				shop.delete("orders") onerror (err error) {
+					kind = kindOfFailure(err)
+					recover none
+				}
+				assert kind == ErrorKind.Exists
+				kind = ErrorKind.Storage
+				shop.bucket("name") onerror (err error) {
+					kind = kindOfFailure(err)
+					recover none
+				}
+				assert kind == ErrorKind.Exists
+				let listing = shop.cursor()
+				let first = try listing.first()
+				fail "no entry" when first is none
+				assert string(first.key) == "name" && !first.bucket
+				let second = try listing.next()
+				fail "no entry" when second is none
+				assert string(second.key) == "orders" && second.bucket && second.value.len() == 0
+				return none
+			})
+			try db.write(def (tx Transaction) !none {
+				let shop = try tx.createBucket("shop")
+				try shop.deleteBucket("orders")
+				try shop.deleteBucket("orders")
+				assert (try shop.bucket("orders")) is none
+				// Made again in the same transaction, it starts empty.
+				let orders = try shop.createBucket("orders")
+				assert (try orders.count()) == 0
+				assert (try orders.nextSequence()) == 1
+				try tx.deleteBucket("other")
+				return none
+			})
+			let after = try db.stats()
+			assert after.freePages > before.freePages + 40
+			try db.read(def (tx Transaction) !none {
+				assert (try tx.buckets()).join(",") == "shop"
+				return none
+			})
+			try db.close()
+			try os.remove(path)
+			return none
+		}
+
+		@test()
+		def TestCursor() !none {
+			let path = scratch("cursor")
+			let db = try open(path, Options{sync: false})
+			try db.write(def (tx Transaction) !none {
+				let bucket = try tx.createBucket("b")
+				for let i = 0; i < 3000; i += 2 {
+					try bucket.put("k{i.str().padStart(4, "0")}", "v{i}")
+				}
+				return none
+			})
+			try db.read(def (tx Transaction) !none {
+				let bucket = try tx.bucket("b")
+				fail "no bucket" when bucket is none
+				let cursor = bucket.cursor()
+				let entry = try cursor.seek("k1001")
+				fail "no entry" when entry is none
+				assert string(entry.key) == "k1002"
+				entry = try cursor.previous()
+				fail "no entry" when entry is none
+				assert string(entry.key) == "k1000"
+				entry = try cursor.last()
+				fail "no entry" when entry is none
+				assert string(entry.key) == "k2998"
+				assert (try cursor.next()) is none
+				entry = try cursor.first()
+				fail "no entry" when entry is none
+				assert string(entry.key) == "k0000"
+				assert (try cursor.previous()) is none
+				assert (try cursor.seek("zzz")) is none
+				// Backwards over every leaf.
+				let count = 0
+				let back = bucket.cursor()
+				let at = try back.previous()
+				let last = "~"
+				for {
+					break when at is none
+					assert string(at.key).compare(last) < 0
+					last = string(at.key)
+					count++
+					at = try back.previous()
+				}
+				assert count == 1500
+				// Only the keys with a prefix.
+				let some = 0
+				let walk = bucket.cursor()
+				let hit = try walk.seek("k12")
+				for {
+					break when hit is none || !string(hit.key).startsWith("k12")
+					some++
+					hit = try walk.next()
+				}
+				assert some == 50
+				return none
+			})
+			// Deleting and adding while the cursor walks.
+			try db.write(def (tx Transaction) !none {
+				let bucket = try tx.createBucket("b")
+				let cursor = bucket.cursor()
+				let entry = try cursor.first()
+				let visited = 0
+				for {
+					break when entry is none
+					visited++
+					let key = string(entry.key)
+					try bucket.delete(key) when visited % 3 == 0
+					try bucket.put("a-before-{visited}", "x") when visited % 500 == 0
+					entry = try cursor.next()
+				}
+				assert visited == 1500
+				assert (try bucket.count()) == 1003
+				return none
+			})
+			try db.close()
+			try os.remove(path)
+			return none
+		}
+
+		@test()
+		def TestBulkLoad() !none {
+			let path = scratch("bulk")
+			let db = try open(path, Options{sync: false})
+			let dice = new Dice(77)
+			// One transaction writes far more than a node holds.
+			try db.write(def (tx Transaction) !none {
+				let ordered = try tx.createBucket("ordered")
+				let scattered = try tx.createBucket("scattered")
+				for let i = 0; i < 60000; i++ {
+					try ordered.put("k{i.str().padStart(7, "0")}", "value {i}")
+					try scattered.put("r{dice.roll(100000000).str().padStart(9, "0")}-{i}", "v{i}")
+				}
+				assert (try textOf(ordered, "k0059999")) == "value 59999"
+				return none
+			})
+			try db.close()
+			db = try open(path)
+			try db.read(def (tx Transaction) !none {
+				let ordered = try tx.bucket("ordered")
+				fail "no bucket" when ordered is none
+				assert (try ordered.count()) == 60000
+				assert (try textOf(ordered, "k0000000")) == "value 0"
+				assert (try textOf(ordered, "k0031337")) == "value 31337"
+				assert (try textOf(ordered, "k0060000")) == "(none)"
+				let scattered = try tx.bucket("scattered")
+				fail "no bucket" when scattered is none
+				let cursor = scattered.cursor()
+				let entry = try cursor.first()
+				let last = ""
+				let count = 0
+				for {
+					break when entry is none
+					let key = string(entry.key)
+					assert key.compare(last) > 0
+					last = key
+					count++
+					entry = try cursor.next()
+				}
+				assert count == 60000
+				return none
+			})
+			// Sequential keys fill their pages: about 24 bytes an entry.
+			let stats = try db.stats()
+			assert stats.size < 60000 * 2 * 40
+			try db.close()
+			try os.remove(path)
+			return none
+		}
+
+		@test()
+		def TestReadersBesideAWriter() !none {
+			let path = scratch("tasks")
+			let db = try open(path, Options{sync: false})
+			try db.write(def (tx Transaction) !none {
+				let bucket = try tx.createBucket("b")
+				for let i = 0; i < 300; i++ {
+					try bucket.put("k{i.str().padStart(3, "0")}", "round 0")
+				}
+				return none
+			})
+			let watchers array<async string> = []
+			for let i = 0; i < 4; i++ {
+				watchers.push(watch(db))
+			}
+			for let round = 1; round <= 150; round++ {
+				try db.write(def (tx Transaction) !none {
+					let bucket = try tx.createBucket("b")
+					for let i = 0; i < 300; i++ {
+						try bucket.put("k{i.str().padStart(3, "0")}", "round {round}")
+					}
+					return none
+				})
+			}
+			try db.write(def (tx Transaction) !none {
+				try (try tx.createBucket("b")).put("stop", "now")
+				return none
+			})
+			for let watcher in watchers {
+				let outcome = await watcher
+				assert outcome == ""
+			}
+			try db.close()
+			try os.remove(path)
+			return none
+		}
+
+		@test()
+		def TestRefusals() !none {
+			let path = scratch("refusals")
+			let db = try open(path)
+			try db.write(def (tx Transaction) !none {
+				try (try tx.createBucket("b")).put("k", "v")
+				return none
+			})
+			let kind = ErrorKind.Storage
+			db.read(def (tx Transaction) !none {
+				let bucket = try tx.bucket("b")
+				fail "no bucket" when bucket is none
+				try bucket.put("k", "nope")
+				return none
+			}) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.ReadOnly
+			kind = ErrorKind.Storage
+			db.write(def (tx Transaction) !none {
+				let bucket = try tx.createBucket("b")
+				let nothing byte[] = []
+				try bucket.put(nothing, "v".bytes())
+				return none
+			}) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.Argument
+
+			// A transaction that ended, and what came out of it.
+			let tx = try db.beginTx(true)
+			let bucket = try tx.createBucket("b")
+			let cursor = bucket.cursor()
+			try tx.commitTx()
+			kind = ErrorKind.Storage
+			bucket.get("k") onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.Closed
+			kind = ErrorKind.Storage
+			cursor.first() onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.Closed
+			kind = ErrorKind.Storage
+			tx.commitTx() onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.Closed
+
+			// The file belongs to this Database while it is open.
+			kind = ErrorKind.Storage
+			open(path) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover db
+			}
+			assert kind == ErrorKind.Busy
+			try db.close()
+			kind = ErrorKind.Storage
+			db.beginTx() onerror (err error) {
+				kind = kindOfFailure(err)
+				recover tx
+			}
+			assert kind == ErrorKind.Closed
+
+			// Read-only: readers share the file and cannot write.
+			let one = try open(path, Options{readOnly: true})
+			let two = try open(path, Options{readOnly: true})
+			try two.read(def (seen Transaction) !none {
+				let b = try seen.bucket("b")
+				fail "no bucket" when b is none
+				assert (try textOf(b, "k")) == "v"
+				return none
+			})
+			kind = ErrorKind.Storage
+			one.beginTx(true) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover tx
+			}
+			assert kind == ErrorKind.ReadOnly
+			try one.close()
+			try two.close()
+
+			kind = ErrorKind.Storage
+			open(path, Options{pageSize: 5000}) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover db
+			}
+			assert kind == ErrorKind.Argument
+			try os.writeFile(path, "this is not a database, it is a text file of some length".bytes())
+			kind = ErrorKind.Storage
+			open(path) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover db
+			}
+			assert kind == ErrorKind.Corrupt
+			try os.remove(path)
+			return none
+		}
+
+		@test()
+		def TestTornCommit() !none {
+			let path = scratch("torn")
+			let db = try open(path)
+			try db.write(def (tx Transaction) !none {
+				let bucket = try tx.createBucket("b")
+				for let i = 0; i < 300; i++ {
+					try bucket.put("k{i.str().padStart(3, "0")}", "before")
+				}
+				return none
+			})
+			try db.write(def (tx Transaction) !none {
+				let bucket = try tx.createBucket("b")
+				for let i = 0; i < 300; i++ {
+					try bucket.put("k{i.str().padStart(3, "0")}", "after")
+				}
+				return none
+			})
+			let commits = (try db.stats()).commits
+			try db.close()
+			// The power fails while the last commit's meta page is being
+			// written: half of it is on the device.
+			let file = try os.open(path, "r+")
+			let torn byte[] = []
+			torn.len(40)
+			torn.fill(byte(0xEE))
+			try file.writeAt(torn, ((commits + 1) % 2) * 4096 + 20)
+			try file.close()
+			db = try open(path)
+			assert (try db.stats()).commits == commits - 1
+			try db.write(def (tx Transaction) !none {
+				let bucket = try tx.createBucket("b")
+				let lines = try dump(bucket)
+				assert lines.len() == 300
+				for let line in lines {
+					assert line.endsWith("=before")
+				}
+				// And the database goes on from there.
+				try bucket.put("k000", "recovered")
+				return none
+			})
+			try db.close()
+			db = try open(path)
+			try db.read(def (tx Transaction) !none {
+				let bucket = try tx.bucket("b")
+				fail "no bucket" when bucket is none
+				assert (try textOf(bucket, "k000")) == "recovered"
+				assert (try textOf(bucket, "k299")) == "before"
+				return none
+			})
+			try db.close()
+
+			// A damaged data page is found by its checksum, not returned.
+			let size = (try os.stat(path)).size
+			let harm = try os.open(path, "r+")
+			let junk byte[] = []
+			junk.len(int(size) - 8192)
+			junk.fill(byte(0x5A))
+			try harm.writeAt(junk, 8192)
+			try harm.close()
+			db = open(path) onerror recover db
+			let kind = ErrorKind.Storage
+			db.read(def (tx Transaction) !none {
+				let bucket = try tx.bucket("b")
+				fail "no bucket" when bucket is none
+				try bucket.get("k000")
+				return none
+			}) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.Corrupt || kind == ErrorKind.Closed
+			db.close() onerror recover none
+			try os.remove(path)
+			return none
+		}
+
+		@test()
+		def TestBackupAndCompact() !none {
+			let path = scratch("source")
+			let copy = scratch("backup")
+			let small = scratch("compact")
+			let db = try open(path, Options{sync: false})
+			try db.write(def (tx Transaction) !none {
+				let bucket = try tx.createBucket("b")
+				let inner = try bucket.createBucket("inner")
+				for let i = 0; i < 4000; i++ {
+					try bucket.put("k{i.str().padStart(5, "0")}", filler(i, 200))
+					try inner.put("i{i}", "x") when i % 100 == 0
+				}
+				try inner.nextSequence()
+				return none
+			})
+			try db.write(def (tx Transaction) !none {
+				let bucket = try tx.createBucket("b")
+				for let i = 0; i < 4000; i++ {
+					try bucket.delete("k{i.str().padStart(5, "0")}") when i % 10 != 0
+				}
+				return none
+			})
+			try db.backup(copy)
+			try db.compact(small)
+			let kind = ErrorKind.Storage
+			db.compact(small) onerror (err error) {
+				kind = kindOfFailure(err)
+				recover none
+			}
+			assert kind == ErrorKind.Exists
+			let lines string[] = []
+			try db.read(def (tx Transaction) !none {
+				let bucket = try tx.bucket("b")
+				fail "no bucket" when bucket is none
+				lines = try dump(bucket)
+				return none
+			})
+			assert lines.len() == 401
+			let full = (try db.stats()).size
+			try db.close()
+			for let other in [copy, small] {
+				let twin = try open(other)
+				try twin.write(def (tx Transaction) !none {
+					let bucket = try tx.createBucket("b")
+					assert sameLines(try dump(bucket), lines)
+					let inner = try bucket.bucket("inner")
+					fail "no bucket" when inner is none
+					assert (try inner.count()) == 40
+					assert (try inner.nextSequence()) == 2
+					return none
+				})
+				let size = (try twin.stats()).size
+				assert size == full when other == copy
+				assert size < full / 4 when other == small
+				try twin.close()
+				try os.remove(other)
+			}
+			try os.remove(path)
+			return none
+		}
+	}
+}

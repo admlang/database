@@ -1,0 +1,296 @@
+partial module adm.database.store {
+	use adm.database.store.engine::*
+
+	// Entry is one key of a bucket with its value. A key that names a
+	// nested bucket has `bucket` set and no value.
+	struct Entry {
+		key    byte[]
+		value  byte[]
+		bucket bool
+	}
+
+	// Bucket is a set of keys in byte order, each with a value or a nested
+	// bucket, inside one transaction.
+	//
+	// ```
+	// let visits = try tx.createBucket("visits")
+	// try visits.put("2026-10-07/ana", "3")
+	// let count = try visits.text("2026-10-07/ana")      // ?string
+	// let day = visits.cursor()
+	// let entry = try day.seek("2026-10-07/")
+	// ```
+	//
+	// A key is 1 to 32768 bytes, a value up to 1 GiB. Values come back as
+	// copies: changing one does not change the database.
+	//
+	// Methods fail with a StoreError: ErrorKind.Closed once the
+	// transaction ended, ErrorKind.ReadOnly for a write in a read
+	// transaction, and as `Database` methods do.
+	type Bucket {
+		name          string
+		internal tree Tree
+
+		def new(tree Tree, name string) {
+			self.tree = tree
+			self.name = name
+		}
+
+		// The value under a key; none when there is none, or when the key
+		// names a nested bucket. Fails as the type says.
+		def get(key byte[]) !?byte[] {
+			try alive()
+			let found = try tree.lookup(key)
+			return none when found is none || found.flag == flagBucket
+			return found.value.clone()
+		}
+
+		// The value under a text key. Fails as `get` of bytes does.
+		def get(key string) !?byte[] {
+			return try get(key.bytes())
+		}
+
+		// The value under a key as text; none as `get`. Fails as the type
+		// says.
+		def text(key string) !?string {
+			let value = try get(key.bytes())
+			return none when value is none
+			return string(value)
+		}
+
+		// Whether the key holds a value. Fails as the type says.
+		def has(key byte[]) !bool {
+			try alive()
+			let found = try tree.lookup(key)
+			return !(found is none || found.flag == flagBucket)
+		}
+
+		// Whether the text key holds a value. Fails as the type says.
+		def has(key string) !bool {
+			return try has(key.bytes())
+		}
+
+		// put stores a value under a key, replacing the one there.
+		// Fails as the type says, with ErrorKind.Argument for an empty key
+		// or a key or value over the limit, and ErrorKind.Exists when the
+		// key names a nested bucket.
+		def put(key byte[], value byte[]) !none {
+			try alive(true)
+			fail errorOf(ErrorKind.Argument, "store: a key cannot be empty") when key.len() == 0
+			fail errorOf(ErrorKind.Argument, "store: a key of {key.len()} bytes is over the limit of {maxKeySize}") when key.len() > maxKeySize
+			fail errorOf(ErrorKind.Argument, "store: a value of {value.len()} bytes is over the limit of {maxValueSize}") when value.len() > maxValueSize
+			return try tree.store(key.clone(), value.clone(), 0)
+		}
+
+		// put stores bytes under a text key. Fails as `put` of bytes does.
+		def put(key string, value byte[]) !none {
+			return try put(key.bytes(), value)
+		}
+
+		// put stores text under a text key. Fails as `put` of bytes does.
+		def put(key string, value string) !none {
+			return try put(key.bytes(), value.bytes())
+		}
+
+		// delete removes a key; one that is not there is not an error.
+		// Fails as the type says, and with ErrorKind.Exists when the key
+		// names a nested bucket (`deleteBucket` removes those).
+		def delete(key byte[]) !none {
+			try alive(true)
+			let found = try tree.lookup(key)
+			return none when found is none
+			fail errorOf(ErrorKind.Exists, "store: '{string(key)}' is a bucket, not a value") when found.flag == flagBucket
+			try tree.remove(key)
+			return none
+		}
+
+		// delete removes a text key. Fails as `delete` of bytes does.
+		def delete(key string) !none {
+			return try delete(key.bytes())
+		}
+
+		// The bucket nested under that name; none when there is none.
+		// Fails as the type says, and with ErrorKind.Exists when the name
+		// holds a value.
+		def bucket(name string) !?Bucket {
+			try alive()
+			let nested = try tree.child(name.bytes())
+			return none when nested is none
+			return new Bucket(nested, name)
+		}
+
+		// createBucket makes a nested bucket, or returns the one that
+		// exists. Fails as `bucket` does, and with ErrorKind.Argument for
+		// an empty name.
+		def createBucket(name string) !Bucket {
+			try alive(true)
+			fail errorOf(ErrorKind.Argument, "store: a bucket needs a name") when name == ""
+			return new Bucket(try tree.grow(name.bytes()), name)
+		}
+
+		// deleteBucket removes a nested bucket with everything in it; one
+		// that is not there is not an error. Fails as `bucket` does.
+		def deleteBucket(name string) !none {
+			try alive(true)
+			try tree.prune(name.bytes())
+			return none
+		}
+
+		// nextSequence returns the next number of the bucket's own counter,
+		// from 1: an id for a new record. The counter is stored with the
+		// bucket.
+		// Fails as the type says.
+		def nextSequence() !int {
+			try alive(true)
+			tree.sequence++
+			tree.changed = true
+			return tree.sequence
+		}
+
+		// The last number `nextSequence` returned; 0 before the first.
+		// Fails as the type says.
+		def sequence() !int {
+			try alive()
+			return tree.sequence
+		}
+
+		// Sets the counter `nextSequence` goes on from.
+		// Fails as the type says.
+		def sequence(value int) !none {
+			try alive(true)
+			return none when tree.sequence == value
+			tree.sequence = value
+			tree.changed = true
+			return none
+		}
+
+		// How many keys the bucket holds, nested buckets among them. It
+		// walks the bucket.
+		// Fails as the type says.
+		def count() !int {
+			try alive()
+			let walker = new Walker(tree)
+			let total = 0
+			let more = try walker.first()
+			for more {
+				total++
+				more = try walker.next()
+			}
+			return total
+		}
+
+		// A cursor over the bucket's keys.
+		def cursor() Cursor {
+			return new Cursor(tree)
+		}
+
+		// Names the bucket.
+		def str() string {
+			return "store.Bucket({name})"
+		}
+
+		internal def alive(writing bool = false) !none {
+			fail errorOf(ErrorKind.Closed, "store: the transaction has ended") when tree.state.closed
+			fail errorOf(ErrorKind.Closed, "store: the bucket {name} was deleted") when tree.dropped
+			fail errorOf(ErrorKind.ReadOnly, "store: a read transaction cannot write") when writing && !tree.state.writable
+			return none
+		}
+	}
+
+	// Cursor walks the keys of a bucket in byte order, forwards or
+	// backwards. Each move returns the entry it lands on, or none past
+	// either end.
+	//
+	// ```
+	// let cursor = bucket.cursor()
+	// let entry = try cursor.seek("2026-10-")
+	// for {
+	//     break when entry is none || !string(entry.key).startsWith("2026-10-")
+	//     print("{string(entry.key)} = {string(entry.value)}")
+	//     entry = try cursor.next()
+	// }
+	// ```
+	//
+	// A write in the same transaction does not break a cursor: its next
+	// move goes on from the key it stands on, whether that key is still
+	// there or not.
+	//
+	// Moves fail with a StoreError as `Bucket` methods do.
+	type Cursor {
+		internal tree    Tree
+		internal walker  Walker
+		// The key the cursor stands on, and the edit count of the bucket
+		// when it got there.
+		internal current byte[]
+		internal seen    int
+		internal placed  bool
+
+		def new(tree Tree) {
+			self.tree = tree
+			walker = new Walker(tree)
+		}
+
+		// Goes to the first key. Fails as the type says.
+		def first() !?Entry {
+			try alive()
+			return try landed(try walker.first())
+		}
+
+		// Goes to the last key. Fails as the type says.
+		def last() !?Entry {
+			try alive()
+			return try landed(try walker.last())
+		}
+
+		// Goes to the first key that is not below `key`. Fails as the type says.
+		def seek(key byte[]) !?Entry {
+			try alive()
+			return try landed(try walker.seek(key))
+		}
+
+		// Goes to the first key that is not below the text key. Fails as the type says.
+		def seek(key string) !?Entry {
+			return try seek(key.bytes())
+		}
+
+		// Goes to the next key; to the first one on a cursor that has not
+		// moved yet. Fails as the type says.
+		def next() !?Entry {
+			try alive()
+			return try first() unless placed
+			if seen != tree.edits {
+				let there = try walker.seek(current)
+				return try landed(there) unless there && compareKeys(walker.key(), current) == 0
+			}
+			return try landed(try walker.next())
+		}
+
+		// Goes to the key before; to the last one on a cursor that has not
+		// moved yet. Fails as the type says.
+		def previous() !?Entry {
+			try alive()
+			return try last() unless placed
+			if seen != tree.edits {
+				let there = try walker.seek(current)
+				return try landed(try walker.last()) unless there
+			}
+			return try landed(try walker.previous())
+		}
+
+		internal def landed(there bool) !?Entry {
+			placed = true
+			seen = tree.edits
+			return none unless there
+			current = walker.key().clone()
+			let nested = walker.flag() == flagBucket
+			let value byte[] = []
+			value = walker.value().clone() unless nested
+			return Entry{key: current.clone(), value: value, bucket: nested}
+		}
+
+		internal def alive() !none {
+			fail errorOf(ErrorKind.Closed, "store: the transaction has ended") when tree.state.closed
+			fail errorOf(ErrorKind.Closed, "store: the bucket was deleted") when tree.dropped
+			return none
+		}
+	}
+}

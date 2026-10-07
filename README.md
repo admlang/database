@@ -11,6 +11,12 @@ or a new protocol version ships without a std release.
 | [`adm.database.postgres`](postgres/) | PostgreSQL | the wire protocol (3.0), written in ADM | `postgres:`, `postgresql:` |
 | [`adm.database.mysql`](mysql/) | MySQL, MariaDB | the client/server protocol, written in ADM | `mysql:`, `mariadb:` |
 
+One library is a database of its own rather than a driver:
+
+| Library | What it is |
+|---|---|
+| [`adm.database.store`](store/) | an embedded key-value database written in ADM: one file, ordered buckets, crash-safe transactions; its own API, not `std.data.db` |
+
 ## Use
 
 Install the driver for your database, for example:
