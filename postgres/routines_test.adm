@@ -1,0 +1,174 @@
+// Stored routines and migrations on PostgreSQL; without ADM_TEST_POSTGRES
+// they pass without running.
+partial module adm.database.postgres {
+	use (
+		std.testing
+		std.data.db
+		std.time
+		std.services::(migration)
+		std.services.database::(Database, db)
+	)
+
+	struct Scored {
+		id    int
+		name  string
+		score int
+	}
+
+	// The table the routines read, made by a migration script; a dollar
+	// quoted body holds a `;` that does not end its statement.
+	@migration(from = "0.0.1", db = "pgroutines")
+	sql def createScored() !none {
+		CREATE SCHEMA IF NOT EXISTS analytics;
+		DROP TABLE IF EXISTS scored;
+		CREATE TABLE scored (id bigint PRIMARY KEY, name text NOT NULL, score bigint NOT NULL);
+		CREATE OR REPLACE FUNCTION bumped(x bigint) RETURNS bigint LANGUAGE sql AS $$ SELECT x + 1; $$;
+	}
+
+	// A type whose calls run on its property; `@db` names where the
+	// routine is installed.
+	type Reports {
+		@db.connection()
+		conn db.Queryable
+
+		def new(conn db.Queryable) {
+			self.conn = conn
+		}
+
+		@db("pgroutines")
+		sql def topScored(n int) !Scored[] {
+			BEGIN
+				RETURN QUERY SELECT id, name, score FROM scored ORDER BY score DESC LIMIT n;
+			END
+		}
+	}
+
+	@db("pgroutines")
+	sql def scoredCount(minimum int) !int {
+		DECLARE
+			total bigint;
+		BEGIN
+			SELECT count(*) INTO total FROM scored WHERE score >= minimum;
+			RETURN total;
+		END
+	}
+
+	@db("pgroutines")
+	sql def addScored(id int, name string, score int) !none {
+		BEGIN
+			INSERT INTO scored (id, name, score) VALUES (id, name, score);
+		END
+	}
+
+	@db("pgroutines")
+	sql def bestName() !?string {
+		BEGIN
+			RETURN (SELECT name FROM scored ORDER BY score DESC LIMIT 1);
+		END;
+	}
+
+	// Created as analytics.scored_total, called by that name.
+	@db("pgroutines")
+	@db.routine(name = "scored_total", schema = "analytics")
+	sql def scoredTotal() !int {
+		BEGIN
+			RETURN (SELECT coalesce(sum(score), 0) FROM scored);
+		END
+	}
+
+	def routineOid(q db.Queryable, name string) !int {
+		let rows = try q.query("SELECT oid::bigint FROM pg_proc WHERE proname = $1", name)
+		defer rows.close()
+		fail "no routine {name}" unless try rows.next()
+		return rows.int(0)
+	}
+
+	// Takes the migration lock on a connection of its own and reports how
+	// long it waited for it.
+	def lockedAfter(key string) !duration {
+		let conn = try db.connect(serverURL())
+		let started = time.now()
+		try dialect.lockMigrations(conn, key)
+		let waited = time.since(started)
+		try dialect.unlockMigrations(conn, key)
+		try conn.close()
+		return waited
+	}
+
+	check "Stored routines" {
+		@test()
+		def TestRoutinesInstallWithTheMigrations() !none {
+			return none when testServer == ""
+			try await Database.start()
+			try Database.add("pgroutines", serverURL(), versions = "adm_versions")
+			let pool = try Database.get("pgroutines")
+			// The server keeps what an earlier run left.
+			try pool.exec("DELETE FROM scored")
+
+			try addScored(1, "Ana", 9)
+			try addScored(2, "Bob", 4)
+			try addScored(3, "Cy", 7)
+			assert try scoredCount(5) == 2
+			let best = try bestName()
+			fail "no best name" when best is none
+			assert best == "Ana"
+			let top = try new Reports(pool).topScored(2)
+			assert top.len() == 2
+			assert top[0].name == "Ana"
+			assert top[1].score == 7
+			assert try scoredTotal() == 20
+			let placed = try pool.query("SELECT n.nspname FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE p.proname = 'scored_total'")
+			assert try placed.next()
+			assert try placed.string(0) == "analytics"
+			try placed.close()
+
+			let bumped = try pool.query("SELECT bumped(41)")
+			assert try bumped.next()
+			assert try bumped.int(0) == 42
+			try bumped.close()
+
+			// Added again: the routines are there with the same body and
+			// are not created again.
+			let before = try routineOid(pool, "topscored")
+			try Database.remove("pgroutines")
+			try Database.add("pgroutines", serverURL(), versions = "adm_versions")
+			assert try routineOid(try Database.get("pgroutines"), "topscored") == before
+			assert try scoredCount(0) == 3
+			try Database.remove("pgroutines")
+		}
+
+		@test()
+		def TestRoutineInATransactionBlock() !none {
+			return none when testServer == ""
+			try await Database.start()
+			try Database.add("pgroutines", serverURL(), versions = "adm_versions")
+			try (try Database.get("pgroutines")).exec("DELETE FROM scored")
+			transaction {
+				try addScored(10, "Dee", 1)
+				try scoredCount(0)
+				fail "roll back"
+			} onerror recover none
+			assert try scoredCount(0) == 0
+			try Database.remove("pgroutines")
+		}
+
+		// The migration lock keeps a second session waiting until the
+		// first releases it.
+		@test()
+		def TestMigrationLockWaits() !none {
+			return none when testServer == ""
+			let first = try db.connect(serverURL())
+			try dialect.lockMigrations(first, "adm.migrations/locktest")
+			let second = async lockedAfter("adm.migrations/locktest")
+			time.sleep(300ms)
+			try dialect.unlockMigrations(first, "adm.migrations/locktest")
+			let waited = try await second
+			assert waited >= 200ms
+			// Another program's key does not wait.
+			try dialect.lockMigrations(first, "adm.migrations/locktest")
+			assert try lockedAfter("adm.migrations/other") < 200ms
+			try dialect.unlockMigrations(first, "adm.migrations/locktest")
+			try first.close()
+		}
+	}
+}

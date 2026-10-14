@@ -1,0 +1,246 @@
+partial module adm.database.sqlite {
+	use (
+		std.testing
+		std.data.db
+		std.os
+		std.services::(migration)
+		std.services.database::(Database, db)
+	)
+
+	// Schema runs scripts: `sql def` bodies of several statements.
+	type Schema {
+		@db.connection()
+		conn db.Queryable
+
+		def new(conn db.Queryable) {
+			self.conn = conn
+		}
+
+		// A trigger's body holds `;` and does not end the statement; a
+		// quoted `;` neither; the placeholder binds in its own statement.
+		sql def create(start int) !none {
+			CREATE TABLE teams (id INTEGER PRIMARY KEY, name TEXT NOT NULL, members INTEGER NOT NULL DEFAULT 0);
+			CREATE TABLE players (id INTEGER PRIMARY KEY, team INTEGER NOT NULL);
+			CREATE TRIGGER joined AFTER INSERT ON players BEGIN
+				UPDATE teams SET members = members + 1 WHERE id = NEW.team;
+			END;
+			-- the first team
+			INSERT INTO teams (id, name) VALUES ({start}, 'default; first');
+		}
+
+		sql def broken() !none {
+			CREATE TABLE kept (id INTEGER);
+			INSERT INTO nowhere VALUES (1);
+		}
+
+		sql def join(team int) !none {
+			INSERT INTO players (team) VALUES ({team})
+		}
+
+		sql def team(id int) !(string, int) {
+			SELECT name, members FROM teams WHERE id = {id}
+		}
+	}
+
+	// Migration steps of the connection "migrated": a script that creates
+	// the schema, then a step calling two `sql def` functions together.
+	@migration(from = "0.0.1", to = "0.0.2", db = "migrated")
+	sql def createLeague() !none {
+		CREATE TABLE league (id INTEGER PRIMARY KEY, name TEXT NOT NULL);
+		INSERT INTO league (id, name) VALUES (1, 'first');
+	}
+
+	@migration(from = "0.0.2", db = "migrated")
+	def growLeague() !none {
+		transaction {
+			try addLeagueTeam(2, "second")
+			try renameLeagueTeam(1, "one")
+		}
+		return none
+	}
+
+	@db("migrated")
+	sql def addLeagueTeam(id int, name string) !none {
+		INSERT INTO league (id, name) VALUES ({id}, {name})
+	}
+
+	@db("migrated")
+	sql def renameLeagueTeam(id int, name string) !none {
+		UPDATE league SET name = {name} WHERE id = {id}
+	}
+
+	@db("migrated")
+	sql def leagueNames() !string[] {
+		SELECT name FROM league ORDER BY id
+	}
+
+	// A step that fails after changing the schema: its transaction is
+	// rolled back.
+	@migration(from = "0.0.1", db = "failing")
+	sql def failingStep() !none {
+		CREATE TABLE half (id INTEGER);
+		INSERT INTO missing VALUES (1);
+	}
+
+	// A step on two connections runs once both are added.
+	@migration(from = "0.0.1", db = ["left", "right"])
+	def linkSides() !none {
+		transaction {
+			try leftTable()
+			try rightTable()
+		}
+		return none
+	}
+
+	@db("left")
+	sql def leftTable() !none {
+		CREATE TABLE side (name TEXT);
+		INSERT INTO side VALUES ('left');
+	}
+
+	@db("right")
+	sql def rightTable() !none {
+		CREATE TABLE side (name TEXT);
+		INSERT INTO side VALUES ('right');
+	}
+
+	// A file in the test's home folder, removed first.
+	def scratchDatabase(name string) !string {
+		let path = os.join(try os.appHome(), name)
+		try os.remove(path, recursive = true)
+		return path
+	}
+
+	def rowCount(q db.Queryable, statement string) !int {
+		let rows = try q.query(statement)
+		defer rows.close()
+		fail "no rows" unless try rows.next()
+		return rows.int(0)
+	}
+
+	check "sql def scripts" {
+		@test()
+		def TestScriptRunsStatementsInOrder() !none {
+			let conn = try open("", Mode.Memory)
+			let schema = new Schema(conn)
+			try schema.create(7)
+			try schema.join(7)
+			try schema.join(7)
+			let (name, members) = try schema.team(7)
+			assert name == "default; first"
+			assert members == 2
+		}
+
+		@test()
+		def TestScriptFailureNamesTheStatement() !none {
+			let conn = try open("", Mode.Memory)
+			let message = ""
+			new Schema(conn).broken() onerror (err error) {
+				message = err.message
+				recover none
+			}
+			assert message.startsWith("statement 2 of 2: ")
+			// Outside a transaction block the first statement stays.
+			assert try rowCount(conn, "SELECT count(*) FROM sqlite_master WHERE name = 'kept'") == 1
+		}
+
+		@test()
+		def TestScriptInsideATransactionBlockRollsBack() !none {
+			let conn = try open("", Mode.Memory)
+			let schema = new Schema(conn)
+			transaction {
+				try schema.broken()
+			} onerror recover none
+			assert try rowCount(conn, "SELECT count(*) FROM sqlite_master WHERE name = 'kept'") == 0
+		}
+	}
+
+	check "database migrations" {
+		@test()
+		def TestStepsRunOnceAndRecordTheVersionInATable() !none {
+			try await Database.start()
+			let path = try scratchDatabase("league.db")
+			try Database.add("migrated", "sqlite:{path}", 2, versions = "adm_versions")
+			assert (try leagueNames()).join(",") == "one,second"
+			let pool = try Database.get("migrated")
+			let rows = try pool.query("SELECT application, version FROM adm_versions")
+			assert try rows.next()
+			assert try rows.string(1) == __app_version__
+			try rows.close()
+
+			// Added again, nothing runs a second time.
+			try Database.remove("migrated")
+			try Database.add("migrated", "sqlite:{path}", 2, versions = "adm_versions")
+			assert (try leagueNames()).join(",") == "one,second"
+			try Database.remove("migrated")
+		}
+
+		@test()
+		def TestVersionInTheHomeFolder() !none {
+			try await Database.start()
+			let path = try scratchDatabase("league-home.db")
+			let marker = os.join(try os.appHome(), "databases", "migrated.version")
+			try os.remove(marker, recursive = true)
+			try Database.add("migrated", "sqlite:{path}")
+			assert (try leagueNames()).join(",") == "one,second"
+			assert string(try os.readFile(marker)) == __app_version__
+			try Database.remove("migrated")
+
+			try Database.add("migrated", "sqlite:{path}")
+			assert (try leagueNames()).join(",") == "one,second"
+			try Database.remove("migrated")
+		}
+
+		@test()
+		def TestFailedStepRollsBackAndKeepsNoConnection() !none {
+			try await Database.start()
+			let path = try scratchDatabase("failing.db")
+			let message = ""
+			Database.add("failing", "sqlite:{path}", versions = "adm_versions") onerror (err error) {
+				message = err.message
+				recover none
+			}
+			assert message.contains("failingStep")
+			assert message.contains("statement 2 of 2")
+			assert !(Database.names().includes("failing"))
+
+			let conn = try open(path)
+			assert try rowCount(conn, "SELECT count(*) FROM sqlite_master WHERE name = 'half'") == 0
+			try conn.close()
+		}
+
+		@test()
+		def TestStepOnTwoConnectionsWaitsForBoth() !none {
+			try await Database.start()
+			let left = try scratchDatabase("left.db")
+			let right = try scratchDatabase("right.db")
+			try Database.add("left", "sqlite:{left}", versions = "adm_versions")
+			let pool = try Database.get("left")
+			assert try rowCount(pool, "SELECT count(*) FROM sqlite_master WHERE name = 'side'") == 0
+
+			try Database.add("right", "sqlite:{right}", versions = "adm_versions")
+			assert try rowCount(try Database.get("left"), "SELECT count(*) FROM side") == 1
+			assert try rowCount(try Database.get("right"), "SELECT count(*) FROM side") == 1
+			try Database.remove("left")
+			try Database.remove("right")
+		}
+
+		@test()
+		def TestNewerDatabaseIsRefused() !none {
+			try await Database.start()
+			let path = try scratchDatabase("newer.db")
+			let conn = try open(path)
+			try conn.exec("CREATE TABLE adm_versions (application varchar(200) PRIMARY KEY, version varchar(100) NOT NULL)")
+			try conn.exec("INSERT INTO adm_versions VALUES (?, '99.0')", __app_name__)
+			try conn.close()
+
+			let message = ""
+			Database.add("migrated", "sqlite:{path}", versions = "adm_versions") onerror (err error) {
+				message = err.message
+				recover none
+			}
+			assert message.contains("last migrated by version 99.0")
+			assert !(Database.names().includes("migrated"))
+		}
+	}
+}

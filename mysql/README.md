@@ -101,12 +101,24 @@ SQLSTATE.
 
 A refusal during the login (wrong password, unknown database) is `Denied`.
 
+## Stored routines
+
+A `sql def` whose body is `BEGIN ... END` is created as a procedure (`!none`, and rows, which its
+`SELECT` returns and `CALL` reads) or a function (a single value, `SELECT name(...)`), with
+`COMMENT 'adm:<hash>'` so an unchanged one is not created again. Functions are declared `NOT
+DETERMINISTIC READS SQL DATA`; with binary logging on (MySQL 8's default) the server still
+refuses to create one for a user without SUPER unless `log_bin_trust_function_creators` is on.
+Each schema statement commits by itself, so a migration step that fails can leave part of its
+changes; the error names the statement it stopped at.
+
 ## Tests
 
 The suite passes without running unless `ADM_TEST_MYSQL` holds `host:port` of a MySQL or
 MariaDB server with a database `shop`, a user `app` (password `secret`) with all rights on it,
 and `root` with password `rootpw` reachable from the test machine. On MySQL 8.4 start the
-server with `--mysql-native-password=ON`, so the test can make a user of that method.
+server with `--mysql-native-password=ON`, so the test can make a user of that method, and
+`--log-bin-trust-function-creators=ON`, so `app` can create the stored functions of
+`routines_test.adm`.
 
 ## Not done
 

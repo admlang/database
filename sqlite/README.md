@@ -85,6 +85,12 @@ SQLSTATE.
 | `SQLITE_MISMATCH`, `SQLITE_RANGE`, `SQLITE_TOOBIG` | `Type` |
 | anything else | `Other` |
 
+## Migrations
+
+SQLite has no stored routines: a `sql def` written `BEGIN ... END` fails when called or
+installed. Migration steps take no lock of their own: each step's transaction begins
+`IMMEDIATE`, which holds the database's write lock, and the version is read inside it.
+
 ## The engine
 
 `sqlite/sqlite3.inc` is the amalgamation's `sqlite3.c`, unmodified (`sqlite/UPSTREAM` has the

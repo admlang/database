@@ -24,6 +24,31 @@ partial module adm.database.sqlite {
 			return db.Placeholder.Question
 		}
 
+		// routineCall implements std.data.db.Dialect, as the driver does.
+		def routineCall(kind db.RoutineKind, name string, args int) !string[] {
+			return dialect.routineCall(kind, name, args)
+		}
+
+		// installRoutine implements std.data.db.Dialect, as the driver does.
+		def installRoutine(conn db.Connection, routine db.Routine) !bool {
+			return dialect.installRoutine(conn, routine)
+		}
+
+		// lockMigrations implements std.data.db.Dialect, as the driver does.
+		def lockMigrations(conn db.Connection, key string) !none {
+			return dialect.lockMigrations(conn, key)
+		}
+
+		// unlockMigrations implements std.data.db.Dialect, as the driver does.
+		def unlockMigrations(conn db.Connection, key string) !none {
+			return dialect.unlockMigrations(conn, key)
+		}
+
+		// backslashEscapes implements std.data.db.Dialect, as the driver does.
+		def backslashEscapes() bool {
+			return dialect.backslashEscapes()
+		}
+
 		// exec implements std.data.db.Queryable.
 		// Fails with a DbError when the database rejects the statement, an
 		// argument cannot be bound, or the connection is closed or lost.
@@ -132,6 +157,31 @@ partial module adm.database.sqlite {
 
 		def placeholder() db.Placeholder {
 			return db.Placeholder.Question
+		}
+
+		// routineCall implements std.data.db.Dialect, as the driver does.
+		def routineCall(kind db.RoutineKind, name string, args int) !string[] {
+			return dialect.routineCall(kind, name, args)
+		}
+
+		// installRoutine implements std.data.db.Dialect, as the driver does.
+		def installRoutine(conn db.Connection, routine db.Routine) !bool {
+			return dialect.installRoutine(conn, routine)
+		}
+
+		// lockMigrations implements std.data.db.Dialect, as the driver does.
+		def lockMigrations(conn db.Connection, key string) !none {
+			return dialect.lockMigrations(conn, key)
+		}
+
+		// unlockMigrations implements std.data.db.Dialect, as the driver does.
+		def unlockMigrations(conn db.Connection, key string) !none {
+			return dialect.unlockMigrations(conn, key)
+		}
+
+		// backslashEscapes implements std.data.db.Dialect, as the driver does.
+		def backslashEscapes() bool {
+			return dialect.backslashEscapes()
 		}
 
 		def exec(statement string, args ...any) !db.Result {

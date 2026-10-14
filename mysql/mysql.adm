@@ -54,6 +54,41 @@ partial module adm.database.mysql {
 		def connect(target url.URL) !db.Connection {
 			return try dial(target)
 		}
+
+		// routineCall implements std.data.db.Dialect: `SELECT name(...)`
+		// for a function, `CALL name(...)` for a procedure, rows included.
+		// Does not fail.
+		def routineCall(kind db.RoutineKind, name string, args int) !string[] {
+			return routineCallText(kind, name, args)
+		}
+
+		// installRoutine implements std.data.db.Dialect: the routine is
+		// created in the current database, its hash kept in its comment,
+		// the one of that name dropped first.
+		// Fails with a DbError when a type has no MySQL type or the server
+		// rejects the routine.
+		def installRoutine(conn db.Connection, routine db.Routine) !bool {
+			return installRoutineOn(conn, routine)
+		}
+
+		// lockMigrations implements std.data.db.Dialect with `GET_LOCK`,
+		// waiting as long as another session holds it.
+		// Fails with a DbError when the connection is lost.
+		def lockMigrations(conn db.Connection, key string) !none {
+			return namedLock(conn, "SELECT GET_LOCK(?, -1)", key)
+		}
+
+		// unlockMigrations implements std.data.db.Dialect.
+		// Fails with a DbError when the connection is lost.
+		def unlockMigrations(conn db.Connection, key string) !none {
+			return namedLock(conn, "SELECT RELEASE_LOCK(?)", key)
+		}
+
+		// backslashEscapes implements std.data.db.Dialect: true, as MySQL
+		// reads quoted text unless NO_BACKSLASH_ESCAPES is set.
+		def backslashEscapes() bool {
+			return true
+		}
 	}
 
 	// open opens a session with the server a `mysql:` URL names and returns

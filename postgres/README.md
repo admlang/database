@@ -106,6 +106,16 @@ server's text; `bytes` decodes `bytea` and gives the text bytes of anything else
 
 A refusal before the session is up (wrong password, unknown database) is `Denied`.
 
+## Stored routines
+
+A `sql def` whose body is `BEGIN ... END` (or `DECLARE ... BEGIN ... END`) is created in PL/pgSQL
+in the current schema: a procedure for `!none`, a function returning the value for a single
+value, a function `RETURNS TABLE(...)` for rows (with `#variable_conflict use_column`, so a query
+naming a column means the column). The old routine of that name is dropped, the new one created
+and commented `adm:<hash>` in one transaction; an unchanged one is left alone. Two routines of
+one name on one connection are a compile error; `@db.routine(name = "...", schema = "...")`
+creates one under another name or in another schema.
+
 ## Tests
 
 The suite passes without running unless `ADM_TEST_POSTGRES` holds `host:port` of a server with

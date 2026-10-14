@@ -6,7 +6,9 @@ partial module adm.database.sqlite {
 	)
 
 	// PersonStore is how a program uses the driver through `sql def`: a type
-	// holding its connection, with one method per statement.
+	// holding its connection, with one method per statement, checked
+	// against the table's schema when the suite is built.
+	@db.sqlschema("testdata/people.sql")
 	type PersonStore {
 		@db.connection()
 		conn db.Queryable

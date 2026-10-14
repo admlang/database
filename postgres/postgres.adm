@@ -50,6 +50,41 @@ partial module adm.database.postgres {
 		def connect(target url.URL) !db.Connection {
 			return try dial(target)
 		}
+
+		// routineCall implements std.data.db.Dialect: `CALL name(...)` for
+		// a procedure, `SELECT name(...)` for a function, `SELECT * FROM
+		// name(...)` for one returning a table. Does not fail.
+		def routineCall(kind db.RoutineKind, name string, args int) !string[] {
+			return routineCallText(kind, name, args)
+		}
+
+		// installRoutine implements std.data.db.Dialect: the routine is
+		// created in PL/pgSQL in the current schema, its hash kept in its
+		// comment, the one of that name dropped first.
+		// Fails with a DbError when a type has no PostgreSQL type or the
+		// server rejects the routine.
+		def installRoutine(conn db.Connection, routine db.Routine) !bool {
+			return installRoutineOn(conn, routine)
+		}
+
+		// lockMigrations implements std.data.db.Dialect with a session
+		// advisory lock.
+		// Fails with a DbError when the connection is lost.
+		def lockMigrations(conn db.Connection, key string) !none {
+			return runQuiet(conn, "SELECT pg_advisory_lock($1)", lockNumber(key))
+		}
+
+		// unlockMigrations implements std.data.db.Dialect.
+		// Fails with a DbError when the connection is lost.
+		def unlockMigrations(conn db.Connection, key string) !none {
+			return runQuiet(conn, "SELECT pg_advisory_unlock($1)", lockNumber(key))
+		}
+
+		// backslashEscapes implements std.data.db.Dialect: false, a
+		// backslash is an ordinary character in standard strings.
+		def backslashEscapes() bool {
+			return false
+		}
 	}
 
 	// open opens a session with the server a `postgres:` URL names and

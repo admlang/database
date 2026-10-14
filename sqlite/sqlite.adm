@@ -52,6 +52,45 @@ partial module adm.database.sqlite {
 		def connect(target url.URL) !db.Connection {
 			return try connectURL(target)
 		}
+
+		// routineCall implements std.data.db.Dialect.
+		// Fails with a DbError of ErrorKind.Other: SQLite has no stored
+		// routines.
+		def routineCall(kind db.RoutineKind, name string, args int) !string[] {
+			fail noRoutines(name)
+		}
+
+		// installRoutine implements std.data.db.Dialect.
+		// Fails with a DbError of ErrorKind.Other: SQLite has no stored
+		// routines.
+		def installRoutine(conn db.Connection, routine db.Routine) !bool {
+			fail noRoutines(routine.name)
+		}
+
+		// lockMigrations implements std.data.db.Dialect and takes nothing:
+		// each migration step's transaction begins IMMEDIATE, which holds
+		// the database's write lock, and the version is read inside it.
+		// Does not fail.
+		def lockMigrations(conn db.Connection, key string) !none {
+			return none
+		}
+
+		// unlockMigrations implements std.data.db.Dialect. Does not fail.
+		def unlockMigrations(conn db.Connection, key string) !none {
+			return none
+		}
+
+		// backslashEscapes implements std.data.db.Dialect: false.
+		def backslashEscapes() bool {
+			return false
+		}
+	}
+
+	// The Dialect the driver's connections and transactions answer with.
+	let dialect = new SQLite()
+
+	def noRoutines(name string) db.DbError {
+		return db.errorOf(db.ErrorKind.Other, "{name} is a stored routine (a sql def body written BEGIN ... END), and SQLite has none")
 	}
 
 	// open opens a database file, or a private database in memory with

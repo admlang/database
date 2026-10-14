@@ -1,0 +1,139 @@
+// Stored routines and migrations on MySQL; without ADM_TEST_MYSQL they
+// pass without running.
+partial module adm.database.mysql {
+	use (
+		std.testing
+		std.data.db
+		std.time
+		std.services::(migration)
+		std.services.database::(Database, db)
+	)
+
+	struct Scored {
+		id    int
+		name  string
+		score int
+	}
+
+	// The table the routines read, made by a migration script; a quoted
+	// `;` and a backslash-escaped quote do not end a statement.
+	@migration(from = "0.0.1", db = "myroutines")
+	sql def createScored() !none {
+		DROP TABLE IF EXISTS scored;
+		CREATE TABLE scored (id BIGINT PRIMARY KEY, name TEXT NOT NULL, score BIGINT NOT NULL);
+		INSERT INTO scored VALUES (100, 'it\'s; here', 0);
+		DELETE FROM scored WHERE id = 100;
+	}
+
+	type Reports {
+		@db.connection()
+		conn db.Queryable
+
+		def new(conn db.Queryable) {
+			self.conn = conn
+		}
+
+		@db("myroutines")
+		sql def topScored(n int) !Scored[] {
+			BEGIN
+				SELECT id, name, score FROM scored ORDER BY score DESC LIMIT n;
+			END
+		}
+	}
+
+	@db("myroutines")
+	sql def scoredCount(minimum int) !int {
+		BEGIN
+			DECLARE total BIGINT;
+			SELECT count(*) INTO total FROM scored WHERE score >= minimum;
+			RETURN total;
+		END
+	}
+
+	@db("myroutines")
+	sql def addScored(newId int, newName string, newScore int) !none {
+		BEGIN
+			INSERT INTO scored (id, name, score) VALUES (newId, newName, newScore);
+		END
+	}
+
+	// Created in the database named, under a name of its own.
+	@db("myroutines")
+	@db.routine(name = "scored_total", schema = "shop")
+	sql def scoredTotal() !int {
+		BEGIN
+			RETURN (SELECT coalesce(sum(score), 0) FROM scored);
+		END
+	}
+
+	def routineCreated(q db.Queryable, name string) !string {
+		let rows = try q.query("SELECT CAST(CREATED AS CHAR) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = DATABASE() AND ROUTINE_NAME = ?", name)
+		defer rows.close()
+		fail "no routine {name}" unless try rows.next()
+		return rows.string(0)
+	}
+
+	// Takes the migration lock on a connection of its own and reports how
+	// long it waited for it.
+	def lockedAfter(key string) !duration {
+		let conn = try db.connect("mysql://app:secret@{testServer}/shop?sslmode=disable")
+		let started = time.now()
+		try dialect.lockMigrations(conn, key)
+		let waited = time.since(started)
+		try dialect.unlockMigrations(conn, key)
+		try conn.close()
+		return waited
+	}
+
+	check "Stored routines" {
+		@test()
+		def TestRoutinesInstallWithTheMigrations() !none {
+			return none when testServer == ""
+			try await Database.start()
+			let url = "mysql://app:secret@{testServer}/shop?sslmode=disable"
+			try Database.add("myroutines", url, versions = "adm_versions")
+			let pool = try Database.get("myroutines")
+			// The server keeps what an earlier run left.
+			try pool.exec("DELETE FROM scored")
+
+			try addScored(1, "Ana", 9)
+			try addScored(2, "Bob", 4)
+			try addScored(3, "Cy", 7)
+			assert try scoredCount(5) == 2
+			let top = try new Reports(pool).topScored(2)
+			assert top.len() == 2
+			assert top[0].name == "Ana"
+			assert top[1].score == 7
+			assert try scoredTotal() == 20
+			assert (try routineCreated(pool, "scored_total")).len() > 0
+
+			// Added again: the routines are there with the same body and
+			// are not created again.
+			let before = try routineCreated(pool, "topScored")
+			try Database.remove("myroutines")
+			try Database.add("myroutines", url, versions = "adm_versions")
+			assert try routineCreated(try Database.get("myroutines"), "topScored") == before
+			assert try scoredCount(0) == 3
+			try Database.remove("myroutines")
+		}
+
+		// The migration lock keeps a second session waiting until the
+		// first releases it.
+		@test()
+		def TestMigrationLockWaits() !none {
+			return none when testServer == ""
+			let first = try db.connect("mysql://app:secret@{testServer}/shop?sslmode=disable")
+			try dialect.lockMigrations(first, "adm.migrations/locktest")
+			let second = async lockedAfter("adm.migrations/locktest")
+			time.sleep(300ms)
+			try dialect.unlockMigrations(first, "adm.migrations/locktest")
+			let waited = try await second
+			assert waited >= 200ms
+			// Another program's key does not wait.
+			try dialect.lockMigrations(first, "adm.migrations/locktest")
+			assert try lockedAfter("adm.migrations/other") < 200ms
+			try dialect.unlockMigrations(first, "adm.migrations/locktest")
+			try first.close()
+		}
+	}
+}

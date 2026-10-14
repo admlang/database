@@ -1,0 +1,129 @@
+// The statements of std.data.db.Dialect as MySQL and MariaDB write them:
+// calling and installing stored routines, and the migration lock
+// (`GET_LOCK`).
+partial module adm.database.mysql {
+	use (
+		std.data.db
+		std.crypto.hash::(SHA256)
+	)
+
+	// The Dialect the driver's connections and transactions answer with.
+	let dialect = new MySQL()
+
+	// The statement that calls a routine, as text around its `args`
+	// arguments: `SELECT name(...)` for a function, `CALL name(...)` for a
+	// procedure, whose `SELECT` returns the rows of a Rows routine.
+	internal def routineCallText(kind db.RoutineKind, name string, args int) string[] {
+		let open = kind == db.RoutineKind.Function ?? ("SELECT " + name + "(", "CALL " + name + "(")
+		let parts = [open]
+		for let i = 1; i < args; i++ {
+			parts.push(", ")
+		}
+		parts.push(")") when args > 0
+		parts[0] = open + ")" when args == 0
+		return parts
+	}
+
+	// Creates the routine in the current database, dropping a procedure or
+	// function of that name first, unless its comment holds the routine's
+	// hash already. MySQL commits each of these statements by itself.
+	// Fails with a DbError when a type has no MySQL type or the server
+	// rejects the routine.
+	internal def installRoutineOn(conn db.Connection, routine db.Routine) !bool {
+		let mark = "adm:" + routine.hash
+		let rows = try conn.query("SELECT ROUTINE_COMMENT FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = COALESCE(NULLIF(?, ''), DATABASE()) AND ROUTINE_NAME = ?", routine.schema, routine.name)
+		let present = false
+		for try rows.next() {
+			present = true when !rows.isNull(0) && try rows.string(0) == mark
+		}
+		return false when present
+
+		let name = qualified(routine)
+		let params string[]
+		let function = routine.kind == db.RoutineKind.Function
+		for let (_, p) in routine.parameters {
+			let t = try mysqlType(routine, p.typeName)
+			params.push(function ?? (p.name + " " + t, "IN " + p.name + " " + t))
+		}
+		let head = "CREATE PROCEDURE " + name + "(" + params.join(", ") + ")"
+		// READS SQL DATA lets the function be created with binary logging
+		// on (with log_bin_trust_function_creators); MySQL does not check
+		// what the body does.
+		head = "CREATE FUNCTION " + name + "(" + params.join(", ") + ") RETURNS " + try mysqlType(routine, routine.result.typeName) + " NOT DETERMINISTIC READS SQL DATA" when function
+		try conn.exec("DROP PROCEDURE IF EXISTS " + name)
+		try conn.exec("DROP FUNCTION IF EXISTS " + name)
+		try conn.exec(head + " COMMENT '" + mark + "'\n" + routine.body)
+		return true
+	}
+
+	// The routine's name as DDL writes it: `database.name`, or the name
+	// alone.
+	internal def qualified(routine db.Routine) string {
+		return routine.name when routine.schema == ""
+		return routine.schema + "." + routine.name
+	}
+
+	// The MySQL type of a routine's parameter or result, written as ADM
+	// declares it.
+	// Fails with a DbError of ErrorKind.Type for a type it has none for.
+	internal def mysqlType(routine db.Routine, typeName string) !string {
+		let name = typeName.trimPrefix("?").trimPrefix("std.")
+		match name {
+			case "int", "int64":
+				return "BIGINT"
+			case "uint", "uint64":
+				return "BIGINT UNSIGNED"
+			case "int32":
+				return "INT"
+			case "uint32":
+				return "INT UNSIGNED"
+			case "int16":
+				return "SMALLINT"
+			case "uint16":
+				return "SMALLINT UNSIGNED"
+			case "int8":
+				return "TINYINT"
+			case "uint8", "byte":
+				return "TINYINT UNSIGNED"
+			case "float", "float64":
+				return "DOUBLE"
+			case "float32", "float16":
+				return "FLOAT"
+			case "string":
+				return "TEXT"
+			case "bool":
+				return "BOOLEAN"
+			case "byte[]":
+				return "LONGBLOB"
+			case "time.Time", "time.DateTime":
+				return "DATETIME(6)"
+			case "time.Date":
+				return "DATE"
+			case "time.TimeOfDay":
+				return "TIME(6)"
+			case "math.Decimal":
+				return "DECIMAL(65,30)"
+			case "bigint", "builtin.bigint":
+				return "DECIMAL(65,0)"
+			default:
+				fail db.errorOf(db.ErrorKind.Type, "stored routine {routine.name}: {typeName} has no MySQL type")
+		}
+	}
+
+	// The `GET_LOCK` name of a migration lock: at most 64 characters, so
+	// the key's SHA-256 in hex, cut to 60.
+	internal def lockName(key string) string {
+		return "adm-" + new SHA256().hash(key.bytes()).hex().slice(0, 60)
+	}
+
+	// Takes or releases a named lock, which a session keeps until it
+	// releases it or ends.
+	// Fails with a DbError when the server answers no row or the
+	// connection is lost.
+	internal def namedLock(conn db.Connection, statement string, key string) !none {
+		let rows = try conn.query(statement, lockName(key))
+		defer rows.close()
+		fail db.errorOf(db.ErrorKind.Other, "mysql: the migration lock could not be taken") unless try rows.next()
+		return none
+	}
+}

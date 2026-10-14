@@ -1,0 +1,169 @@
+// The statements of std.data.db.Dialect as PostgreSQL writes them: calling
+// and installing stored routines (PL/pgSQL), and the migration lock (an
+// advisory lock).
+partial module adm.database.postgres {
+	use (
+		std.data.db
+		std.crypto.hash::(SHA256)
+	)
+
+	// The Dialect the driver's connections and transactions answer with.
+	let dialect = new Postgres()
+
+	// The statement that calls a routine, as text around its `args`
+	// arguments: `CALL` for a procedure, `SELECT name(...)` for a function
+	// and `SELECT * FROM name(...)` for one returning a table.
+	internal def routineCallText(kind db.RoutineKind, name string, args int) string[] {
+		let open = "CALL " + name + "("
+		match kind {
+			case db.RoutineKind.Function:
+				open = "SELECT " + name + "("
+			case db.RoutineKind.Rows:
+				open = "SELECT * FROM " + name + "("
+			default:
+		}
+		return argumentPlaces(open, args, ")")
+	}
+
+	// `open`, the separators between `args` places, and `close`, as the
+	// text around them.
+	internal def argumentPlaces(open string, args int, close string) string[] {
+		let parts = [open]
+		for let i = 1; i < args; i++ {
+			parts.push(", ")
+		}
+		parts.push(close) when args > 0
+		parts[0] = open + close when args == 0
+		return parts
+	}
+
+	// Creates the routine in the current schema, dropping the one of that
+	// name first, unless its comment holds the routine's hash already. The
+	// drop, the create and the comment are one transaction.
+	// Fails with a DbError when a type has no PostgreSQL type or the server
+	// rejects the routine.
+	internal def installRoutineOn(conn db.Connection, routine db.Routine) !bool {
+		let mark = "adm:" + routine.hash
+		let rows = try conn.query("SELECT obj_description(p.oid, 'pg_proc') FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace WHERE p.proname = lower($1) AND n.nspname = COALESCE(lower(NULLIF($2, '')), current_schema())", routine.name, routine.schema)
+		let present = false
+		for try rows.next() {
+			present = true when !rows.isNull(0) && try rows.string(0) == mark
+		}
+		return false when present
+
+		let params string[]
+		let types string[]
+		for let (_, p) in routine.parameters {
+			let t = try pgType(routine, p.typeName)
+			params.push(p.name + " " + t)
+			types.push(t)
+		}
+		let body = routine.body
+		let head = "CREATE PROCEDURE"
+		let returns = ""
+		match routine.kind {
+			case db.RoutineKind.Function:
+				head = "CREATE FUNCTION"
+				returns = " RETURNS " + try pgType(routine, routine.result.typeName)
+			case db.RoutineKind.Rows:
+				head = "CREATE FUNCTION"
+				let columns string[]
+				for let (_, c) in routine.columns {
+					columns.push(c.name + " " + try pgType(routine, c.typeName))
+				}
+				returns = " RETURNS TABLE(" + columns.join(", ") + ")"
+				// The table's columns are variables of the body too; a
+				// query naming a column of the same name means the column.
+				body = "#variable_conflict use_column\n" + body
+			default:
+		}
+		let tag = "$adm$"
+		let n = 0
+		for body.contains(tag) {
+			n++
+			tag = "$adm{n}$"
+		}
+		let name = qualified(routine)
+		let signature = name + "(" + types.join(", ") + ")"
+		let tx = try conn.beginTx()
+		let done = createRoutine(tx, name, head + " " + name + "(" + params.join(", ") + ")" + returns + " LANGUAGE plpgsql AS " + tag + "\n" + body + "\n" + tag, signature, mark)
+		if done is error {
+			tx.rollbackTx() onerror recover none
+			fail done
+		}
+		try tx.commitTx()
+		return true
+	}
+
+	// Replaces the routine: the old one dropped, the new one created and
+	// marked with its hash.
+	// Fails with a DbError when the server rejects a statement.
+	internal def createRoutine(tx db.Transaction, name string, create string, signature string, mark string) !none {
+		try tx.exec("DROP ROUTINE IF EXISTS " + name)
+		try tx.exec(create)
+		try tx.exec("COMMENT ON ROUTINE " + signature + " IS '" + mark + "'")
+		return none
+	}
+
+	// The routine's name as DDL writes it: `schema.name`, or the name alone.
+	internal def qualified(routine db.Routine) string {
+		return routine.name when routine.schema == ""
+		return routine.schema + "." + routine.name
+	}
+
+	// The PostgreSQL type of a routine's parameter, result or column,
+	// written as ADM declares it.
+	// Fails with a DbError of ErrorKind.Type for a type it has none for.
+	internal def pgType(routine db.Routine, typeName string) !string {
+		let name = typeName.trimPrefix("?").trimPrefix("std.")
+		match name {
+			case "int", "int64", "uint", "uint32", "uint64":
+				return "bigint"
+			case "int32", "uint16":
+				return "integer"
+			case "int16", "int8", "uint8", "byte":
+				return "smallint"
+			case "float", "float64":
+				return "double precision"
+			case "float32", "float16":
+				return "real"
+			case "string":
+				return "text"
+			case "bool":
+				return "boolean"
+			case "byte[]":
+				return "bytea"
+			case "time.Time":
+				return "timestamptz"
+			case "time.DateTime":
+				return "timestamp"
+			case "time.Date":
+				return "date"
+			case "time.TimeOfDay":
+				return "time"
+			case "math.Decimal", "bigint", "builtin.bigint":
+				return "numeric"
+			default:
+				fail db.errorOf(db.ErrorKind.Type, "stored routine {routine.name}: {typeName} has no PostgreSQL type")
+		}
+	}
+
+	// The advisory lock key of a migration lock's name: the first eight
+	// bytes of its SHA-256.
+	internal def lockNumber(key string) int64 {
+		let digest = new SHA256().hash(key.bytes())
+		let n int64 = 0
+		for let i = 0; i < 8; i++ {
+			n = (n << 8) | int64(digest[i])
+		}
+		return n
+	}
+
+	// Runs a statement whose rows say nothing.
+	// Fails with a DbError when the server rejects it or the connection is
+	// lost.
+	internal def runQuiet(conn db.Connection, statement string, args ...any) !none {
+		let rows = try conn.query(statement, ...args)
+		return rows.close()
+	}
+}

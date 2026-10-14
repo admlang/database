@@ -111,6 +111,25 @@ try Database.add("reports", "sqlite:reports.db")
 let total = try dailyTotal(today)
 ```
 
+A database's schema comes from the application's `@migration(db = ...)` steps, which
+`Database.add` runs on a database that has not seen them, each in a transaction and under a lock
+in the database; `sql def` bodies of several statements (scripts) and stored routines (`BEGIN ...
+END`, installed under the function's name with the migrations) are written as above:
+
+```adm
+@migration(from = "1.0", db = "reports")
+sql def createSales() !none {
+	CREATE TABLE sales (day date NOT NULL, amount numeric(12,2) NOT NULL);
+	CREATE INDEX sales_day ON sales (day);
+}
+
+try Database.add("reports", "postgres://app:secret@db.internal/reports", versions = "adm_versions")
+```
+
+Each driver implements `db.Dialect` for what differs between databases: how a routine is called
+and created, the migration lock (PostgreSQL `pg_advisory_lock`, MySQL `GET_LOCK`, SQLite none:
+each step's transaction begins `IMMEDIATE`), and whether `\` escapes in quoted text.
+
 Every failure is a `db.DbError` with a `kind` (`Constraint`, `Syntax`, `Denied`, `Conflict`,
 `TimedOut`, `Connection`, `Closed`, `Type`, `NoRows`, ...), the database's SQLSTATE where it
 has one, and its own error number.
