@@ -1,0 +1,3 @@
+partial module adm.database.orm {
+	// A typed layer over std.data.db and its drivers: a repository per struct (find, save, delete), a query builder that writes each dialect's SQL with bound parameters, relations with eager loading, migrations derived from struct changes, transactions, optimistic locking, soft delete, hooks
+}

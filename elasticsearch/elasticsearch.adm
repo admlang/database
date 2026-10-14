@@ -1,0 +1,3 @@
+partial module adm.database.elasticsearch {
+	// Elasticsearch 8 and OpenSearch 2 over std.net.http: documents as typed structs (index, get, update, delete), bulk, search with a typed query builder or raw JSON, aggregations, point in time and search_after, mappings, templates and aliases, API keys and basic authentication, node sniffing
+}

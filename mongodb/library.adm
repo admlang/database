@@ -1,0 +1,11 @@
+// MongoDB database driver
+@manifest(version = "0.0.1")
+library adm.database.mongodb {
+	use (
+		adm.database.mongodb
+	)
+
+	export (
+		adm.database.mongodb
+	)
+}

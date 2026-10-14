@@ -1,9 +1,11 @@
 # ADM database drivers
 
-Official [ADM](https://github.com/admlang/adm) libraries that connect an ADM program to SQL
-databases. Each library is one driver for `std.data.db`, published as `adm.database.<name>` and
-signed by the `admlang` publisher. The drivers live outside the standard library so that a fix
-or a new protocol version ships without a std release.
+Official [ADM](https://github.com/admlang/adm) libraries that connect an ADM program to a
+database. Each is published as `adm.database.<name>` and signed by the `admlang` publisher. They
+live outside the standard library so that a fix or a new protocol version ships without a std
+release.
+
+The SQL drivers implement `std.data.db`, so a program talks to every one of them the same way:
 
 | Library | Database | How it connects | URL schemes |
 |---|---|---|---|
@@ -11,11 +13,14 @@ or a new protocol version ships without a std release.
 | [`adm.database.postgres`](postgres/) | PostgreSQL | the wire protocol (3.0), written in ADM | `postgres:`, `postgresql:` |
 | [`adm.database.mysql`](mysql/) | MySQL, MariaDB | the client/server protocol, written in ADM | `mysql:`, `mariadb:` |
 
-One library is a database of its own rather than a driver:
+Three libraries have an API of their own:
 
 | Library | What it is |
 |---|---|
 | [`adm.database.store`](store/) | an embedded database written in ADM: one file, ordered buckets, crash-safe transactions, and typed collections (a struct per record, indexes declared with `@store.index`); its own API, not `std.data.db` |
+| [`adm.database.mongodb`](mongodb/) | a MongoDB driver: the wire protocol and BSON in ADM, replica sets and sharded clusters, typed collections, transactions, change streams; its own API, since MongoDB is not SQL |
+| [`adm.database.elasticsearch`](elasticsearch/) | an Elasticsearch and OpenSearch client: typed documents, bulk indexing, a query builder, aggregations, index management |
+| [`adm.database.orm`](orm/) | a typed layer over `std.data.db` and the SQL drivers: repositories per struct, a dialect-aware query builder, relations, migrations derived from structs |
 
 ## Use
 
@@ -148,6 +153,12 @@ ADM_TEST_MYSQL=127.0.0.1:3306 adm test database/mysql      # MySQL or MariaDB
 ```
 
 The READMEs of those libraries say what the server must hold.
+
+```bash
+ADM_TEST_MONGODB=127.0.0.1:27017 adm test database/mongodb
+ADM_TEST_ELASTICSEARCH=http://127.0.0.1:9200 adm test database/elasticsearch
+adm test database/orm                                      # SQLite; the servers above add their dialects
+```
 
 ## License
 

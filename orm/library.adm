@@ -1,0 +1,11 @@
+// Typed data access over std.data.db
+@manifest(version = "0.0.1")
+library adm.database.orm {
+	use (
+		adm.database.orm
+	)
+
+	export (
+		adm.database.orm
+	)
+}

@@ -1,0 +1,11 @@
+// Elasticsearch and OpenSearch client
+@manifest(version = "0.0.1")
+library adm.database.elasticsearch {
+	use (
+		adm.database.elasticsearch
+	)
+
+	export (
+		adm.database.elasticsearch
+	)
+}
