@@ -1,6 +1,6 @@
 // PostgreSQL as an ADM library: the `postgres:` driver of std.data.db,
 // speaking the server's wire protocol over std.net.
-@manifest(version = "0.1.0")
+@manifest(version = "0.2.0")
 library adm.database.postgres {
 	use (
 		adm.database.postgres
