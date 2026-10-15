@@ -1,0 +1,370 @@
+partial module adm.database.mongodb {
+	use (
+		std.bytes
+		std.data.compress.snappy
+		std.data.compress.zlib
+		std.data.compress.zstd
+		std.data.encoding
+		std.data.encoding::(BSON, BSONValue, BSONKind)
+		std.net
+		std.time
+	)
+
+	internal const opCompressed = 2012
+	internal const opMsg = 2013
+
+	internal const flagChecksum = 1
+	internal const flagMoreToCome = 2
+	internal const flagExhaustAllowed = 0x10000
+
+	// The commands OP_COMPRESSED never carries (OP_COMPRESSED spec).
+	internal const uncompressible = ["hello", "ismaster", "saslstart", "saslcontinue", "getnonce", "authenticate", "createuser", "updateuser", "copydbsaslstart", "copydbgetnonce", "copydb"]
+
+	internal let requestCounter int = 0
+
+	internal atomic def nextRequestID() int {
+		requestCounter = (requestCounter + 1) & 0x7FFFFFFF
+		return requestCounter
+	}
+
+	internal let bsonCodec BSON = new BSON()
+
+	// A document sequence (OP_MSG payload type 1): `documents` of an
+	// insert, `updates` of an update, `deletes` of a delete.
+	internal struct Sequence {
+		identifier string
+		documents  byte[][]
+	}
+
+	// One reply: its flags and body.
+	internal struct Reply {
+		requestID  int
+		responseTo int
+		flags      int
+		body       BSONValue
+	}
+
+	// The bytes of an OP_MSG: header, flags, the body section, then the
+	// document sequences.
+	internal def encodeMessage(requestID int, flags int, body byte[], sequences Sequence[]) byte[] {
+		let out byte[] = []
+		putInt32(out, 0)
+		putInt32(out, requestID)
+		putInt32(out, 0)
+		putInt32(out, opMsg)
+		putInt32(out, flags)
+		out.push(byte(0))
+		out += body
+		for let seq in sequences {
+			out.push(byte(1))
+			let start = out.len()
+			putInt32(out, 0)
+			out += seq.identifier.bytes()
+			out.push(byte(0))
+			for let doc in seq.documents {
+				out += doc
+			}
+			patchInt32(out, start, out.len() - start)
+		}
+		patchInt32(out, 0, out.len())
+		return out
+	}
+
+	// An OP_MSG wrapped in OP_COMPRESSED.
+	internal def compressMessage(message byte[], compressor string, level int) !byte[] {
+		let inner = message[16:]
+		let id = 0
+		let packed byte[] = []
+		switch compressor {
+			case "snappy":
+				id = 1
+				packed = snappy.compress(inner)
+			case "zlib":
+				id = 2
+				let buffer = new bytes.Buffer()
+				let w = new zlib.Writer(buffer, zlibLevel(level))
+				try w.write(inner)
+				try w.close()
+				packed = buffer.bytes()
+			case "zstd":
+				id = 3
+				packed = zstd.compress(inner)
+			default:
+				return message
+		}
+		let out byte[] = []
+		putInt32(out, 0)
+		putInt32(out, readInt32(message, 4))
+		putInt32(out, 0)
+		putInt32(out, opCompressed)
+		putInt32(out, opMsg)
+		putInt32(out, inner.len())
+		out.push(byte(id))
+		out += packed
+		patchInt32(out, 0, out.len())
+		return out
+	}
+
+	internal def zlibLevel(level int) zlib.Level {
+		switch level {
+			case 0:
+				return zlib.Level.NoCompression
+			case 1:
+				return zlib.Level.BestSpeed
+			case 9:
+				return zlib.Level.BestCompression
+			default:
+				return level < 0 ?? (zlib.Level.DefaultCompression, zlib.Level(level))
+		}
+	}
+
+	// The body of an OP_COMPRESSED: its original opcode and the
+	// decompressed bytes after the header.
+	internal def decompressMessage(data byte[]) !(int, byte[]) {
+		fail mongoError(ErrorKind.Protocol, "OP_COMPRESSED is cut short") when data.len() < 25
+		let original = readInt32(data, 16)
+		let size = readInt32(data, 20)
+		let id = int(data[24])
+		let packed = data[25:]
+		let inner byte[] = []
+		switch id {
+			case 0:
+				inner = packed
+			case 1:
+				inner = snappy.decompress(packed) onerror (err error) {
+					fail mongoErrorCaused(ErrorKind.Protocol, "snappy", err)
+				}
+			case 2:
+				inner = zlib.decompress(packed, size) onerror (err error) {
+					fail mongoErrorCaused(ErrorKind.Protocol, "zlib", err)
+				}
+			case 3:
+				inner = zstd.decompress(packed, size) onerror (err error) {
+					fail mongoErrorCaused(ErrorKind.Protocol, "zstd", err)
+				}
+			default:
+				fail mongoError(ErrorKind.Protocol, "unknown compressor {id}")
+		}
+		fail mongoError(ErrorKind.Protocol, "OP_COMPRESSED holds {inner.len()} bytes, not {size}") unless inner.len() == size
+		return (original, inner)
+	}
+
+	// Reads the body of an OP_MSG reply (after its 16-byte header): flags
+	// and the single type-0 section; document sequences in replies are
+	// folded into the body under their identifiers.
+	internal def decodeMessageBody(data byte[], requestID int, responseTo int) !Reply {
+		fail mongoError(ErrorKind.Protocol, "OP_MSG is cut short") when data.len() < 5
+		let flags = readInt32(data, 0)
+		fail mongoError(ErrorKind.Protocol, "OP_MSG sets unknown required flags {flags & 0xFFFC}") when flags & 0xFFFC != 0
+		let end = flags & flagChecksum != 0 ?? (data.len() - 4, data.len())
+		let pos = 4
+		let body ?BSONValue = none
+		let folded (string, BSONValue)[] = []
+		for pos < end {
+			let kind = int(data[pos])
+			pos++
+			fail mongoError(ErrorKind.Protocol, "an OP_MSG section is cut short") when pos + 4 > end
+			let size = readInt32(data, pos)
+			fail mongoError(ErrorKind.Protocol, "an OP_MSG section runs past the message") when size < 5 || pos + size > end
+			if kind == 0 {
+				fail mongoError(ErrorKind.Protocol, "OP_MSG has two body sections") unless body is none
+				body = bsonCodec.parse(data[pos:pos + size]) onerror (err error) {
+					fail mongoErrorCaused(ErrorKind.Protocol, "the reply is not BSON", err)
+				}
+			} else if kind == 1 {
+				let section = data[pos:pos + size]
+				let nameEnd = 4
+				for nameEnd < section.len() && section[nameEnd] != byte(0) {
+					nameEnd++
+				}
+				fail mongoError(ErrorKind.Protocol, "a document sequence has no identifier") when nameEnd >= section.len()
+				let name = string(section[4:nameEnd])
+				let docs = new BSONValue(BSONKind.Array)
+				let at = nameEnd + 1
+				for at < section.len() {
+					fail mongoError(ErrorKind.Protocol, "a document sequence is cut short") when at + 4 > section.len()
+					let docSize = readInt32(section, at)
+					fail mongoError(ErrorKind.Protocol, "a document sequence is cut short") when docSize < 5 || at + docSize > section.len()
+					docs.push(try bsonCodec.parse(section[at:at + docSize]))
+					at += docSize
+				}
+				folded.push((name, docs))
+			} else if kind == 3 {
+				// Telemetry context; nothing for the client to read.
+			} else {
+				fail mongoError(ErrorKind.Protocol, "unknown OP_MSG section type {kind}")
+			}
+			pos += size
+		}
+		let doc = body
+		fail mongoError(ErrorKind.Protocol, "OP_MSG has no body section") when doc is none
+		for let item in folded {
+			let (name, docs) = item
+			doc.set(name, docs)
+		}
+		return Reply{requestID: requestID, responseTo: responseTo, flags: flags, body: doc}
+	}
+
+	internal def putInt32(out byte[], v int) {
+		out.push(byte(v & 0xFF))
+		out.push(byte((v >> 8) & 0xFF))
+		out.push(byte((v >> 16) & 0xFF))
+		out.push(byte((v >> 24) & 0xFF))
+	}
+
+	internal def patchInt32(out byte[], at int, v int) {
+		out[at] = byte(v & 0xFF)
+		out[at + 1] = byte((v >> 8) & 0xFF)
+		out[at + 2] = byte((v >> 16) & 0xFF)
+		out[at + 3] = byte((v >> 24) & 0xFF)
+	}
+
+	// A little-endian int32, sign-extended.
+	internal def readInt32(data byte[], at int) int {
+		let v = int(data[at]) | (int(data[at + 1]) << 8) | (int(data[at + 2]) << 16) | (int(data[at + 3]) << 24)
+		return v >= 0x80000000 ?? (v - 0x100000000, v)
+	}
+
+	// Whether a command may go compressed: not the handshake, not
+	// authentication (by the first key of the command).
+	internal def compressible(command BSONValue) bool {
+		let names = command.names()
+		return names.len() == 0 || !uncompressible.includes(names[0].lower())
+	}
+
+	// One connection to a server, after its handshake. One task uses it at
+	// a time.
+	internal type Conn {
+		stream             net.Stream
+		address            string
+		id                 int
+		// The pool generation it was made in, and the service it reaches
+		// behind a load balancer.
+		generation         int        = 0
+		serviceId          string     = ""
+		compressor         string     = ""
+		zlibLevel          int        = -1
+		// From the handshake.
+		hello              BSONValue
+		maxWireVersion     int        = 0
+		maxBsonObjectSize  int        = 16777216
+		maxMessageSize     int        = 48000000
+		maxWriteBatchSize  int        = 100000
+		serverConnectionId int        = 0
+		// Set once the connection must not be used again.
+		broken             bool       = false
+		// Set while a reply with moreToCome is outstanding (exhaust).
+		streaming          bool       = false
+		// The monotonic time it was last checked in.
+		lastUsed           int64      = 0
+		// When the connection was made (monotonic ns), and whether its
+		// credentials are done.
+		created            int64      = 0
+		authenticated      bool       = false
+
+		def new(stream net.Stream, address string, id int) {
+			self.stream = stream
+			self.address = address
+			self.id = id
+			hello = new BSONValue(BSONKind.Document)
+			created = time.monoNs()
+		}
+
+		// Sends a command and reads its reply, each within `wait` (0s
+		// without end). `moreToCome` sends without waiting for a reply
+		// (an unacknowledged write); `exhaust` lets the server stream
+		// replies (read the rest with `next`).
+		// Fails with ErrorKind.Connection or TimedOut when the connection
+		// breaks or the time runs out (the connection is then broken),
+		// ErrorKind.Protocol when the reply is malformed.
+		def roundTrip(command BSONValue, sequences Sequence[], wait duration, moreToCome bool = false, exhaust bool = false) !BSONValue {
+			fail mongoError(ErrorKind.Closed, "the connection is closed") when broken
+			let body = bsonCodec.encode(command) onerror (err error) {
+				fail mongoErrorCaused(ErrorKind.Argument, "the command does not encode", err)
+			}
+			fail mongoError(ErrorKind.Argument, "the command is {body.len()} bytes, more than the server takes") when body.len() > maxBsonObjectSize + 16384
+			let requestID = nextRequestID()
+			let flags = (moreToCome ?? (flagMoreToCome, 0)) | (exhaust ?? (flagExhaustAllowed, 0))
+			let message = encodeMessage(requestID, flags, body, sequences)
+			fail mongoError(ErrorKind.Argument, "the message is {message.len()} bytes, more than the server takes ({maxMessageSize})") when message.len() > maxMessageSize
+			message = try compressMessage(message, compressor, zlibLevel) when compressor != "" && compressible(command)
+			try send(message, wait)
+			return new BSONValue(BSONKind.Document) when moreToCome
+			let reply = try receive(wait)
+			fail mongoError(ErrorKind.Protocol, "the reply answers request {reply.responseTo}, not {requestID}") unless reply.responseTo == requestID
+			streaming = reply.flags & flagMoreToCome != 0
+			return reply.body
+		}
+
+		// The next reply of a streamed (exhaust) exchange.
+		def next(wait duration) !BSONValue {
+			fail mongoError(ErrorKind.Closed, "the connection is closed") when broken
+			let reply = try receive(wait)
+			streaming = reply.flags & flagMoreToCome != 0
+			return reply.body
+		}
+
+		internal def send(message byte[], wait duration) !none {
+			net.writeAll(stream, message, wait) onerror (err error) {
+				fail breakWith(err, "writing to {address}")
+			}
+			return none
+		}
+
+		internal def receive(wait duration) !Reply {
+			let header byte[] = []
+			header.len(16)
+			net.readFull(stream, header, wait) onerror (err error) {
+				fail breakWith(err, "reading from {address}")
+			}
+			let size = readInt32(header, 0)
+			if size < 16 || size > maxMessageSize + 16 * 1024 * 1024 {
+				broken = true
+				fail mongoError(ErrorKind.Protocol, "a reply of {size} bytes from {address}")
+			}
+			let rest byte[] = []
+			rest.len(size - 16)
+			net.readFull(stream, rest, wait) onerror (err error) {
+				fail breakWith(err, "reading from {address}")
+			}
+			let requestID = readInt32(header, 4)
+			let responseTo = readInt32(header, 8)
+			let opCode = readInt32(header, 12)
+			let data = header + rest
+			if opCode == opCompressed {
+				let (original, inner) = decompressMessage(data) onerror (err error) {
+					broken = true
+					fail err
+				}
+				fail mongoError(ErrorKind.Protocol, "OP_COMPRESSED holds opcode {original}") unless original == opMsg
+				return decodeMessageBody(inner, requestID, responseTo) onerror (err error) {
+					broken = true
+					fail err
+				}
+			}
+			if opCode != opMsg {
+				broken = true
+				fail mongoError(ErrorKind.Protocol, "a reply with opcode {opCode} from {address}")
+			}
+			return decodeMessageBody(rest, requestID, responseTo) onerror (err error) {
+				broken = true
+				fail err
+			}
+		}
+
+		// Marks the connection broken and turns a network failure into a
+		// MongoError labelled NetworkError.
+		internal def breakWith(err error, doing string) MongoError {
+			broken = true
+			let timedOut = err.code == "timeout" || err.message.contains("timed out")
+			let out = mongoErrorCaused(timedOut ?? (ErrorKind.TimedOut, ErrorKind.Connection), doing, err)
+			out.labels.push("NetworkError") unless timedOut
+			return out
+		}
+
+		def close() {
+			broken = true
+			stream.close() onerror recover none
+		}
+	}
+}

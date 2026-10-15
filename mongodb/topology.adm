@@ -1,0 +1,570 @@
+partial module adm.database.mongodb {
+	use (
+		std.data.encoding::(BSONValue, BSONKind)
+	)
+
+	// What a server is, as its last check found it (SDAM spec).
+	enum ServerType {
+		Unknown         = "Unknown",
+		Standalone      = "Standalone",
+		Mongos          = "Mongos",
+		PossiblePrimary = "PossiblePrimary",
+		RSPrimary       = "RSPrimary",
+		RSSecondary     = "RSSecondary",
+		RSArbiter       = "RSArbiter",
+		RSOther         = "RSOther",
+		RSGhost         = "RSGhost",
+		LoadBalancer    = "LoadBalancer",
+	}
+
+	// What the deployment is.
+	enum TopologyType {
+		Unknown               = "Unknown",
+		Single                = "Single",
+		ReplicaSetNoPrimary   = "ReplicaSetNoPrimary",
+		ReplicaSetWithPrimary = "ReplicaSetWithPrimary",
+		Sharded               = "Sharded",
+		LoadBalanced          = "LoadBalanced",
+	}
+
+	// A server's topologyVersion: the process and a counter within it.
+	internal struct TopologyVersion {
+		processId string
+		counter   int64
+	}
+
+	// One server as the client sees it (SDAM's ServerDescription).
+	internal type ServerDescription {
+		address                      string
+		kind                         ServerType          = ServerType.Unknown
+		error                        string              = ""
+		// Round-trip times in nanoseconds: the weighted average and the
+		// minimum of the recent samples; -1 while unknown.
+		rtt                          int64               = -1
+		minRtt                       int64               = -1
+		// The lastWrite date (ms since 1970) and when this description was
+		// made (monotonic ns); -1 when unknown.
+		lastWriteDate                int64               = -1
+		lastUpdateTime               int64               = -1
+		minWireVersion               int                 = 0
+		maxWireVersion               int                 = 0
+		me                           string              = ""
+		hosts                        string[]            = []
+		passives                     string[]            = []
+		arbiters                     string[]            = []
+		tags                         map<string, string> = map<string, string>{}
+		setName                      ?string             = none
+		// The electionId as hex, none when absent.
+		electionId                   ?string             = none
+		setVersion                   ?int                = none
+		primary                      ?string             = none
+		logicalSessionTimeoutMinutes ?int                = none
+		topologyVersion              ?TopologyVersion    = none
+		helloOk                      bool                = false
+		// Seconds since the epoch at which the server last wrote, for
+		// max staleness; -1 when unknown.
+		lastWriteSeconds             float               = -1.0
+
+		def new(address string) {
+			self.address = address
+		}
+
+		def isDataBearing() bool {
+			return kind := ServerType.Standalone || ServerType.Mongos || ServerType.RSPrimary || ServerType.RSSecondary || ServerType.LoadBalancer
+		}
+
+		def members() string[] {
+			let out string[] = []
+			out += hosts
+			out += passives
+			out += arbiters
+			return out
+		}
+	}
+
+	// The client's view of the deployment (SDAM's TopologyDescription).
+	internal type TopologyDescription {
+		kind                         TopologyType                   = TopologyType.Unknown
+		setName                      ?string                        = none
+		maxElectionId                ?string                        = none
+		maxSetVersion                ?int                           = none
+		servers                      map<string, ServerDescription> = map<string, ServerDescription>{}
+		compatible                   bool                           = true
+		compatibilityError           string                         = ""
+		logicalSessionTimeoutMinutes ?int                           = none
+
+		def new() {}
+
+		def copy() TopologyDescription {
+			let out = new TopologyDescription()
+			out.kind = kind
+			out.setName = setName
+			out.maxElectionId = maxElectionId
+			out.maxSetVersion = maxSetVersion
+			for let (address, server) in servers {
+				out.servers[address] = server
+			}
+			out.compatible = compatible
+			out.compatibilityError = compatibilityError
+			out.logicalSessionTimeoutMinutes = logicalSessionTimeoutMinutes
+			return out
+		}
+
+		def hasPrimary() bool {
+			for let (_, server) in servers {
+				return true when server.kind == ServerType.RSPrimary
+			}
+			return false
+		}
+	}
+
+	// The description a hello reply gives a server (SDAM, "Parsing a hello
+	// response"). `rtt` is the round trip of this check in nanoseconds.
+	internal def describeServer(address string, hello BSONValue, rtt int64, now int64) ServerDescription {
+		let sd = new ServerDescription(address)
+		sd.lastUpdateTime = now
+		return sd unless okOf(hello)
+		let isPrimary = hello.has("isWritablePrimary") ?? (boolOf(hello, "isWritablePrimary"), boolOf(hello, "ismaster"))
+		let setName = stringOf(hello, "setName")
+		sd.setName = setName when hello.has("setName")
+		if stringOf(hello, "msg") == "isdbgrid" {
+			sd.kind = ServerType.Mongos
+		} else if boolOf(hello, "isreplicaset") {
+			sd.kind = ServerType.RSGhost
+		} else if hello.has("setName") {
+			if isPrimary {
+				sd.kind = ServerType.RSPrimary
+			} else if boolOf(hello, "hidden") {
+				sd.kind = ServerType.RSOther
+			} else if boolOf(hello, "secondary") {
+				sd.kind = ServerType.RSSecondary
+			} else if boolOf(hello, "arbiterOnly") {
+				sd.kind = ServerType.RSArbiter
+			} else {
+				sd.kind = ServerType.RSOther
+			}
+		} else {
+			sd.kind = ServerType.Standalone
+		}
+		sd.rtt = rtt
+		sd.minWireVersion = intOf(hello, "minWireVersion", 0)
+		sd.maxWireVersion = intOf(hello, "maxWireVersion", 0)
+		sd.me = stringOf(hello, "me").lower()
+		sd.hosts = addressList(hello, "hosts")
+		sd.passives = addressList(hello, "passives")
+		sd.arbiters = addressList(hello, "arbiters")
+		if hello.has("tags") {
+			for let entry in hello.get("tags").entries() {
+				let (name, value) = entry
+				sd.tags[name] = value.asString() onerror recover ""
+			}
+		}
+		sd.electionId = objectIdHex(hello.get("electionId")) when hello.has("electionId")
+		sd.setVersion = intOf(hello, "setVersion", 0) when hello.has("setVersion")
+		sd.primary = stringOf(hello, "primary").lower() when hello.has("primary")
+		sd.logicalSessionTimeoutMinutes = intOf(hello, "logicalSessionTimeoutMinutes", 0) when hello.has("logicalSessionTimeoutMinutes") && hello.get("logicalSessionTimeoutMinutes").kind != BSONKind.Null
+		sd.topologyVersion = topologyVersionOf(hello)
+		sd.helloOk = boolOf(hello, "helloOk")
+		if hello.has("lastWrite") {
+			let lastWrite = hello.get("lastWrite")
+			if lastWrite.has("lastWriteDate") {
+				let ms = lastWrite.get("lastWriteDate").asDateTime() onerror recover int64(-1)
+				sd.lastWriteDate = ms
+			}
+		}
+		return sd
+	}
+
+	internal def addressList(hello BSONValue, name string) string[] {
+		let out string[] = []
+		return out unless hello.has(name)
+		for let item in hello.get(name).elements() {
+			let text = item.asString() onerror recover ""
+			out.push(text.lower()) unless text == ""
+		}
+		return out
+	}
+
+	internal def topologyVersionOf(doc BSONValue) ?TopologyVersion {
+		return none unless doc.has("topologyVersion")
+		let tv = doc.get("topologyVersion")
+		return none unless tv.has("processId") && tv.has("counter")
+		let process = objectIdHex(tv.get("processId"))
+		return none when process is none
+		let counter = tv.get("counter").asInt() onerror recover 0
+		return TopologyVersion{processId: process, counter: int64(counter)}
+	}
+
+	// Compares topologyVersions (SDAM): -1 when `current` is older than
+	// `incoming` (or either is none, or the processes differ), 0 when equal,
+	// 1 when newer.
+	internal def compareTopologyVersion(current ?TopologyVersion, incoming ?TopologyVersion) int {
+		return -1 when current is none || incoming is none
+		return -1 unless current.processId == incoming.processId
+		return current.counter == incoming.counter ?? (0, current.counter < incoming.counter ?? (-1, 1))
+	}
+
+	internal def objectIdHex(v BSONValue) ?string {
+		let id = v.asObjectId() onerror (err error) {
+			return none
+		}
+		return id.str()
+	}
+
+	// Whether two optional names are present and equal.
+	internal def sameName(a ?string, b ?string) bool {
+		return !(a is none) && !(b is none) && compareOptionalText(a, b) == 0
+	}
+
+	internal def compareOptionalText(a ?string, b ?string) int {
+		return b is none ?? (0, -1) when a is none
+		return 1 when b is none
+		return a == b ?? (0, a < b ?? (-1, 1))
+	}
+
+	internal def compareOptionalInt(a ?int, b ?int) int {
+		return b is none ?? (0, -1) when a is none
+		return 1 when b is none
+		return a == b ?? (0, a < b ?? (-1, 1))
+	}
+
+	// The settings the topology needs: the seeds, the replica set name and
+	// whether discovery is off.
+	internal struct TopologySettings {
+		seeds        string[]
+		setName      string   = ""
+		direct       bool     = false
+		loadBalanced bool     = false
+	}
+
+	// The description a client starts from (SDAM, "Initial
+	// TopologyDescription").
+	internal def initialTopology(ts TopologySettings) TopologyDescription {
+		let td = new TopologyDescription()
+		if ts.loadBalanced {
+			td.kind = TopologyType.LoadBalanced
+		} else if ts.direct {
+			td.kind = TopologyType.Single
+		} else if ts.setName != "" {
+			td.kind = TopologyType.ReplicaSetNoPrimary
+		}
+		td.setName = ts.setName == "" ?? (none, ts.setName)
+		for let seed in ts.seeds {
+			let sd = new ServerDescription(seed)
+			sd.kind = ServerType.LoadBalancer when ts.loadBalanced
+			td.servers[seed] = sd
+		}
+		return td
+	}
+
+	// Applies a server's new description to a copy of the topology (SDAM,
+	// "Updating the TopologyDescription") and returns the copy. A
+	// description of a server the topology no longer holds is ignored; one
+	// whose topologyVersion is older than the current one's is too.
+	internal def updateTopology(old TopologyDescription, sd ServerDescription, ts TopologySettings) TopologyDescription {
+		let current = old.servers.get(sd.address)
+		return old when current is none
+		return old when compareTopologyVersion(current.topologyVersion, sd.topologyVersion) > 0
+		let td = old.copy()
+		if td.kind == TopologyType.Single && ts.setName != "" {
+			let name = sd.setName
+			if sd.kind != ServerType.Unknown && (name is none || name != ts.setName) {
+				let unknown = new ServerDescription(sd.address)
+				unknown.error = "the server's replica set is not {ts.setName}"
+				unknown.lastUpdateTime = sd.lastUpdateTime
+				td.servers[sd.address] = unknown
+				finishTopology(td)
+				return td
+			}
+		}
+		// The averaged round trip carries over while the server stays known.
+		sd.rtt = (sd.rtt + 4 * current.rtt) / 5 when sd.kind != ServerType.Unknown && sd.rtt >= 0 && current.rtt >= 0
+		td.servers[sd.address] = sd
+		switch td.kind {
+			case TopologyType.Single, TopologyType.LoadBalanced:
+				finishTopology(td)
+				return td
+			case TopologyType.Unknown:
+				switch sd.kind {
+					case ServerType.Standalone:
+						if ts.seeds.len() == 1 {
+							td.kind = TopologyType.Single
+						} else {
+							td.servers.delete(sd.address)
+						}
+					case ServerType.Mongos:
+						td.kind = TopologyType.Sharded
+					case ServerType.RSPrimary:
+						td.kind = TopologyType.ReplicaSetWithPrimary
+						updateRSFromPrimary(td, sd)
+					case ServerType.RSSecondary, ServerType.RSArbiter, ServerType.RSOther:
+						td.kind = TopologyType.ReplicaSetNoPrimary
+						updateRSWithoutPrimary(td, sd)
+					default:
+				}
+			case TopologyType.Sharded:
+				if !(sd.kind := ServerType.Unknown || ServerType.Mongos) {
+					td.servers.delete(sd.address)
+				}
+			case TopologyType.ReplicaSetNoPrimary:
+				switch sd.kind {
+					case ServerType.Standalone, ServerType.Mongos:
+						td.servers.delete(sd.address)
+					case ServerType.RSPrimary:
+						td.kind = TopologyType.ReplicaSetWithPrimary
+						updateRSFromPrimary(td, sd)
+					case ServerType.RSSecondary, ServerType.RSArbiter, ServerType.RSOther:
+						updateRSWithoutPrimary(td, sd)
+					default:
+				}
+			case TopologyType.ReplicaSetWithPrimary:
+				switch sd.kind {
+					case ServerType.Standalone, ServerType.Mongos:
+						td.servers.delete(sd.address)
+						checkIfHasPrimary(td)
+					case ServerType.RSPrimary:
+						updateRSFromPrimary(td, sd)
+					case ServerType.RSSecondary, ServerType.RSArbiter, ServerType.RSOther:
+						updateRSWithPrimaryFromMember(td, sd)
+					default:
+						checkIfHasPrimary(td)
+				}
+			default:
+		}
+		finishTopology(td)
+		return td
+	}
+
+	internal def updateRSWithoutPrimary(td TopologyDescription, sd ServerDescription) {
+		return unless td.servers.hasKey(sd.address)
+		let name = td.setName
+		if name is none {
+			td.setName = sd.setName
+		} else if !sameName(sd.setName, name) {
+			td.servers.delete(sd.address)
+			return
+		}
+		for let address in sd.members() {
+			td.servers[address] = new ServerDescription(address) unless td.servers.hasKey(address)
+		}
+		let primary = sd.primary
+		if !(primary is none) && td.servers.hasKey(primary) {
+			let known = td.servers[primary]
+			if known.kind == ServerType.Unknown {
+				let possible = new ServerDescription(primary)
+				possible.kind = ServerType.PossiblePrimary
+				td.servers[primary] = possible
+			}
+		}
+		td.servers.delete(sd.address) when sd.me != "" && sd.address != sd.me
+	}
+
+	internal def updateRSWithPrimaryFromMember(td TopologyDescription, sd ServerDescription) {
+		return unless td.servers.hasKey(sd.address)
+		let name = td.setName
+		if !sameName(sd.setName, name) {
+			td.servers.delete(sd.address)
+			checkIfHasPrimary(td)
+			return
+		}
+		if sd.me != "" && sd.address != sd.me {
+			td.servers.delete(sd.address)
+			checkIfHasPrimary(td)
+			return
+		}
+		if !td.hasPrimary() {
+			td.kind = TopologyType.ReplicaSetNoPrimary
+			let primary = sd.primary
+			if !(primary is none) && td.servers.hasKey(primary) && td.servers[primary].kind == ServerType.Unknown {
+				let possible = new ServerDescription(primary)
+				possible.kind = ServerType.PossiblePrimary
+				td.servers[primary] = possible
+			}
+		}
+	}
+
+	internal def updateRSFromPrimary(td TopologyDescription, sd ServerDescription) {
+		return unless td.servers.hasKey(sd.address)
+		let name = td.setName
+		if name is none {
+			td.setName = sd.setName
+		} else if !sameName(sd.setName, name) {
+			td.servers.delete(sd.address)
+			checkIfHasPrimary(td)
+			return
+		}
+		if sd.maxWireVersion >= 17 {
+			let byElection = compareOptionalText(sd.electionId, td.maxElectionId)
+			if byElection > 0 || (byElection == 0 && compareOptionalInt(sd.setVersion, td.maxSetVersion) >= 0) {
+				td.maxElectionId = sd.electionId
+				td.maxSetVersion = sd.setVersion
+			} else {
+				markStalePrimary(td, sd)
+				return
+			}
+		} else {
+			let election = sd.electionId
+			let version = sd.setVersion
+			if !(version is none) && !(election is none) {
+				let maxVersion = td.maxSetVersion
+				let maxElection = td.maxElectionId
+				let bothKnown = !(maxVersion is none) && !(maxElection is none)
+				let byVersion = compareOptionalInt(maxVersion, version)
+				if bothKnown && (byVersion > 0 || (byVersion == 0 && compareOptionalText(maxElection, election) > 0)) {
+					markStalePrimary(td, sd)
+					return
+				}
+				td.maxElectionId = election
+			}
+			if !(version is none) {
+				let maxVersion = td.maxSetVersion
+				td.maxSetVersion = version when maxVersion is none || version > maxVersion
+			}
+		}
+		for let (address, server) in td.servers.clone() {
+			if address != sd.address && server.kind == ServerType.RSPrimary {
+				let unknown = new ServerDescription(address)
+				unknown.error = "primary marked stale due to discovery of newer primary"
+				td.servers[address] = unknown
+			}
+		}
+		let members = sd.members()
+		for let address in members {
+			td.servers[address] = new ServerDescription(address) unless td.servers.hasKey(address)
+		}
+		for let (address, _) in td.servers.clone() {
+			td.servers.delete(address) unless members.includes(address)
+		}
+		checkIfHasPrimary(td)
+	}
+
+	internal def markStalePrimary(td TopologyDescription, sd ServerDescription) {
+		let unknown = new ServerDescription(sd.address)
+		unknown.error = "primary marked stale due to electionId/setVersion mismatch, ({sd.electionId}, {sd.setVersion}) is stale compared to ({td.maxElectionId}, {td.maxSetVersion})"
+		unknown.lastUpdateTime = sd.lastUpdateTime
+		td.servers[sd.address] = unknown
+		checkIfHasPrimary(td)
+	}
+
+	internal def checkIfHasPrimary(td TopologyDescription) {
+		td.kind = td.hasPrimary() ?? (TopologyType.ReplicaSetWithPrimary, TopologyType.ReplicaSetNoPrimary)
+	}
+
+	// Compatibility and the logical session timeout, after any update.
+	internal def finishTopology(td TopologyDescription) {
+		td.compatible = true
+		td.compatibilityError = ""
+		for let (_, server) in td.servers {
+			continue when server.kind := ServerType.Unknown || ServerType.PossiblePrimary || ServerType.LoadBalancer
+			if server.minWireVersion > maxWireVersion {
+				td.compatible = false
+				td.compatibilityError = "Server at {server.address} requires wire version {server.minWireVersion}, but this version of {driverName} only supports up to {maxWireVersion}."
+			} else if server.maxWireVersion < minWireVersion {
+				td.compatible = false
+				td.compatibilityError = "Server at {server.address} reports wire version {server.maxWireVersion}, but this version of {driverName} requires at least {minWireVersion} (MongoDB 4.2)."
+			}
+		}
+		let timeout ?int = none
+		let first = true
+		for let (_, server) in td.servers {
+			continue unless server.isDataBearing() || (td.kind == TopologyType.Single && server.kind != ServerType.Unknown)
+			let minutes = server.logicalSessionTimeoutMinutes
+			if minutes is none {
+				timeout = none
+				first = false
+				break
+			}
+			if first {
+				timeout = minutes
+				first = false
+			} else {
+				let have = timeout
+				timeout = minutes when !(have is none) && minutes < have
+			}
+		}
+		td.logicalSessionTimeoutMinutes = first ?? (none, timeout)
+	}
+
+	// The error codes of SDAM's "node is recovering", "not writable
+	// primary" and "node is shutting down" classes.
+	internal const recoveringCodes = [11600, 11602, 13436, 189, 91]
+	internal const notWritablePrimaryCodes = [10107, 13435, 10058]
+	internal const shutdownCodes = [11600, 91]
+
+	internal def isRecovering(message string, code int) bool {
+		return recoveringCodes.includes(code) when code != 0
+		return message.contains("not master or secondary") || message.contains("node is recovering")
+	}
+
+	internal def isNotWritablePrimary(message string, code int) bool {
+		return notWritablePrimaryCodes.includes(code) when code != 0
+		return false when isRecovering(message, 0)
+		return message.contains("not master")
+	}
+
+	internal def isStateChange(message string, code int) bool {
+		return isRecovering(message, code) || isNotWritablePrimary(message, code)
+	}
+
+	// An error an operation met on a server, as SDAM's error handling
+	// reads it.
+	internal struct ServerError {
+		address         string
+		// The pool generation of the connection it happened on.
+		generation      int
+		network         bool             = false
+		timeout         bool             = false
+		// Whether the handshake (and authentication) had finished.
+		afterHandshake  bool             = true
+		code            int              = 0
+		message         string           = ""
+		topologyVersion ?TopologyVersion = none
+		labels          string[]         = []
+	}
+
+	// What SDAM says to do after an error: the new topology, and whether
+	// the server's pool is cleared and an immediate check requested.
+	internal struct ErrorOutcome {
+		topology     TopologyDescription
+		clearPool    bool                = false
+		requestCheck bool                = false
+		// Interrupt the connections in use too (network errors).
+		interrupt    bool                = false
+	}
+
+	// SDAM error handling ("Error handling pseudocode"), given the server's
+	// current pool generation.
+	internal def topologyAfterError(td TopologyDescription, poolGeneration int, e ServerError, ts TopologySettings) ErrorOutcome {
+		let unchanged = ErrorOutcome{topology: td}
+		let current = td.servers.get(e.address)
+		return unchanged when current is none
+		return unchanged when e.generation < poolGeneration
+		let lb = td.kind == TopologyType.LoadBalanced
+		if !e.network && !e.timeout && isStateChange(e.message, e.code) {
+			// A state change no newer than what the monitor saw is stale.
+			return unchanged when compareTopologyVersion(current.topologyVersion, e.topologyVersion) >= 0
+			let out = ErrorOutcome{topology: td, requestCheck: true, clearPool: shutdownCodes.includes(e.code)}
+			if !lb {
+				let unknown = new ServerDescription(e.address)
+				unknown.error = e.message
+				unknown.topologyVersion = e.topologyVersion
+				out.topology = updateTopology(td, unknown, ts)
+			}
+			return out
+		}
+		// A timeout never marks a server Unknown: it may be a slow server
+		// (SDAM, "Network error when reading or writing").
+		return unchanged when e.timeout
+		if e.network || !e.afterHandshake {
+			return unchanged when e.labels.includes("SystemOverloadedError")
+			let out = ErrorOutcome{topology: td, clearPool: true, interrupt: e.network}
+			if !lb {
+				let unknown = new ServerDescription(e.address)
+				unknown.error = e.message
+				out.topology = updateTopology(td, unknown, ts)
+			}
+			return out
+		}
+		return unchanged
+	}
+}

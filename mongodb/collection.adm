@@ -1,0 +1,730 @@
+partial module adm.database.mongodb {
+	use (
+		std.data.encoding::(BSONValue, BSONKind, ObjectId)
+	)
+
+	// What insert did with one document.
+	struct InsertResult {
+		// The document's _id (given, or made by the driver).
+		insertedId   BSONValue
+		acknowledged bool      = true
+	}
+
+	// What insert did with several documents.
+	struct InsertManyResult {
+		// The _id of each document by its position in the list.
+		insertedIds  map<int, BSONValue> = map<int, BSONValue>{}
+		acknowledged bool                = true
+	}
+
+	// What an update or replace did.
+	struct UpdateResult {
+		matched      int        = 0
+		modified     int        = 0
+		upserted     int        = 0
+		upsertedId   ?BSONValue = none
+		acknowledged bool       = true
+	}
+
+	// What a delete did.
+	struct DeleteResult {
+		deleted      int  = 0
+		acknowledged bool = true
+	}
+
+	// How insert writes.
+	struct InsertOptions {
+		// Stop at the first failing document (true), or try them all.
+		ordered                  bool          = true
+		bypassDocumentValidation bool          = false
+		comment                  any           = none
+		writeConcern             ?WriteConcern = none
+		session                  ?Session      = none
+	}
+
+	// How an update or replace writes.
+	struct UpdateOptions {
+		upsert                   bool          = false
+		arrayFilters             any[]         = []
+		collation                any           = none
+		hint                     any           = none
+		// Which document updateOne or replaceOne takes when several match.
+		sort                     any           = none
+		bypassDocumentValidation bool          = false
+		// Variables the update can read as `$$name`.
+		variables                any           = none
+		comment                  any           = none
+		writeConcern             ?WriteConcern = none
+		session                  ?Session      = none
+	}
+
+	// How a delete writes.
+	struct DeleteOptions {
+		collation    any           = none
+		hint         any           = none
+		variables    any           = none
+		comment      any           = none
+		writeConcern ?WriteConcern = none
+		session      ?Session      = none
+	}
+
+	// How findOneAndUpdate, findOneAndReplace and findOneAndDelete work:
+	// which document (sort), what comes back (projection, and the document
+	// after the change when `returnNew`).
+	struct FindAndModifyOptions {
+		sort                     any           = none
+		projection               any           = none
+		returnNew                bool          = false
+		upsert                   bool          = false
+		arrayFilters             any[]         = []
+		collation                any           = none
+		hint                     any           = none
+		bypassDocumentValidation bool          = false
+		variables                any           = none
+		comment                  any           = none
+		maxTime                  duration      = 0s
+		writeConcern             ?WriteConcern = none
+		session                  ?Session      = none
+	}
+
+	// How countDocuments counts.
+	struct CountOptions {
+		skip      int      = 0
+		limit     int      = 0
+		hint      any      = none
+		collation any      = none
+		comment   any      = none
+		maxTime   duration = 0s
+		session   ?Session = none
+	}
+
+	// How an aggregation runs.
+	struct AggregateOptions {
+		allowDiskUse             bool     = false
+		batchSize                int      = 0
+		bypassDocumentValidation bool     = false
+		collation                any      = none
+		hint                     any      = none
+		variables                any      = none
+		comment                  any      = none
+		maxTime                  duration = 0s
+		maxAwaitTime             duration = 0s
+		session                  ?Session = none
+	}
+
+	// The kinds of bulk write operations.
+	enum WriteKind {
+		InsertOne,
+		UpdateOne,
+		UpdateMany,
+		ReplaceOne,
+		DeleteOne,
+		DeleteMany,
+	}
+
+	// One operation of a bulk write: an insert of `document`, an update of
+	// the documents `filter` matches with `update` (operators or a
+	// pipeline), a replace with `document`, or a delete.
+	struct WriteModel<T> {
+		kind         WriteKind
+		document     ?T        = none
+		filter       any       = none
+		update       any       = none
+		upsert       bool      = false
+		arrayFilters any[]     = []
+		collation    any       = none
+		hint         any       = none
+		sort         any       = none
+	}
+
+	// How a bulk write runs.
+	struct BulkWriteOptions {
+		ordered                  bool          = true
+		bypassDocumentValidation bool          = false
+		variables                any           = none
+		comment                  any           = none
+		writeConcern             ?WriteConcern = none
+		session                  ?Session      = none
+	}
+
+	// One write statement as the server takes it.
+	internal struct Statement {
+		// 0 insert, 1 update, 2 delete.
+		command int
+		// The insert document, or the update or delete statement.
+		body    byte[]
+		multi   bool
+		// The position in the caller's list.
+		index   int
+		// The _id of an inserted document.
+		id      ?BSONValue = none
+	}
+
+	// Collection is one collection, whose documents read and write as T.
+	// Read and write concerns and the read preference are the database's
+	// unless set here.
+	partial type Collection<T> {
+		internal database Database
+		name              string
+		readPreference    ?ReadPreference = none
+		readConcern       ?ReadConcern    = none
+		writeConcern      ?WriteConcern   = none
+
+		def new(database Database, name string) {
+			self.database = database
+			self.name = name
+		}
+
+		// "database.collection".
+		def namespace() string {
+			return database.name + "." + name
+		}
+
+		// Inserts a document; one without an _id gets an ObjectId first.
+		// Fails with ErrorKind.Write (a duplicate key, a validation
+		// failure), ErrorKind.WriteConcern, or as any operation does.
+		def insert(document T, options InsertOptions = InsertOptions{}) !InsertResult {
+			let statement = try insertStatement(document, 0)
+			let result = try runStatements(self, [statement], options.ordered, writeConcernFor(self, options.writeConcern), options.session, options.bypassDocumentValidation, none, options.comment)
+			let id = statement.id
+			return InsertResult{insertedId: id is none ?? (new BSONValue(), id), acknowledged: result.acknowledged}
+		}
+
+		// Inserts documents in batches as large as the server takes.
+		// Fails as insert does; the error's `result` says which went in.
+		def insert(documents T[], options InsertOptions = InsertOptions{}) !InsertManyResult {
+			fail mongoError(ErrorKind.Argument, "insert needs at least one document") when documents.len() == 0
+			let statements Statement[] = []
+			for let (i, document) in documents {
+				statements.push(try insertStatement(document, i))
+			}
+			let result = try runStatements(self, statements, options.ordered, writeConcernFor(self, options.writeConcern), options.session, options.bypassDocumentValidation, none, options.comment)
+			let out = InsertManyResult{acknowledged: result.acknowledged}
+			for let statement in statements {
+				let id = statement.id
+				out.insertedIds[statement.index] = id unless id is none
+			}
+			return out
+		}
+
+		// A query for the documents the filter matches (all for none);
+		// nothing is sent until its results are asked for.
+		def find(filter any = none) Find<T> {
+			return new Find<T>(self, filter)
+		}
+
+		// The first document the filter matches, or none.
+		// Fails when the server refuses the query or the document does not
+		// convert to T.
+		def findOne(filter any = none, sort any = none, projection any = none, session ?Session = none) !?T {
+			let query = find(filter).limit(1)
+			query.sortBy = sort
+			query.projectionOf = projection
+			query.sessionOf = session
+			return try query.first()
+		}
+
+		// Counts the documents the filter matches (an aggregation; exact).
+		// Fails when the server refuses it.
+		def countDocuments(filter any = none, options CountOptions = CountOptions{}) !int {
+			let pipeline any[] = []
+			let matchStage = new BSONValue(BSONKind.Document)
+			matchStage.set("$match", filter is none ?? (new BSONValue(BSONKind.Document), try toDocument(filter)))
+			pipeline.push(matchStage)
+			if options.skip > 0 {
+				let skip = new BSONValue(BSONKind.Document)
+				skip.set("$skip", new BSONValue(int64(options.skip)))
+				pipeline.push(skip)
+			}
+			if options.limit > 0 {
+				let limit = new BSONValue(BSONKind.Document)
+				limit.set("$limit", new BSONValue(int64(options.limit)))
+				pipeline.push(limit)
+			}
+			let group = new BSONValue(BSONKind.Document)
+			let spec = new BSONValue(BSONKind.Document)
+			spec.set("_id", new BSONValue(int32(1)))
+			let sum = new BSONValue(BSONKind.Document)
+			sum.set("$sum", new BSONValue(int32(1)))
+			spec.set("n", sum)
+			group.set("$group", spec)
+			pipeline.push(group)
+			let aggregateOptions = AggregateOptions{hint: options.hint, collation: options.collation, comment: options.comment, maxTime: options.maxTime, session: options.session}
+			let cursor = try aggregate<Document>(pipeline, aggregateOptions)
+			let first = try cursor.next()
+			try cursor.close()
+			return first is none ?? (0, intOf(first, "n", 0))
+		}
+
+		// The number of documents from the collection's metadata (the count
+		// command): fast, but may be off after an unclean shutdown or with
+		// orphaned documents on a sharded cluster.
+		// Fails when the server refuses it.
+		def estimatedDocumentCount(maxTime duration = 0s, comment any = none) !int {
+			let command = new BSONValue(BSONKind.Document)
+			command.set("count", new BSONValue(name))
+			command.set("maxTimeMS", new BSONValue(int64(maxTime.milliseconds()))) when maxTime > 0s
+			try setValue(command, "comment", comment)
+			let spec = OpSpec{name: "count", database: database.name, readPreference: collectionReadPreference(self), retryRead: true, readConcern: collectionReadConcern(self)}
+			let result = try execute(database.client, spec, def (c Conn) !(BSONValue, Sequence[]) {
+				return (try copyDocument(command), [])
+			})
+			return intOf(result.reply, "n", 0)
+		}
+
+		// The distinct values of a field among the documents the filter
+		// matches.
+		// Fails when the server refuses it.
+		def distinct(field string, filter any = none, collation any = none, session ?Session = none) !Document[] {
+			let command = new BSONValue(BSONKind.Document)
+			command.set("distinct", new BSONValue(name))
+			command.set("key", new BSONValue(field))
+			command.set("query", filter is none ?? (new BSONValue(BSONKind.Document), try toDocument(filter)))
+			try setValue(command, "collation", collation)
+			let spec = OpSpec{name: "distinct", database: database.name, readPreference: collectionReadPreference(self), retryRead: true, readConcern: collectionReadConcern(self), session: session}
+			let result = try execute(database.client, spec, def (c Conn) !(BSONValue, Sequence[]) {
+				return (try copyDocument(command), [])
+			})
+			return result.reply.has("values") ?? (result.reply.get("values").elements(), [])
+		}
+
+		// Runs an aggregation pipeline and returns its results as R. A
+		// pipeline ending in `$out` or `$merge` writes, and runs on the
+		// primary.
+		// Fails when the server refuses the pipeline.
+		def aggregate<R>(pipeline any[], options AggregateOptions = AggregateOptions{}) !Cursor<R> {
+			return try runAggregate<R>(database.client, database.name, name, pipeline, options, collectionReadPreference(self), collectionReadConcern(self), writeConcernFor(self, none))
+		}
+
+		// Updates the first document the filter matches with update
+		// operators (`{"$set": {...}}`) or a pipeline.
+		// Fails with ErrorKind.Argument when the update is neither, and as
+		// insert does.
+		def updateOne(filter any, update any, options UpdateOptions = UpdateOptions{}) !UpdateResult {
+			let statement = try updateStatement(filter, update, multi = false, upsert = options.upsert, arrayFilters = options.arrayFilters, collation = options.collation, hint = options.hint, sort = options.sort, index = 0, replace = false)
+			return try updateResultOf(try runStatements(self, [statement], true, writeConcernFor(self, options.writeConcern), options.session, options.bypassDocumentValidation, options.variables, options.comment))
+		}
+
+		// Updates every document the filter matches.
+		// Fails as updateOne does.
+		def updateMany(filter any, update any, options UpdateOptions = UpdateOptions{}) !UpdateResult {
+			fail mongoError(ErrorKind.Argument, "updateMany takes no sort") unless options.sort is none
+			let statement = try updateStatement(filter, update, multi = true, upsert = options.upsert, arrayFilters = options.arrayFilters, collation = options.collation, hint = options.hint, sort = none, index = 0, replace = false)
+			return try updateResultOf(try runStatements(self, [statement], true, writeConcernFor(self, options.writeConcern), options.session, options.bypassDocumentValidation, options.variables, options.comment))
+		}
+
+		// Replaces the first document the filter matches with another.
+		// Fails with ErrorKind.Argument when the replacement holds update
+		// operators.
+		def replaceOne(filter any, replacement T, options UpdateOptions = UpdateOptions{}) !UpdateResult {
+			let statement = try updateStatement(filter, replacement, multi = false, upsert = options.upsert, arrayFilters = [], collation = options.collation, hint = options.hint, sort = options.sort, index = 0, replace = true)
+			return try updateResultOf(try runStatements(self, [statement], true, writeConcernFor(self, options.writeConcern), options.session, options.bypassDocumentValidation, options.variables, options.comment))
+		}
+
+		// Deletes the first document the filter matches.
+		// Fails with a MongoError carrying the write or write concern error
+		// when the server refuses the delete, or when no server is reachable.
+		def deleteOne(filter any, options DeleteOptions = DeleteOptions{}) !DeleteResult {
+			let statement = try deleteStatement(filter, false, options.collation, options.hint, 0)
+			let result = try runStatements(self, [statement], ordered = true, wc = writeConcernFor(self, options.writeConcern), session = options.session, bypass = false, letVars = options.variables, comment = options.comment)
+			return DeleteResult{deleted: result.deleted, acknowledged: result.acknowledged}
+		}
+
+		// Deletes every document the filter matches.
+		// Fails as deleteOne does.
+		def deleteMany(filter any, options DeleteOptions = DeleteOptions{}) !DeleteResult {
+			let statement = try deleteStatement(filter, true, options.collation, options.hint, 0)
+			let result = try runStatements(self, [statement], ordered = true, wc = writeConcernFor(self, options.writeConcern), session = options.session, bypass = false, letVars = options.variables, comment = options.comment)
+			return DeleteResult{deleted: result.deleted, acknowledged: result.acknowledged}
+		}
+
+		// Runs inserts, updates, replaces and deletes in batches: in order,
+		// stopping at the first failure, or (unordered) all of them.
+		// Fails with ErrorKind.Write listing each failed operation by its
+		// position, with `result` for what succeeded.
+		def bulkWrite(models WriteModel<T>[], options BulkWriteOptions = BulkWriteOptions{}) !BulkWriteResult {
+			fail mongoError(ErrorKind.Argument, "bulkWrite needs at least one operation") when models.len() == 0
+			let statements Statement[] = []
+			for let (i, model) in models {
+				switch model.kind {
+					case WriteKind.InsertOne:
+						let document = model.document
+						fail mongoError(ErrorKind.Argument, "an InsertOne needs a document") when document is none
+						statements.push(try insertStatement(document, i))
+					case WriteKind.UpdateOne, WriteKind.UpdateMany:
+						statements.push(try updateStatement(model.filter, model.update, model.kind == WriteKind.UpdateMany, model.upsert, model.arrayFilters, model.collation, model.hint, model.sort, i, false))
+					case WriteKind.ReplaceOne:
+						let document = model.document
+						fail mongoError(ErrorKind.Argument, "a ReplaceOne needs a document") when document is none
+						statements.push(try updateStatement(model.filter, document, multi = false, upsert = model.upsert, arrayFilters = [], collation = model.collation, hint = model.hint, sort = model.sort, index = i, replace = true))
+					default:
+						statements.push(try deleteStatement(model.filter, model.kind == WriteKind.DeleteMany, model.collation, model.hint, i))
+				}
+			}
+			return try runStatements(self, statements, options.ordered, writeConcernFor(self, options.writeConcern), options.session, options.bypassDocumentValidation, options.variables, options.comment)
+		}
+
+		// Deletes the first document the filter matches and returns it.
+		// Fails when the server refuses the command or the document does not
+		// convert to T.
+		def findOneAndDelete(filter any, options FindAndModifyOptions = FindAndModifyOptions{}) !?T {
+			return try findAndModify<T>(self, filter, none, remove = true, options = options)
+		}
+
+		// Updates the first document the filter matches and returns it, as
+		// it was or (`returnNew`) as it is now.
+		// Fails as findOneAndDelete does, or when the update has no
+		// operators.
+		def findOneAndUpdate(filter any, update any, options FindAndModifyOptions = FindAndModifyOptions{}) !?T {
+			let doc = try toUpdate(update)
+			return try findAndModify<T>(self, filter, doc, remove = false, options = options)
+		}
+
+		// Replaces the first document the filter matches and returns it.
+		// Fails as findOneAndDelete does, or when the replacement holds
+		// update operators.
+		def findOneAndReplace(filter any, replacement T, options FindAndModifyOptions = FindAndModifyOptions{}) !?T {
+			let doc = try toReplacement(replacement)
+			return try findAndModify<T>(self, filter, doc, remove = false, options = options)
+		}
+
+		// Drops the collection (a missing one is not an error).
+		def drop(session ?Session = none) !none {
+			let command = new BSONValue(BSONKind.Document)
+			command.set("drop", new BSONValue(name))
+			runWrite(database.client, database.name, command, writeConcernFor(self, none), session) onerror (err error) {
+				return none when serverCodeOf(err) == 26
+				fail err
+			}
+			return none
+		}
+
+		// Renames the collection, replacing one of the new name when
+		// `dropTarget` says so.
+		// Fails when the collection does not exist, the new name is taken
+		// and `dropTarget` is false, or the server refuses.
+		def rename(newName string, dropTarget bool = false, session ?Session = none) !none {
+			let command = new BSONValue(BSONKind.Document)
+			command.set("renameCollection", new BSONValue(namespace()))
+			command.set("to", new BSONValue(database.name + "." + newName))
+			command.set("dropTarget", new BSONValue(true)) when dropTarget
+			try runWrite(database.client, "admin", command, writeConcernFor(self, none), session)
+			name = newName
+			return none
+		}
+	}
+
+	internal def collectionReadPreference<T>(c Collection<T>) ReadPreference {
+		let rp = c.readPreference
+		return rp is none ?? (readPreferenceOf(c.database), rp)
+	}
+
+	internal def collectionReadConcern<T>(c Collection<T>) ReadConcern {
+		let rc = c.readConcern
+		return rc is none ?? (readConcernOf(c.database), rc)
+	}
+
+	internal def writeConcernFor<T>(c Collection<T>, given ?WriteConcern) WriteConcern {
+		return given unless given is none
+		let wc = c.writeConcern
+		return wc is none ?? (writeConcernOf(c.database), wc)
+	}
+
+	internal def setValue(command BSONValue, name string, value any) !none {
+		return none when value is none
+		if value is string {
+			command.set(name, new BSONValue(value))
+			return none
+		}
+		if value is int {
+			command.set(name, new BSONValue(value))
+			return none
+		}
+		command.set(name, try toDocument(value))
+		return none
+	}
+
+	// The insert statement of a document: its BSON, with an ObjectId _id
+	// put first when it has none.
+	internal def insertStatement(document any, index int) !Statement {
+		let doc = try toDocument(document)
+		let id = new BSONValue()
+		let out = new BSONValue(BSONKind.Document)
+		if doc.has("_id") {
+			id = doc.get("_id")
+			out = doc
+		} else {
+			id = new BSONValue(new ObjectId())
+			out.set("_id", id)
+			for let entry in doc.entries() {
+				let (key, value) = entry
+				out.set(key, value)
+			}
+		}
+		let body = bsonCodec.encode(out) onerror (err error) {
+			fail mongoErrorCaused(ErrorKind.Argument, "the document does not encode", err)
+		}
+		return Statement{command: 0, body: body, multi: false, index: index, id: id}
+	}
+
+	// An update document: operators, or a pipeline (an array).
+	internal def toUpdate(update any) !BSONValue {
+		if update is BSONValue {
+			return update when update.kind == BSONKind.Array
+		}
+		let doc = try toDocumentOrArray(update)
+		if doc.kind == BSONKind.Document {
+			let names = doc.names()
+			fail mongoError(ErrorKind.Argument, "an update needs update operators ($set, $inc...) or a pipeline") when names.len() == 0 || !names[0].startsWith("$")
+		}
+		return doc
+	}
+
+	internal def toReplacement(replacement any) !BSONValue {
+		let doc = try toDocument(replacement)
+		let names = doc.names()
+		fail mongoError(ErrorKind.Argument, "a replacement holds no update operators") when names.len() > 0 && names[0].startsWith("$")
+		return doc
+	}
+
+	// A value as a document or an array (a pipeline).
+	internal def toDocumentOrArray(value any) !BSONValue {
+		if value is any[] {
+			let list = new BSONValue(BSONKind.Array)
+			for let item in value {
+				list.push(try toDocument(item))
+			}
+			return list
+		}
+		return try toDocument(value)
+	}
+
+	internal def updateStatement(filter any, update any, multi bool, upsert bool, arrayFilters any[], collation any, hint any, sort any, index int, replace bool) !Statement {
+		let statement = new BSONValue(BSONKind.Document)
+		statement.set("q", filter is none ?? (new BSONValue(BSONKind.Document), try toDocument(filter)))
+		statement.set("u", replace ?? (try toReplacement(update), try toUpdate(update)))
+		statement.set("upsert", new BSONValue(true)) when upsert
+		statement.set("multi", new BSONValue(true)) when multi
+		if arrayFilters.len() > 0 {
+			let list = new BSONValue(BSONKind.Array)
+			for let f in arrayFilters {
+				list.push(try toDocument(f))
+			}
+			statement.set("arrayFilters", list)
+		}
+		try setValue(statement, "collation", collation)
+		try setValue(statement, "hint", hint)
+		try setValue(statement, "sort", sort)
+		let body = bsonCodec.encode(statement) onerror (err error) {
+			fail mongoErrorCaused(ErrorKind.Argument, "the update does not encode", err)
+		}
+		return Statement{command: 1, body: body, multi: multi, index: index}
+	}
+
+	internal def deleteStatement(filter any, many bool, collation any, hint any, index int) !Statement {
+		let statement = new BSONValue(BSONKind.Document)
+		statement.set("q", filter is none ?? (new BSONValue(BSONKind.Document), try toDocument(filter)))
+		statement.set("limit", new BSONValue(int32(many ?? (0, 1))))
+		try setValue(statement, "collation", collation)
+		try setValue(statement, "hint", hint)
+		let body = bsonCodec.encode(statement) onerror (err error) {
+			fail mongoErrorCaused(ErrorKind.Argument, "the filter does not encode", err)
+		}
+		return Statement{command: 2, body: body, multi: many, index: index}
+	}
+
+	internal def updateResultOf(r BulkWriteResult) !UpdateResult {
+		let out = UpdateResult{matched: r.matched, modified: r.modified, upserted: r.upserted, acknowledged: r.acknowledged}
+		for let (_, id) in r.upsertedIds {
+			out.upsertedId = id
+		}
+		return out
+	}
+
+	// Runs write statements as insert, update and delete commands (CRUD and
+	// Server Write Commands specs): consecutive statements of one kind go
+	// together (all of a kind, unordered), split into batches the server
+	// takes; results add up and write errors keep the caller's positions.
+	internal def runStatements<T>(c Collection<T>, statements Statement[], ordered bool, wc WriteConcern, session ?Session, bypass bool, letVars any, comment any) !BulkWriteResult {
+		let total = BulkWriteResult{acknowledged: acknowledged(wc)}
+		fail mongoError(ErrorKind.Argument, "an unacknowledged write cannot be ordered with a session") when !acknowledged(wc) && !(session is none)
+		let groups Statement[][] = []
+		if ordered {
+			for let statement in statements {
+				if groups.len() == 0 || groups[groups.len() - 1][0].command != statement.command {
+					groups.push([statement])
+				} else {
+					groups[groups.len() - 1].push(statement)
+				}
+			}
+		} else {
+			for let kind in [0, 1, 2] {
+				let group = statements.filter(s => s.command == kind)
+				groups.push(group) when group.len() > 0
+			}
+		}
+		let errors WriteError[] = []
+		let concernError ?WriteConcernError = none
+		let labels string[] = []
+		for let group in groups {
+			let start = 0
+			for start < group.len() {
+				let taken = 0
+				let commandName = group[0].command == 0 ?? ("insert", group[0].command == 1 ?? ("update", "delete"))
+				let sequenceName = group[0].command == 0 ?? ("documents", group[0].command == 1 ?? ("updates", "deletes"))
+				let spec = OpSpec{name: commandName, database: c.database.name, write: true, retryWrite: true, writeConcern: wc, session: session}
+				let result = try execute(c.database.client, spec, def (conn Conn) !(BSONValue, Sequence[]) {
+					// As many statements as one command takes on this server.
+					let docs byte[][] = []
+					let size = 0
+					let i = start
+					for i < group.len() && docs.len() < conn.maxWriteBatchSize {
+						let body = group[i].body
+						fail mongoError(ErrorKind.Argument, "a document of {body.len()} bytes is larger than the server takes ({conn.maxBsonObjectSize})") when group[0].command == 0 && body.len() > conn.maxBsonObjectSize
+						break when docs.len() > 0 && size + body.len() > conn.maxMessageSize - 16384
+						docs.push(body)
+						size += body.len()
+						i++
+					}
+					taken = docs.len()
+					// A batch with a statement that may touch several
+					// documents is not a retryable write.
+					for let j = start; j < start + taken; j++ {
+						spec.retryWrite = false when group[j].multi
+					}
+					let command = new BSONValue(BSONKind.Document)
+					command.set(commandName, new BSONValue(c.name))
+					command.set("ordered", new BSONValue(ordered))
+					command.set("bypassDocumentValidation", new BSONValue(true)) when bypass
+					try setValue(command, "let", letVars)
+					try setValue(command, "comment", comment)
+					return (command, [Sequence{identifier: sequenceName, documents: docs}])
+				})
+				let reply = result.reply
+				let n = intOf(reply, "n", 0)
+				switch group[0].command {
+					case 0:
+						total.inserted += n
+						for let j = start; j < start + taken; j++ {
+							let id = group[j].id
+							total.insertedIds[group[j].index] = id unless id is none
+						}
+					case 1:
+						let upserts = reply.has("upserted") ?? (reply.get("upserted").elements(), [])
+						total.matched += n - upserts.len()
+						total.modified += intOf(reply, "nModified", 0)
+						total.upserted += upserts.len()
+						for let u in upserts {
+							let at = intOf(u, "index", 0)
+							total.upsertedIds[group[start + at].index] = u.get("_id")
+						}
+					default:
+						total.deleted += n
+				}
+				let failedHere = false
+				if reply.has("writeErrors") {
+					for let we in reply.get("writeErrors").elements() {
+						let at = intOf(we, "index", 0)
+						errors.push(WriteError{index: group[start + at].index, code: intOf(we, "code", 0), codeName: stringOf(we, "codeName"), message: stringOf(we, "errmsg"), details: we.has("errInfo") ?? (we.get("errInfo"), none)})
+						failedHere = true
+						total.insertedIds.delete(group[start + at].index) when group[0].command == 0
+					}
+				}
+				if reply.has("writeConcernError") {
+					let wce = reply.get("writeConcernError")
+					concernError = WriteConcernError{code: intOf(wce, "code", 0), codeName: stringOf(wce, "codeName"), message: stringOf(wce, "errmsg"), details: wce.has("errInfo") ?? (wce.get("errInfo"), none)}
+					labels = labelsOf(reply)
+				}
+				start += taken
+				return try writeFailure(total, errors, concernError, labels) when ordered && failedHere
+			}
+		}
+		return try writeFailure(total, errors, concernError, labels) when errors.len() > 0 || !(concernError is none)
+		return total
+	}
+
+	// The error of a write some of whose statements failed.
+	internal def writeFailure(result BulkWriteResult, errors WriteError[], concern ?WriteConcernError, labels string[]) !BulkWriteResult {
+		let kind = errors.len() > 0 ?? (ErrorKind.Write, ErrorKind.WriteConcern)
+		let first = errors.len() > 0 ?? (errors[0].message, concern is none ?? ("", concern.message))
+		let err = mongoError(kind, errors.len() > 1 ?? ("{errors.len()} writes failed; the first: {first}", first))
+		err.writeErrors = errors
+		err.writeConcernError = concern
+		err.labels = labels
+		err.result = result
+		if errors.len() > 0 {
+			err.serverCode = errors[0].code
+			err.codeName = errors[0].codeName
+		} else if !(concern is none) {
+			err.serverCode = concern.code
+			err.codeName = concern.codeName
+		}
+		fail err
+	}
+
+	// findAndModify (CRUD spec): the document before or after the change.
+	internal def findAndModify<T>(c Collection<T>, filter any, update ?BSONValue, remove bool, options FindAndModifyOptions) !?T {
+		let command = new BSONValue(BSONKind.Document)
+		command.set("findAndModify", new BSONValue(c.name))
+		command.set("query", filter is none ?? (new BSONValue(BSONKind.Document), try toDocument(filter)))
+		try setValue(command, "sort", options.sort)
+		if remove {
+			command.set("remove", new BSONValue(true))
+		} else {
+			command.set("update", update is none ?? (new BSONValue(BSONKind.Document), update))
+			command.set("new", new BSONValue(true)) when options.returnNew
+			command.set("upsert", new BSONValue(true)) when options.upsert
+		}
+		try setValue(command, "fields", options.projection)
+		if options.arrayFilters.len() > 0 {
+			let list = new BSONValue(BSONKind.Array)
+			for let f in options.arrayFilters {
+				list.push(try toDocument(f))
+			}
+			command.set("arrayFilters", list)
+		}
+		try setValue(command, "collation", options.collation)
+		try setValue(command, "hint", options.hint)
+		command.set("bypassDocumentValidation", new BSONValue(true)) when options.bypassDocumentValidation
+		try setValue(command, "let", options.variables)
+		try setValue(command, "comment", options.comment)
+		command.set("maxTimeMS", new BSONValue(int64(options.maxTime.milliseconds()))) when options.maxTime > 0s
+		let spec = OpSpec{name: "findAndModify", database: c.database.name, write: true, retryWrite: true, writeConcern: writeConcernFor(c, options.writeConcern), session: options.session}
+		let result = try execute(c.database.client, spec, def (conn Conn) !(BSONValue, Sequence[]) {
+			return (try copyDocument(command), [])
+		})
+		try checkWriteConcernError(result.reply)
+		let value = result.reply.get("value")
+		return none when value.kind == BSONKind.Null
+		return try decodeAs<T>(value)
+	}
+
+	// Runs an aggregation on a collection ("" for the database).
+	internal def runAggregate<R>(client Client, database string, collection string, pipeline any[], options AggregateOptions, rp ReadPreference, rc ReadConcern, wc WriteConcern) !Cursor<R> {
+		let stages = new BSONValue(BSONKind.Array)
+		let writes = false
+		for let stage in pipeline {
+			let doc = try toDocument(stage)
+			let names = doc.names()
+			writes = true when names.len() > 0 && (names[0] := "$out" || "$merge")
+			stages.push(doc)
+		}
+		let command = new BSONValue(BSONKind.Document)
+		command.set("aggregate", collection == "" ?? (new BSONValue(int32(1)), new BSONValue(collection)))
+		command.set("pipeline", stages)
+		let cursorDoc = new BSONValue(BSONKind.Document)
+		cursorDoc.set("batchSize", new BSONValue(int32(options.batchSize))) when options.batchSize > 0 && !writes
+		command.set("cursor", cursorDoc)
+		command.set("allowDiskUse", new BSONValue(true)) when options.allowDiskUse
+		command.set("bypassDocumentValidation", new BSONValue(true)) when options.bypassDocumentValidation
+		try setValue(command, "collation", options.collation)
+		try setValue(command, "hint", options.hint)
+		try setValue(command, "let", options.variables)
+		try setValue(command, "comment", options.comment)
+		command.set("maxTimeMS", new BSONValue(int64(options.maxTime.milliseconds()))) when options.maxTime > 0s
+		let spec = OpSpec{name: "aggregate", database: database, readPreference: rp, write: writes, writeStage: writes, retryRead: !writes, readConcern: rc, writeConcern: writes ?? (wc, none), session: options.session}
+		let cursor = try openCursor<R>(client, spec, command, options.batchSize, 0)
+		cursor.maxAwait = options.maxAwaitTime
+		return cursor
+	}
+}

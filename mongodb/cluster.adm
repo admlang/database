@@ -1,0 +1,597 @@
+partial module adm.database.mongodb {
+	use (
+		std.data.encoding::(BSONValue, BSONKind, ObjectId, parseObjectId)
+		std.services.runtime::(Runtime)
+		std.time
+	)
+
+	// SDAM's minHeartbeatFrequencyMS: monitors never check more often.
+	internal const minHeartbeat = 500ms
+
+	// One server of the deployment: its pool, its monitor, and how many
+	// operations run on it now.
+	internal type Server {
+		address          string
+		pool             Pool
+		monitor          ?Monitor = none
+		internal running int      = 0
+
+		def new(address string, pool Pool) {
+			self.address = address
+			self.pool = pool
+		}
+
+		atomic def operationStarted() {
+			running++
+		}
+
+		atomic def operationEnded() {
+			running--
+		}
+
+		atomic def operations() int {
+			return running
+		}
+	}
+
+	// Whether the program runs as a function-as-a-service, where monitors
+	// poll rather than stream (Server Monitoring spec).
+	internal def inFaaS() bool {
+		for let name in ["AWS_EXECUTION_ENV", "AWS_LAMBDA_RUNTIME_API", "FUNCTIONS_WORKER_RUNTIME", "K_SERVICE", "FUNCTION_NAME", "VERCEL"] {
+			let value = Runtime.getEnv(name)
+			if !(value is none) {
+				return true unless name == "AWS_EXECUTION_ENV" && !value.startsWith("AWS_Lambda_")
+			}
+		}
+		return false
+	}
+
+	// The deployment as the client sees it, and the servers it talks to.
+	internal type Cluster {
+		settings             Settings
+		ts                   TopologySettings
+		cache                ScramCache
+		internal current     TopologyDescription
+		internal servers     map<string, Server> = map<string, Server>{}
+		internal waiters     Waiter[]            = []
+		internal closed      bool                = false
+		// The greatest $clusterTime the deployment has reported.
+		internal clusterTime ?BSONValue          = none
+
+		def new(settings Settings, ts TopologySettings) {
+			self.settings = settings
+			self.ts = ts
+			cache = new ScramCache()
+			current = initialTopology(ts)
+		}
+
+		// Starts the servers of the initial topology and their monitors.
+		def start() {
+			let addresses = currentAddresses()
+			for let address in addresses {
+				startServer(address)
+			}
+		}
+
+		internal atomic def currentAddresses() string[] {
+			return current.servers.keys()
+		}
+
+		// The topology as it is now; it does not change under the caller.
+		atomic def description() TopologyDescription {
+			return current
+		}
+
+		internal def startServer(address string) {
+			let plan = DialPlan{address: address, settings: settings, monitoring: false, useHello: false, cache: cache}
+			let server = new Server(address, new Pool(address, plan))
+			return unless register(server)
+			if !settings.loadBalanced {
+				let monitor = new Monitor(address, self, settings)
+				server.monitor = monitor
+				monitor.start()
+			}
+		}
+
+		internal atomic def register(server Server) bool {
+			return false when closed || servers.hasKey(server.address)
+			servers[server.address] = server
+			return true
+		}
+
+		atomic def server(address string) ?Server {
+			return servers.get(address)
+		}
+
+		// Applies a server check's outcome: the topology changes, servers
+		// it added start their monitors and those it removed stop, the
+		// server's pool is readied or cleared, and waiting selections look
+		// again.
+		def onCheck(sd ServerDescription, timeoutError bool) {
+			let (added, removed, server) = applyCheck(sd)
+			for let address in added {
+				startServer(address)
+			}
+			for let gone in removed {
+				gone.pool.close()
+				let monitor = gone.monitor
+				monitor.stop() unless monitor is none
+			}
+			if !(server is none) {
+				if sd.kind != ServerType.Unknown && (sd.isDataBearing() || ts.direct) {
+					server.pool.markReady()
+					if server.pool.minSize > 0 {
+						let pool = server.pool
+						let _ = async pool.populate()
+					}
+				} else if sd.error != "" {
+					server.pool.clear(timeoutError)
+				}
+			}
+		}
+
+		internal atomic def applyCheck(sd ServerDescription) (string[], Server[], ?Server) {
+			let before = current
+			current = updateTopology(before, sd, ts)
+			let added string[] = []
+			for let (address, _) in current.servers {
+				added.push(address) unless servers.hasKey(address)
+			}
+			let removed Server[] = []
+			for let (address, server) in servers.clone() {
+				if !current.servers.hasKey(address) {
+					removed.push(server)
+					servers.delete(address)
+				}
+			}
+			wakeWaiters()
+			return (added, removed, servers.get(sd.address))
+		}
+
+		internal def wakeWaiters() {
+			for let waiter in waiters {
+				waiter.signal()
+			}
+		}
+
+		// Puts the hosts of an SRV rescan in place of the current ones:
+		// hosts that went away leave, new ones join (up to `maxHosts` in
+		// all when it is positive); the others stay as they are.
+		def replaceSeeds(addresses string[], maxHosts int) {
+			let (added, removed) = reseed(addresses, maxHosts)
+			for let address in added {
+				startServer(address)
+			}
+			for let gone in removed {
+				gone.pool.close()
+				let monitor = gone.monitor
+				monitor.stop() unless monitor is none
+			}
+		}
+
+		internal atomic def reseed(addresses string[], maxHosts int) (string[], Server[]) {
+			let td = current.copy()
+			let removed Server[] = []
+			for let (address, _) in current.servers {
+				continue when addresses.includes(address)
+				td.servers.delete(address)
+				let server = servers.get(address)
+				if !(server is none) {
+					removed.push(server)
+					servers.delete(address)
+				}
+			}
+			let fresh string[] = addresses.filter(a => !td.servers.hasKey(a))
+			let room = maxHosts > 0 ?? (maxHosts - td.servers.len(), fresh.len())
+			let chosen = pickHosts(fresh.mapElem(a => HostAddress{host: a}), room)
+			let added string[] = []
+			for let h in chosen {
+				td.servers[h.host] = new ServerDescription(h.host)
+				added.push(h.host)
+			}
+			finishTopology(td)
+			current = td
+			wakeWaiters()
+			return (added, removed)
+		}
+
+		// Asks every monitor to check its server now.
+		def requestCheck() {
+			for let server in serverList() {
+				let monitor = server.monitor
+				monitor.requestCheck() unless monitor is none
+			}
+		}
+
+		internal atomic def serverList() Server[] {
+			return servers.values()
+		}
+
+		// Selects a server for an operation (Server Selection spec): from
+		// the suitable servers in the latency window, the less busy of two
+		// picked at random; while none fits, the monitors are asked to
+		// check and selection waits for the topology to change, until
+		// `deadline` (monotonic ns).
+		// Fails with ErrorKind.ServerSelection when the time runs out (with
+		// what the topology looked like), ErrorKind.Argument when the read
+		// preference does not fit the topology, ErrorKind.Protocol when a
+		// server's wire version is outside what the driver speaks.
+		// A `writeStage` aggregate is selected as a read with `rp` unless a
+		// known server is older than 5.0, when it goes to the primary; the
+		// read preference used is returned with the server.
+		def selectServer(rp ReadPreference, write bool, deadline int64, deprioritized string[] = [], writeStage bool = false) !(Server, ReadPreference) {
+			let waiter = new Waiter()
+			addWaiter(waiter)
+			defer removeWaiter(waiter)
+			for {
+				fail mongoError(ErrorKind.Closed, "the client is closed") when isClosed()
+				let td = description()
+				fail mongoError(ErrorKind.Protocol, td.compatibilityError) unless td.compatible
+				let used = writeStage ?? (writeStagePreference(td, rp), rp)
+				let suitable = try suitableServers(td, used, write && !writeStage, settings.heartbeatFrequency, deprioritized)
+				let window = latencyWindow(suitable, settings.localThreshold)
+				if window.len() > 0 {
+					let chosen = pickServer(window, address => operationsOn(address))
+					let server = self.server(chosen.address)
+					if !(server is none) {
+						server.operationStarted()
+						return (server, used)
+					}
+				}
+				requestCheck()
+				let now = time.monoNs()
+				fail mongoError(ErrorKind.ServerSelection, "no server fits {write ?? ("a write", "a read ({rp.mode.value})")} within the server selection timeout; the topology is {describeTopology(td)}") when now >= deadline
+				let timer = time.sleepChan(duration(deadline - now))
+				select {
+					case waiter.wake:
+						waiter.wake.flush()
+					case timer:
+				}
+			}
+		}
+
+		internal def operationsOn(address string) int {
+			let server = self.server(address)
+			return server is none ?? (0, server.operations())
+		}
+
+		internal atomic def addWaiter(waiter Waiter) {
+			waiters.push(waiter)
+		}
+
+		internal atomic def removeWaiter(waiter Waiter) {
+			let index = waiters.indexOf(waiter)
+			waiters.remove(index) when index >= 0
+		}
+
+		atomic def isClosed() bool {
+			return closed
+		}
+
+		// SDAM error handling for an operation's failure on a server.
+		def onError(server Server, generation int, err error, afterHandshake bool) {
+			let e = ServerError{address: server.address, generation: generation, afterHandshake: afterHandshake}
+			if err is MongoError {
+				e.timeout = err.kind == ErrorKind.TimedOut
+				e.network = err.labels.includes("NetworkError") || e.timeout
+				e.code = err.serverCode
+				e.message = err.message
+				e.labels = err.labels
+				let wce = err.writeConcernError
+				if !(wce is none) {
+					e.code = wce.code
+					e.message = wce.message
+				}
+			} else {
+				e.network = true
+			}
+			let outcome = applyError(server, e)
+			server.pool.clear(outcome.interrupt) when outcome.clearPool
+			if outcome.requestCheck {
+				let monitor = server.monitor
+				monitor.requestCheck() unless monitor is none
+			}
+		}
+
+		internal atomic def applyError(server Server, e ServerError) ErrorOutcome {
+			let outcome = topologyAfterError(current, server.pool.generationNow(), e, ts)
+			current = outcome.topology
+			wakeWaiters()
+			return outcome
+		}
+
+		// The greatest cluster time seen, to gossip on commands.
+		atomic def clusterTimeNow() ?BSONValue {
+			return clusterTime
+		}
+
+		// Keeps a reply's $clusterTime when it is newer.
+		atomic def advanceClusterTime(reply BSONValue) {
+			return unless reply.has("$clusterTime")
+			let incoming = reply.get("$clusterTime")
+			let have = clusterTime
+			clusterTime = incoming when have is none || timestampOf(incoming.get("clusterTime")) > timestampOf(have.get("clusterTime"))
+		}
+
+		// Stops the monitors and closes every pool.
+		def close() {
+			for let server in shutDown() {
+				let monitor = server.monitor
+				monitor.stop() unless monitor is none
+				server.pool.close()
+			}
+		}
+
+		internal atomic def shutDown() Server[] {
+			closed = true
+			let all = servers.values()
+			servers = map<string, Server>{}
+			wakeWaiters()
+			return all
+		}
+	}
+
+	// A timestamp as one comparable number: seconds, then increment.
+	internal def timestampOf(v BSONValue) int64 {
+		let (seconds, increment) = v.asTimestamp() onerror recover (uint32(0), uint32(0))
+		return (int64(seconds) << 32) | int64(increment)
+	}
+
+	internal def describeTopology(td TopologyDescription) string {
+		let parts string[] = []
+		for let (address, server) in td.servers {
+			parts.push(server.error == "" ?? ("{address} {server.kind.value}", "{address} {server.kind.value} ({server.error})"))
+		}
+		return "{td.kind.value} [{parts.join(", ")}]"
+	}
+
+	// Watches one server (Server Monitoring spec): checks it every
+	// `heartbeatFrequency`, or holds a streaming hello open on servers that
+	// support it, with a second connection measuring the round trip.
+	internal type Monitor {
+		address             string
+		weak cluster        ?Cluster
+		settings            Settings
+		streaming           bool
+		internal conn       ?Conn         = none
+		internal rttConn    ?Conn         = none
+		internal wake       channel<bool>
+		internal stopped    bool          = false
+		internal helloOk    bool          = false
+		internal samples    int64[]       = []
+		internal average    int64         = -1
+		internal rttRunning bool          = false
+
+		def new(address string, cluster Cluster, settings Settings) {
+			self.address = address
+			self.cluster = cluster
+			self.settings = settings
+			wake = new channel<bool>(size = 1)
+			helloOk = !(settings.serverApi is none)
+			streaming = settings.monitoringMode == MonitoringMode.Stream || (settings.monitoringMode == MonitoringMode.Auto && !inFaaS())
+		}
+
+		def start() {
+			let _ = async self.run()
+		}
+
+		def requestCheck() {
+			wake <- true when wake.len() == 0
+		}
+
+		// Stops the monitor; a check in progress is cut short by closing its
+		// connection.
+		def stop() {
+			let (checking, rtt) = halt()
+			checking.close() unless checking is none
+			rtt.close() unless rtt is none
+			wake <- true when wake.len() == 0
+		}
+
+		internal atomic def halt() (?Conn, ?Conn) {
+			stopped = true
+			return (conn, rttConn)
+		}
+
+		atomic def isStopped() bool {
+			return stopped
+		}
+
+		// The connections the monitor's tasks make are set under the lock,
+		// so a `stop` that already ran closes one made after it.
+		internal atomic def adoptConn(made Conn) bool {
+			return false when stopped
+			conn = made
+			return true
+		}
+
+		internal atomic def adoptRTTConn(made Conn) bool {
+			return false when stopped
+			rttConn = made
+			return true
+		}
+
+		// Takes the check connection after a failure and forgets the round
+		// trips measured over it.
+		internal atomic def dropConn() ?Conn {
+			let broken = conn
+			conn = none
+			samples = []
+			average = -1
+			return broken
+		}
+
+		internal atomic def averageRTTNow() int64 {
+			return average
+		}
+
+		def run() {
+			let previous = new ServerDescription(address)
+			for !isStopped() {
+				let (sd, networkError, timeoutError) = checkServer(previous)
+				return when isStopped()
+				let owner = cluster
+				return when owner is none
+				owner.onCheck(sd, timeoutError)
+				let supportsStreaming = sd.kind != ServerType.Unknown && !(sd.topologyVersion is none)
+				let current = conn
+				let isStreaming = !(current is none) && current.streaming
+				let transitioned = networkError && previous.kind != ServerType.Unknown
+				if streaming && supportsStreaming && !rttRunning {
+					rttRunning = true
+					let _ = async self.measureRTT()
+				}
+				previous = sd
+				continue when (streaming && (supportsStreaming || isStreaming)) || transitioned
+				pause(settings.heartbeatFrequency)
+			}
+		}
+
+		// Waits a heartbeat, or less when a check is asked for, but never
+		// less than minHeartbeat.
+		internal def pause(heartbeat duration) {
+			let started = time.monoNs()
+			let timer = time.sleepChan(heartbeat)
+			select {
+				case wake:
+					wake.flush()
+				case timer:
+			}
+			let waited = duration(time.monoNs() - started)
+			time.sleep(minHeartbeat - waited) when waited < minHeartbeat && !isStopped()
+		}
+
+		// One check: the server's description, and whether it failed on
+		// the network or by a timeout.
+		internal def checkServer(previous ServerDescription) (ServerDescription, bool, bool) {
+			let started = time.monoNs()
+			let failure ?error = none
+			let reply = new BSONValue(BSONKind.Document)
+			let measured = true
+			let have = conn
+			if have is none || have.broken {
+				let plan = DialPlan{address: address, settings: settings, monitoring: true, useHello: helloOk, cache: none}
+				let (made, problem) = tryDial(plan, unlimited(settings.connectTimeout))
+				failure = problem
+				if !(made is none) {
+					if !adoptConn(made) {
+						made.close()
+						return (new ServerDescription(address), false, false)
+					}
+					reply = made.hello
+				}
+			} else if have.streaming {
+				measured = false
+				reply = have.next(settings.connectTimeout == 0s ?? (duration(-1), settings.connectTimeout + settings.heartbeatFrequency)) onerror (err error) {
+					failure = err
+					recover new BSONValue(BSONKind.Document)
+				}
+			} else if streaming && !(previous.topologyVersion is none) {
+				measured = false
+				let command = helloCommand()
+				let tv = previous.topologyVersion
+				if !(tv is none) {
+					let doc = new BSONValue(BSONKind.Document)
+					doc.set("processId", new BSONValue(objectIdOf(tv.processId)))
+					doc.set("counter", new BSONValue(tv.counter))
+					command.set("topologyVersion", doc)
+				}
+				command.set("maxAwaitTimeMS", new BSONValue(int64(settings.heartbeatFrequency.milliseconds())))
+				reply = have.roundTrip(command, [], settings.connectTimeout == 0s ?? (duration(-1), settings.connectTimeout + settings.heartbeatFrequency), exhaust = true) onerror (err error) {
+					failure = err
+					recover new BSONValue(BSONKind.Document)
+				}
+			} else {
+				reply = have.roundTrip(helloCommand(), [], unlimited(settings.connectTimeout)) onerror (err error) {
+					failure = err
+					recover new BSONValue(BSONKind.Document)
+				}
+			}
+			let now = time.monoNs()
+			failure = commandError(reply) when failure is none && !okOf(reply)
+			let err = failure
+			if !(err is none) {
+				let broken = dropConn()
+				broken.close() unless broken is none
+				let sd = new ServerDescription(address)
+				sd.error = err.message
+				sd.lastUpdateTime = now
+				let timedOut = err is MongoError && err.kind == ErrorKind.TimedOut
+				let network = err is MongoError && (err.labels.includes("NetworkError") || timedOut)
+				return (sd, network, timedOut)
+			}
+			helloOk = boolOf(reply, "helloOk")
+			addSample(now - started) when measured
+			let sd = describeServer(address, reply, averageRTTNow(), now)
+			return (sd, false, false)
+		}
+
+		internal def helloCommand() BSONValue {
+			let command = new BSONValue(BSONKind.Document)
+			command.set(helloOk ?? ("hello", "isMaster"), new BSONValue(int32(1)))
+			command.set("helloOk", new BSONValue(true)) unless helloOk
+			addServerApi(command, settings.serverApi)
+			command.set("$db", new BSONValue("admin"))
+			return command
+		}
+
+		internal atomic def addSample(rtt int64) {
+			average = averageRTT(average, rtt)
+			samples.push(rtt)
+			samples.remove(0) when samples.len() > 10
+		}
+
+		// The round-trip monitor of streaming mode: a hello on its own
+		// connection every heartbeat.
+		def measureRTT() {
+			for !isStopped() {
+				let started = time.monoNs()
+				let have = rttConn
+				if have is none || have.broken {
+					let plan = DialPlan{address: address, settings: settings, monitoring: true, useHello: helloOk, cache: none}
+					let (made, _) = tryDial(plan, unlimited(settings.connectTimeout))
+					if !(made is none) {
+						if !adoptRTTConn(made) {
+							made.close()
+							return
+						}
+						addSample(time.monoNs() - started)
+					}
+				} else {
+					let reply = have.roundTrip(helloCommand(), [], unlimited(settings.connectTimeout)) onerror (err error) {
+						have.close()
+						recover new BSONValue(BSONKind.Document)
+					}
+					addSample(time.monoNs() - started) when okOf(reply)
+				}
+				let timer = time.sleepChan(settings.heartbeatFrequency)
+				select {
+					case timer:
+				}
+			}
+		}
+	}
+
+	// The read preference an aggregate with $out or $merge runs under: the
+	// one given, unless an available server is older than 5.0 (wire 13)
+	// outside a load-balanced topology, when it is primary.
+	internal def writeStagePreference(td TopologyDescription, rp ReadPreference) ReadPreference {
+		return rp when rp.mode == ReadMode.Primary || td.kind == TopologyType.LoadBalanced
+		for let (_, sd) in td.servers {
+			return ReadPreference{} when sd.kind != ServerType.Unknown && sd.maxWireVersion < 13
+		}
+		return rp
+	}
+
+	// A connection, or the error that kept it from being made.
+	internal def tryDial(plan DialPlan, wait duration) (?Conn, ?error) {
+		let conn = dial(plan, wait) onerror (err error) {
+			return (none, err)
+		}
+		return (conn, none)
+	}
+
+	internal def objectIdOf(hex string) ObjectId {
+		return parseObjectId(hex) onerror recover new ObjectId()
+	}
+}

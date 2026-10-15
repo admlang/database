@@ -1,0 +1,510 @@
+partial module adm.database.mongodb {
+	use (
+		std.data.encoding::(bson, BSONValue, BSONKind, ObjectId)
+		std.io
+		std.time
+	)
+
+	// How a GridFS bucket stores files: its name (the collections are
+	// `<name>.files` and `<name>.chunks`) and the chunk size.
+	struct BucketOptions {
+		name           string          = "fs"
+		chunkSize      int             = 261120
+		writeConcern   ?WriteConcern   = none
+		readConcern    ?ReadConcern    = none
+		readPreference ?ReadPreference = none
+	}
+
+	// How a file is stored: its chunk size (the bucket's when 0), its
+	// metadata, and an id of the caller's (an ObjectId is made when none).
+	struct UploadOptions {
+		chunkSize int = 0
+		metadata  any = none
+		id        any = none
+	}
+
+	// A stored file as its files document describes it.
+	struct GridFile {
+		@bson("_id")
+		id Document
+		filename string
+		length int64
+		chunkSize int
+		uploadDate time.Time
+		metadata ?Document = none
+	}
+
+	// Bucket stores files of any size in a database as chunks (GridFS
+	// spec): upload and download whole or as std.io streams, by id or by
+	// name and revision.
+	//
+	//     let bucket = db.bucket()
+	//     let id = try bucket.upload("report.pdf", try os.readFile("report.pdf"))
+	//     let data = try bucket.download(id)
+	type Bucket {
+		internal database     Database
+		internal options      BucketOptions
+		internal files        Collection<Document>
+		internal chunks       Collection<Document>
+		internal indexesReady bool                 = false
+
+		def new(database Database, options BucketOptions = BucketOptions{}) {
+			self.database = database
+			self.options = options
+			files = database.collection<Document>(options.name + ".files")
+			chunks = database.collection<Document>(options.name + ".chunks")
+			files.writeConcern = options.writeConcern
+			chunks.writeConcern = options.writeConcern
+			files.readConcern = options.readConcern
+			chunks.readConcern = options.readConcern
+			files.readPreference = options.readPreference
+			chunks.readPreference = options.readPreference
+		}
+
+		// Opens a stream to write a new file to; `close` stores it.
+		// Fails when the bucket's indexes cannot be made.
+		def openUploadStream(filename string, upload UploadOptions = UploadOptions{}) !UploadStream {
+			try ensureIndexes(self)
+			let id = upload.id is none ?? (new BSONValue(new ObjectId()), try idValue(upload.id))
+			let size = upload.chunkSize > 0 ?? (upload.chunkSize, options.chunkSize)
+			let metadata = upload.metadata is none ?? (none, try toDocument(upload.metadata))
+			return new UploadStream(self, id, filename, size, metadata)
+		}
+
+		// Stores a file from bytes and returns its id.
+		// Fails when a chunk or the files document cannot be written.
+		def upload(filename string, data byte[], upload UploadOptions = UploadOptions{}) !Document {
+			let stream = try openUploadStream(filename, upload)
+			try stream.write(data)
+			try stream.close()
+			return stream.id
+		}
+
+		// Stores a file read from a reader to its end and returns its id.
+		// Fails as the reader does (the chunks written are removed), or when
+		// writing fails.
+		def upload(filename string, source io.Reader, upload UploadOptions = UploadOptions{}) !Document {
+			let stream = try openUploadStream(filename, upload)
+			let buffer byte[] = []
+			buffer.len(stream.chunkSize)
+			for {
+				let n = source.read(buffer) onerror (err error) {
+					stream.abort() onerror recover none
+					fail err
+				}
+				break when n == 0
+				try stream.write(buffer[0:n])
+			}
+			try stream.close()
+			return stream.id
+		}
+
+		// Opens a stream that reads a stored file by id.
+		// Fails with ErrorKind.NotFound when there is no such file.
+		def openDownloadStream(id any) !DownloadStream {
+			let filter = new BSONValue(BSONKind.Document)
+			filter.set("_id", eqOf(try idValue(id)))
+			let found = try files.findOne(filter)
+			fail mongoError(ErrorKind.NotFound, "FileNotFound: no file with id {(try idValue(id)).json()}") when found is none
+			return try downloadOf(self, found)
+		}
+
+		// Opens a stream that reads a file by name: revision 0 is the first
+		// stored, 1 the next, -1 (the default) the newest, -2 the one
+		// before.
+		// Fails with ErrorKind.NotFound when there is no file of the name, or
+		// not that revision.
+		def openDownloadStreamByName(filename string, revision int = -1) !DownloadStream {
+			let filter = new BSONValue(BSONKind.Document)
+			filter.set("filename", new BSONValue(filename))
+			let order = new BSONValue(BSONKind.Document)
+			order.set("uploadDate", new BSONValue(int32(revision < 0 ?? (-1, 1))))
+			let skipped = revision < 0 ?? (-revision - 1, revision)
+			let found = try files.find(filter).sort(order).skip(skipped).limit(1).first()
+			if found is none {
+				let any = try files.findOne(filter)
+				fail mongoError(ErrorKind.NotFound, "FileNotFound: no file named \"{filename}\"") when any is none
+				fail mongoError(ErrorKind.NotFound, "RevisionNotFound: \"{filename}\" has no revision {revision}")
+			}
+			return try downloadOf(self, found)
+		}
+
+		// A stored file's bytes.
+		// Fails as openDownloadStream does, or when a chunk is missing or the
+		// wrong size.
+		def download(id any) !byte[] {
+			let stream = try openDownloadStream(id)
+			return try readEverything(stream)
+		}
+
+		// Writes a stored file to a writer (which is not closed).
+		// Fails as `download(id)` does, or with the writer's error.
+		def download(id any, destination io.Writer) !none {
+			let stream = try openDownloadStream(id)
+			try copyStream(stream, destination)
+			return none
+		}
+
+		// A stored file's bytes by name and revision.
+		// Fails as openDownloadStreamByName does, or when a chunk is missing
+		// or the wrong size.
+		def downloadByName(filename string, revision int = -1) !byte[] {
+			let stream = try openDownloadStreamByName(filename, revision)
+			return try readEverything(stream)
+		}
+
+		// Deletes a stored file: its files document, then its chunks.
+		// Fails with ErrorKind.NotFound when there is no such file (its
+		// orphaned chunks are removed anyway).
+		def delete(id any) !none {
+			let value = try idValue(id)
+			let filter = new BSONValue(BSONKind.Document)
+			filter.set("_id", eqOf(value))
+			let result = try files.deleteOne(filter)
+			let chunkFilter = new BSONValue(BSONKind.Document)
+			chunkFilter.set("files_id", eqOf(value))
+			try chunks.deleteMany(chunkFilter)
+			fail mongoError(ErrorKind.NotFound, "FileNotFound: no file with id {value.json()}") when result.deleted == 0
+			return none
+		}
+
+		// Deletes every revision of a file name.
+		// Fails with ErrorKind.NotFound when there is none.
+		def deleteByName(filename string) !none {
+			let filter = new BSONValue(BSONKind.Document)
+			filter.set("filename", new BSONValue(filename))
+			let ids = new BSONValue(BSONKind.Array)
+			for let f in try files.find(filter).projection(projectionOfId()).all() {
+				ids.push(f.get("_id"))
+			}
+			fail mongoError(ErrorKind.NotFound, "FileNotFound: no file named \"{filename}\"") when ids.len() == 0
+			let inIds = new BSONValue(BSONKind.Document)
+			inIds.set("$in", ids)
+			let byId = new BSONValue(BSONKind.Document)
+			byId.set("_id", inIds)
+			try files.deleteMany(byId)
+			let byFile = new BSONValue(BSONKind.Document)
+			byFile.set("files_id", inIds)
+			try chunks.deleteMany(byFile)
+			return none
+		}
+
+		// The files whose files documents match a filter (`{"metadata.owner":
+		// "ana"}`), as a query to sort and page.
+		def find(filter any = none) Find<GridFile> {
+			return database.collection<GridFile>(options.name + ".files").find(filter)
+		}
+
+		// Renames a stored file.
+		// Fails with ErrorKind.NotFound when there is no such file.
+		def rename(id any, newName string) !none {
+			let filter = new BSONValue(BSONKind.Document)
+			filter.set("_id", eqOf(try idValue(id)))
+			let result = try files.updateOne(filter, setFilename(newName))
+			fail mongoError(ErrorKind.NotFound, "FileNotFound: no file with id {(try idValue(id)).json()}") when result.matched == 0
+			return none
+		}
+
+		// Renames every revision of a file name.
+		// Fails with ErrorKind.NotFound when no file has the name.
+		def renameByName(filename string, newName string) !none {
+			let filter = new BSONValue(BSONKind.Document)
+			filter.set("filename", new BSONValue(filename))
+			let result = try files.updateMany(filter, setFilename(newName))
+			fail mongoError(ErrorKind.NotFound, "FileNotFound: no file named \"{filename}\"") when result.matched == 0
+			return none
+		}
+
+		// Drops the bucket's two collections.
+		// Fails when the server refuses the drop.
+		def drop() !none {
+			try files.drop()
+			try chunks.drop()
+			indexesReady = false
+			return none
+		}
+	}
+
+	partial type Database {
+		// The GridFS bucket of the database (named "fs" unless the options
+		// say otherwise).
+		def bucket(options BucketOptions = BucketOptions{}) Bucket {
+			return new Bucket(self, options)
+		}
+	}
+
+	// A stream a file is written through, a chunk at a time; `close` writes
+	// the last chunk and the files document, `abort` removes what was
+	// written.
+	type UploadStream {
+		internal bucket   Bucket
+		id                Document
+		filename          string
+		chunkSize         int
+		internal metadata ?Document
+		internal pending  byte[]    = []
+		internal chunk    int       = 0
+		internal length   int64     = 0
+		internal state    int       = 0
+
+		def new(bucket Bucket, id Document, filename string, chunkSize int, metadata ?Document) {
+			self.bucket = bucket
+			self.id = id
+			self.filename = filename
+			self.chunkSize = chunkSize
+			self.metadata = metadata
+		}
+
+		// Implements io.Writer: every full chunk is stored as it fills.
+		// Fails when the stream is closed or aborted, or a chunk cannot be
+		// written.
+		def write(data byte[]) !int {
+			fail mongoError(ErrorKind.Closed, "the upload stream is closed") unless state == 0
+			pending += data
+			length += int64(data.len())
+			for pending.len() >= chunkSize {
+				try storeChunk(self, pending[0:chunkSize])
+				pending = pending[chunkSize:]
+			}
+			return data.len()
+		}
+
+		// Stores the last chunk and the files document.
+		// Fails when they cannot be written.
+		def close() !none {
+			return none when state == 1
+			fail mongoError(ErrorKind.Closed, "the upload stream was aborted") when state == 2
+			state = 1
+			if pending.len() > 0 {
+				try storeChunk(self, pending)
+				pending = []
+			}
+			let doc = new BSONValue(BSONKind.Document)
+			doc.set("_id", id)
+			doc.set("length", new BSONValue(length))
+			doc.set("chunkSize", new BSONValue(int32(chunkSize)))
+			doc.set("uploadDate", new BSONValue(time.now()))
+			doc.set("filename", new BSONValue(filename))
+			let extra = metadata
+			doc.set("metadata", extra) unless extra is none
+			try bucket.files.insert(doc)
+			return none
+		}
+
+		// Stops the upload and deletes the chunks already stored.
+		// Fails when they cannot be deleted.
+		def abort() !none {
+			fail mongoError(ErrorKind.Closed, "the upload stream is closed") when state == 1
+			return none when state == 2
+			state = 2
+			pending = []
+			let filter = new BSONValue(BSONKind.Document)
+			filter.set("files_id", eqOf(id))
+			try bucket.chunks.deleteMany(filter)
+			return none
+		}
+	}
+
+	internal def storeChunk(stream UploadStream, data byte[]) !none {
+		let chunk = new BSONValue(BSONKind.Document)
+		chunk.set("_id", new BSONValue(new ObjectId()))
+		chunk.set("files_id", stream.id)
+		chunk.set("n", new BSONValue(int32(stream.chunk)))
+		chunk.set("data", new BSONValue(data.clone()))
+		try stream.bucket.chunks.insert(chunk)
+		stream.chunk++
+		return none
+	}
+
+	// A stream a stored file is read from, chunk by chunk in order; the
+	// chunks are checked for gaps and sizes as they come.
+	type DownloadStream {
+		file               GridFile
+		internal cursor    ?Cursor<Document> = none
+		internal current   byte[]            = []
+		internal offset    int               = 0
+		internal expected  int               = 0
+		internal readBytes int64             = 0
+		internal closed    bool              = false
+
+		def new(file GridFile) {
+			self.file = file
+		}
+
+		// Implements io.Reader: up to `buf.len()` bytes, 0 at the end.
+		// Fails when a chunk is missing, out of order or the wrong size.
+		def read(buf byte[]) !int {
+			fail mongoError(ErrorKind.Closed, "the download stream is closed") when closed
+			let total = 0
+			for total < buf.len() {
+				if offset >= current.len() {
+					break unless try nextChunk(self)
+				}
+				let n = (buf.len() - total) < (current.len() - offset) ?? (buf.len() - total, current.len() - offset)
+				for let i = 0; i < n; i++ {
+					buf[total + i] = current[offset + i]
+				}
+				offset += n
+				total += n
+			}
+			readBytes += int64(total)
+			return total
+		}
+
+		// Implements io.Closer.
+		// Fails when the server cursor cannot be killed.
+		def close() !none {
+			return none when closed
+			closed = true
+			let c = cursor
+			if !(c is none) {
+				cursor = none
+				try c.close()
+			}
+			return none
+		}
+	}
+
+	// Loads the next chunk; false at the end of the file.
+	internal def nextChunk(stream DownloadStream) !bool {
+		let file = stream.file
+		let chunkCount = file.chunkSize <= 0 ?? (0, int((file.length + int64(file.chunkSize) - 1) / int64(file.chunkSize)))
+		if stream.expected >= chunkCount {
+			let c = stream.cursor
+			if !(c is none) {
+				let extra = try c.next()
+				fail mongoError(ErrorKind.Protocol, "ExtraChunk: file {file.id.json()} has a chunk after its last") unless extra is none
+			}
+			return false
+		}
+		let c = stream.cursor
+		fail mongoError(ErrorKind.Closed, "the download stream is closed") when c is none
+		let chunk = try c.next()
+		fail mongoError(ErrorKind.Protocol, "ChunkIsMissing: chunk {stream.expected} of file {file.id.json()} is missing") when chunk is none
+		let n = intOf(chunk, "n", -1)
+		fail mongoError(ErrorKind.Protocol, "ChunkIsMissing: expected chunk {stream.expected} of file {file.id.json()}, found {n}") unless n == stream.expected
+		let data = chunk.get("data").asBytes() onerror (err error) {
+			fail mongoError(ErrorKind.Protocol, "chunk {n} of file {file.id.json()} has no data")
+		}
+		let last = stream.expected == chunkCount - 1
+		let want = last ?? (int(file.length - int64(file.chunkSize) * int64(chunkCount - 1)), file.chunkSize)
+		fail mongoError(ErrorKind.Protocol, "ChunkIsWrongSize: chunk {n} of file {file.id.json()} is {data.len()} bytes, not {want}") unless data.len() == want
+		stream.current = data
+		stream.offset = 0
+		stream.expected++
+		return true
+	}
+
+	internal def downloadOf(bucket Bucket, doc Document) !DownloadStream {
+		let file = try decodeAs<GridFile>(doc)
+		let stream = new DownloadStream(file)
+		if file.length > 0 {
+			let filter = new BSONValue(BSONKind.Document)
+			filter.set("files_id", eqOf(file.id))
+			let order = new BSONValue(BSONKind.Document)
+			order.set("n", new BSONValue(int32(1)))
+			stream.cursor = try bucket.chunks.find(filter).sort(order).cursor()
+		}
+		return stream
+	}
+
+	internal def readEverything(stream DownloadStream) !byte[] {
+		let out byte[] = []
+		let buffer byte[] = []
+		buffer.len(stream.file.chunkSize > 0 ?? (stream.file.chunkSize, 65536))
+		for {
+			let n = stream.read(buffer) onerror (err error) {
+				stream.close() onerror recover none
+				fail err
+			}
+			break when n == 0
+			out += buffer[0:n]
+		}
+		try stream.close()
+		return out
+	}
+
+	internal def copyStream(stream DownloadStream, destination io.Writer) !none {
+		io.copy(stream, destination) onerror (err error) {
+			stream.close() onerror recover none
+			fail err
+		}
+		try stream.close()
+		return none
+	}
+
+	// Makes the bucket's indexes before its first write when the files
+	// collection is empty and they are missing (GridFS spec, "Indexes").
+	internal def ensureIndexes(bucket Bucket) !none {
+		return none when bucket.indexesReady
+		let any = try bucket.files.find().projection(projectionOfId()).readPreference(ReadPreference{}).first()
+		if any is none {
+			if !hasIndex(try bucket.files.listIndexes(), ["filename", "uploadDate"]) {
+				try bucket.files.createIndex(orderedKeys(["filename", "uploadDate"]))
+			}
+			if !hasIndex(try bucket.chunks.listIndexes(), ["files_id", "n"]) {
+				try bucket.chunks.createIndex(orderedKeys(["files_id", "n"]), IndexOptions{unique: true})
+			}
+		}
+		bucket.indexesReady = true
+		return none
+	}
+
+	// Whether an index on these keys (ascending, numbers of any type)
+	// exists.
+	internal def hasIndex(indexes Document[], keys string[]) bool {
+		for let index in indexes {
+			continue unless index.has("key")
+			let key = index.get("key")
+			continue unless key.names().equals(keys)
+			let ascending = true
+			for let entry in key.entries() {
+				let (_, value) = entry
+				ascending = false unless (value.asFloat() onerror recover 0.0) == 1.0
+			}
+			return true when ascending
+		}
+		return false
+	}
+
+	internal def orderedKeys(keys string[]) Document {
+		let doc = new BSONValue(BSONKind.Document)
+		for let k in keys {
+			doc.set(k, new BSONValue(int32(1)))
+		}
+		return doc
+	}
+
+	internal def projectionOfId() Document {
+		let doc = new BSONValue(BSONKind.Document)
+		doc.set("_id", new BSONValue(int32(1)))
+		return doc
+	}
+
+	// `{"$eq": value}`, so an id never acts as a query (GridFS spec,
+	// "TFileId Queries").
+	internal def eqOf(value BSONValue) BSONValue {
+		let doc = new BSONValue(BSONKind.Document)
+		doc.set("$eq", value)
+		return doc
+	}
+
+	internal def setFilename(name string) Document {
+		let set = new BSONValue(BSONKind.Document)
+		set.set("filename", new BSONValue(name))
+		let doc = new BSONValue(BSONKind.Document)
+		doc.set("$set", set)
+		return doc
+	}
+
+	// A file id as a BSON value: a Document as is, an ObjectId, a string or
+	// a number, or any other value encoded under a key.
+	internal def idValue(id any) !BSONValue {
+		return id when id is BSONValue
+		return new BSONValue(id) when id is ObjectId
+		return new BSONValue(id) when id is string
+		return new BSONValue(id) when id is int
+		let holder = map<string, any>{"id": id}
+		return (try toDocument(holder)).get("id")
+	}
+}

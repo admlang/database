@@ -1,0 +1,216 @@
+partial module adm.database.mongodb {
+	use std.net.url::(pathUnescape, queryUnescape)
+
+	// One host of a connection string: a host name, an IPv4 address, an IP
+	// literal (without its brackets) or a Unix socket path; port 0 when the
+	// string gives none.
+	internal struct HostAddress {
+		host    string
+		port    int    = 0
+		// The host was written in brackets.
+		literal bool   = false
+	}
+
+	// What a connection string says, before its options are interpreted.
+	internal struct ConnectionString {
+		srv      bool
+		hosts    HostAddress[]
+		username ?string            = none
+		password ?string            = none
+		database string             = ""
+		// The options in order: the key lower-cased, the value decoded.
+		options  (string, string)[] = []
+		warnings string[]           = []
+	}
+
+	internal def uriError(problem string) MongoError {
+		return mongoError(ErrorKind.Argument, "connection string: " + problem)
+	}
+
+	// Reads a connection string (the Connection String spec): scheme,
+	// optional user information, one or more hosts, an optional database
+	// and options.
+	internal def parseConnectionString(text string) !ConnectionString {
+		let rest = ""
+		let srv = false
+		if text.startsWith("mongodb://") {
+			rest = text.slice(10, text.len())
+		} else if text.startsWith("mongodb+srv://") {
+			rest = text.slice(14, text.len())
+			srv = true
+		} else {
+			fail uriError("it must start with mongodb:// or mongodb+srv://")
+		}
+		let cs = ConnectionString{srv: srv, hosts: []}
+		let query = rest.indexOf("?")
+		let beforeQuery = query < 0 ?? (rest, rest.slice(0, query))
+		let at = beforeQuery.lastIndexOf("@")
+		let hostsStart = 0
+		if at >= 0 {
+			let userinfo = beforeQuery.slice(0, at)
+			fail uriError("the user name and password must be URL encoded: \"/\" is not allowed in them") when userinfo.contains("/")
+			fail uriError("the user name and password must be URL encoded: \"@\" is not allowed in them") when userinfo.contains("@")
+			let colon = userinfo.indexOf(":")
+			let user = colon < 0 ?? (userinfo, userinfo.slice(0, colon))
+			fail uriError("the user name and password must be URL encoded: a password holds no unescaped \":\"") when colon >= 0 && userinfo.slice(colon + 1, userinfo.len()).contains(":")
+			try checkPercent(userinfo)
+			cs.username = try pathUnescape(user)
+			cs.password = try pathUnescape(userinfo.slice(colon + 1, userinfo.len())) when colon >= 0
+			hostsStart = at + 1
+		}
+		let afterUser = beforeQuery.slice(hostsStart, beforeQuery.len())
+		let slash = afterUser.indexOf("/")
+		let hostPart = slash < 0 ?? (afterUser, afterUser.slice(0, slash))
+		fail uriError("it names no host") when hostPart == ""
+		for let item in hostPart.split(",") {
+			cs.hosts.push(try parseHost(item))
+		}
+		if srv {
+			fail uriError("mongodb+srv takes one host name") unless cs.hosts.len() == 1
+			fail uriError("mongodb+srv takes no port") when cs.hosts[0].port != 0
+		}
+		if slash >= 0 {
+			let db = try pathUnescape(afterUser.slice(slash + 1, afterUser.len()))
+			for let bad in ["/", "\\", " ", "\"", "$"] {
+				fail uriError("the database name \"{db}\" holds \"{bad}\"") when db.contains(bad)
+			}
+			cs.database = db
+		}
+		if query >= 0 {
+			let options = rest.slice(query + 1, rest.len())
+			if options != "" {
+				for let pair in options.replace(";", "&", -1).split("&") {
+					continue when pair == ""
+					let eq = pair.indexOf("=")
+					fail uriError("the option \"{pair}\" has no \"=\"") when eq < 0
+					let key = pair.slice(0, eq).lower()
+					let value = try queryUnescape(pair.slice(eq + 1, pair.len()))
+					cs.options.push((key, value))
+				}
+			}
+		}
+		return cs
+	}
+
+	// Fails when a "%" is not followed by two hex digits.
+	internal def checkPercent(text string) !none {
+		let b = text.bytes()
+		for let i = 0; i < b.len(); i++ {
+			continue unless b[i] == byte(0x25)
+			fail uriError("the user name and password must be URL encoded: \"%\" starts no escape") unless i + 2 < b.len() && isHex(b[i + 1]) && isHex(b[i + 2])
+		}
+		return none
+	}
+
+	internal def isHex(b byte) bool {
+		let c = int(b)
+		return (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x46) || (c >= 0x61 && c <= 0x66)
+	}
+
+	internal def parseHost(item string) !HostAddress {
+		fail uriError("a host is empty") when item == ""
+		if item.startsWith("[") {
+			let close = item.indexOf("]")
+			fail uriError("the IP literal \"{item}\" has no \"]\"") when close < 0
+			let address = item.slice(1, close)
+			let tail = item.slice(close + 1, item.len())
+			let port = 0
+			if tail != "" {
+				fail uriError("\"{item}\" has text after the IP literal") unless tail.startsWith(":")
+				port = try parsePort(tail.slice(1, tail.len()))
+			}
+			return HostAddress{host: address.lower(), port: port, literal: true}
+		}
+		let decoded = try pathUnescape(item)
+		if decoded.contains("/") {
+			fail uriError("Unix socket paths must end with .sock: \"{decoded}\"") unless decoded.endsWith(".sock")
+			return HostAddress{host: decoded}
+		}
+		let colon = item.indexOf(":")
+		return HostAddress{host: decoded} when colon < 0
+		fail uriError("the host \"{item}\" holds more than one \":\"") when item.slice(colon + 1, item.len()).contains(":")
+		let name = item.slice(0, colon)
+		fail uriError("a host is empty") when name == ""
+		return HostAddress{host: try pathUnescape(name), port: try parsePort(item.slice(colon + 1, item.len()))}
+	}
+
+	internal def parsePort(text string) !int {
+		fail uriError("the port \"{text}\" is not a number from 1 to 65535") unless text != "" && /^[0-9]+$/.test(text)
+		fail uriError("the port \"{text}\" is not a number from 1 to 65535") when text.len() > 5
+		let port = text.toInt<int>()
+		fail uriError("the port \"{text}\" is not a number from 1 to 65535") when port < 1 || port > 65535
+		return port
+	}
+
+	// Whether a host is a Unix socket path: one with a "/" that ends in
+	// ".sock" (Connection String spec); "db.sock" alone is a host name.
+	internal def isSocketPath(host string) bool {
+		return host.contains("/") && host.endsWith(".sock")
+	}
+
+	// The kind of a host as the specification's tests name it: "ipv4",
+	// "ip_literal", "unix" or "hostname".
+	internal def hostKind(h HostAddress) string {
+		return "ip_literal" when h.literal
+		return "unix" when isSocketPath(h.host)
+		return "ipv4" when /^(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}$/.test(h.host)
+		return "hostname"
+	}
+
+	// A boolean option value; none (with a warning) for anything else.
+	internal def uriBool(key string, value string, warnings string[]) ?bool {
+		switch value {
+			case "true":
+				return true
+			case "false":
+				return false
+			case "1", "yes", "y", "t":
+				warnings.push("deprecated boolean value for \"{key}\": \"{value}\", use \"{key}=true\"")
+				return true
+			case "0", "-1", "no", "n", "f":
+				warnings.push("deprecated boolean value for \"{key}\": \"{value}\", use \"{key}=false\"")
+				return false
+			default:
+				warnings.push("unsupported value for \"{key}\": \"{value}\"")
+				return none
+		}
+	}
+
+	// An integer option value at least `least`; none (with a warning)
+	// otherwise.
+	internal def uriInt(key string, value string, least int, warnings string[]) ?int {
+		if !/^-?[0-9]+$/.test(value) {
+			warnings.push("unsupported value for \"{key}\": \"{value}\"")
+			return none
+		}
+		if value.len() > 10 {
+			warnings.push("unsupported value for \"{key}\": \"{value}\"")
+			return none
+		}
+		let n = value.toInt<int>()
+		if n < least {
+			warnings.push("unsupported value for \"{key}\": \"{value}\"")
+			return none
+		}
+		return n
+	}
+
+	// Key-value pairs: "k1:v1,k2:v2" (a value may hold ":").
+	internal def uriPairs(key string, value string, warnings string[]) ?(string, string)[] {
+		let out (string, string)[] = []
+		return out when value == ""
+		for let item in value.split(",") {
+			let colon = item.indexOf(":")
+			if colon <= 0 {
+				warnings.push("unsupported value for \"{key}\": \"{value}\"")
+				return none
+			}
+			out.push((item.slice(0, colon), item.slice(colon + 1, item.len())))
+		}
+		return out
+	}
+
+	internal def msDuration(ms int) duration {
+		return duration(int64(ms) * 1000000)
+	}
+}

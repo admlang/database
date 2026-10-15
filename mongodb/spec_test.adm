@@ -1,0 +1,608 @@
+// The MongoDB driver specifications' own tests, read from a checkout of
+// github.com/mongodb/specifications (their licence keeps them out of this
+// repository): set ADM_TEST_MONGODB_SPECS to its `source` folder.
+partial module adm.database.mongodb {
+	use (
+		std.data.encoding::(BSONValue, BSONKind)
+		std.os
+		std.testing
+	)
+
+	@env("ADM_TEST_MONGODB_SPECS")
+	internal const specsRoot string
+
+	// The JSON files of a spec test folder, sorted.
+	internal def specFiles(folder string) !string[] {
+		let out string[] = []
+		for let entry in try os.readDir(specsRoot + "/" + folder) {
+			out.push(entry.path) when entry.path.endsWith(".json")
+		}
+		out.sort((a string, b string) => a < b ?? (-1, a == b ?? (0, 1)))
+		return out
+	}
+
+	internal def readSpec(path string) !BSONValue {
+		return try bsonCodec.parseJSON(string(try os.readFile(path)))
+	}
+
+	internal def specSettings(uri string) !Settings {
+		let s = Settings{}
+		try applyConnectionString(s, try parseConnectionString(uri))
+		return s
+	}
+
+	internal def topologySettingsOf(s Settings) TopologySettings {
+		let seeds string[] = []
+		for let h in s.hosts {
+			seeds.push(addressOf(h))
+		}
+		let direct = s.directConnection
+		return TopologySettings{seeds: seeds, setName: s.replicaSet, direct: !(direct is none) && direct, loadBalanced: s.loadBalanced}
+	}
+
+	internal def optionalTextOf(doc BSONValue, name string) ?string {
+		return none unless doc.has(name)
+		let v = doc.get(name)
+		return none when v.kind == BSONKind.Null
+		return v.asString() onerror recover ""
+	}
+
+	// Compares one SDAM outcome; the problems found, "" when none.
+	internal def sdamOutcomeProblems(td TopologyDescription, generations map<string, int>, outcome BSONValue) string {
+		let problems string[] = []
+		if outcome.has("topologyType") {
+			let want = stringOf(outcome, "topologyType")
+			problems.push("topologyType {td.kind.value}, want {want}") unless td.kind.value == want
+		}
+		if outcome.has("setName") {
+			let want = optionalTextOf(outcome, "setName")
+			problems.push("setName {td.setName}, want {want}") unless compareOptionalText(td.setName, want) == 0
+		}
+		if outcome.has("logicalSessionTimeoutMinutes") {
+			let v = outcome.get("logicalSessionTimeoutMinutes")
+			let want ?int = v.kind == BSONKind.Null ?? (none, intOf(outcome, "logicalSessionTimeoutMinutes", 0))
+			problems.push("logicalSessionTimeoutMinutes {td.logicalSessionTimeoutMinutes}, want {want}") unless compareOptionalInt(td.logicalSessionTimeoutMinutes, want) == 0
+		}
+		if outcome.has("compatible") {
+			let want = boolOf(outcome, "compatible")
+			problems.push("compatible {td.compatible}, want {want}") unless td.compatible == want
+		}
+		if outcome.has("maxSetVersion") {
+			let want ?int = outcome.get("maxSetVersion").kind == BSONKind.Null ?? (none, intOf(outcome, "maxSetVersion", -1))
+			problems.push("maxSetVersion {td.maxSetVersion}, want {want}") unless compareOptionalInt(td.maxSetVersion, want) == 0
+		}
+		if outcome.has("maxElectionId") {
+			let want = objectIdHex(outcome.get("maxElectionId"))
+			problems.push("maxElectionId {td.maxElectionId}, want {want}") unless compareOptionalText(td.maxElectionId, want) == 0
+		}
+		if outcome.has("servers") {
+			let servers = outcome.get("servers")
+			let names = servers.names()
+			for let (address, _) in td.servers {
+				problems.push("unexpected server {address}") unless names.includes(address)
+			}
+			for let entry in servers.entries() {
+				let (address, want) = entry
+				let have = td.servers.get(address)
+				if have is none {
+					problems.push("missing server {address}")
+					continue
+				}
+				let wantType = stringOf(want, "type")
+				let haveType = have.kind.value
+				let sameType = haveType == wantType || (wantType == "PossiblePrimary" && haveType == "Unknown") || (wantType == "Unknown" && haveType == "PossiblePrimary")
+				problems.push("{address} type {haveType}, want {wantType}") unless sameType
+				if want.has("setName") {
+					let w = optionalTextOf(want, "setName")
+					problems.push("{address} setName {have.setName}, want {w}") unless compareOptionalText(have.setName, w) == 0
+				}
+				if want.has("setVersion") {
+					let v = want.get("setVersion")
+					let w ?int = v.kind == BSONKind.Null ?? (none, intOf(want, "setVersion", 0))
+					problems.push("{address} setVersion {have.setVersion}, want {w}") unless compareOptionalInt(have.setVersion, w) == 0
+				}
+				if want.has("electionId") {
+					let w = objectIdHex(want.get("electionId"))
+					problems.push("{address} electionId {have.electionId}, want {w}") unless compareOptionalText(have.electionId, w) == 0
+				}
+				if want.has("topologyVersion") {
+					let w = topologyVersionOf(want)
+					let same = (have.topologyVersion is none && w is none) || compareTopologyVersion(have.topologyVersion, w) == 0
+					problems.push("{address} topologyVersion differs") unless same
+				}
+				if want.has("pool") {
+					let w = intOf(want.get("pool"), "generation", 0)
+					let g = generations.get(address)
+					let haveGen = g is none ?? (0, g)
+					problems.push("{address} pool generation {haveGen}, want {w}") unless haveGen == w
+				}
+			}
+		}
+		return problems.join("; ")
+	}
+
+	// Runs one SDAM test file; the problems, "" when it passes.
+	internal def runSDAMFile(path string) !string {
+		let doc = try readSpec(path)
+		let s = specSettings(stringOf(doc, "uri")) onerror (err error) {
+			return "uri: {err.message}"
+		}
+		let ts = topologySettingsOf(s)
+		let td = initialTopology(ts)
+		let generations = map<string, int>{}
+		let phaseNumber = 0
+		for let phase in doc.get("phases").elements() {
+			phaseNumber++
+			if phase.has("responses") {
+				for let response in phase.get("responses").elements() {
+					let address = response.at(0).asString() onerror recover ""
+					let hello = response.at(1)
+					let sd = describeServer(address, hello, 0, 0)
+					td = updateTopology(td, sd, ts)
+				}
+			}
+			if phase.has("applicationErrors") {
+				for let item in phase.get("applicationErrors").elements() {
+					let address = stringOf(item, "address")
+					let g = generations.get(address)
+					let current = g is none ?? (0, g)
+					let e = ServerError{address: address, generation: intOf(item, "generation", current), afterHandshake: stringOf(item, "when") == "afterHandshakeCompletes"}
+					let kind = stringOf(item, "type")
+					e.network = kind := "network" || "timeout"
+					e.timeout = kind == "timeout"
+					if item.has("response") {
+						let r = item.get("response")
+						e.code = intOf(r, "code", 0)
+						e.message = stringOf(r, "errmsg")
+						e.topologyVersion = topologyVersionOf(r)
+						if r.has("writeConcernError") {
+							let wce = r.get("writeConcernError")
+							e.code = intOf(wce, "code", 0)
+							e.message = stringOf(wce, "errmsg")
+						}
+					}
+					let outcome = topologyAfterError(td, current, e, ts)
+					td = outcome.topology
+					generations[address] = current + 1 when outcome.clearPool
+				}
+			}
+			let problems = sdamOutcomeProblems(td, generations, phase.get("outcome"))
+			return "phase {phaseNumber}: {problems}" unless problems == ""
+		}
+		return ""
+	}
+
+	// A setting as text, for comparing with a test's expected option.
+	internal def settingText(s Settings, key string) ?string {
+		switch key.lower() {
+			case "appname":
+				return s.appName
+			case "authmechanism":
+				return s.authMechanism
+			case "authsource":
+				return s.authSource
+			case "authmechanismproperties":
+				return pairsText(s.authProperties)
+			case "compressors":
+				return s.compressors.join(",")
+			case "connecttimeoutms":
+				return "{s.connectTimeout.milliseconds()}"
+			case "sockettimeoutms":
+				return "{s.socketTimeout.milliseconds()}"
+			case "timeoutms":
+				let t = s.timeout
+				return t is none ?? ("", "{t.milliseconds()}")
+			case "serverselectiontimeoutms":
+				return "{s.serverSelectionTimeout.milliseconds()}"
+			case "serverselectiontryonce":
+				return "{s.serverSelectionTryOnce}"
+			case "heartbeatfrequencyms":
+				return "{s.heartbeatFrequency.milliseconds()}"
+			case "localthresholdms":
+				return "{s.localThreshold.milliseconds()}"
+			case "maxidletimems":
+				return "{s.maxIdleTime.milliseconds()}"
+			case "maxpoolsize":
+				return "{s.maxPoolSize}"
+			case "minpoolsize":
+				return "{s.minPoolSize}"
+			case "maxconnecting":
+				return "{s.maxConnecting}"
+			case "replicaset":
+				return s.replicaSet
+			case "directconnection":
+				let d = s.directConnection
+				return d is none ?? ("", "{d}")
+			case "loadbalanced":
+				return "{s.loadBalanced}"
+			case "readpreference":
+				return s.readPreference.mode.value
+			case "readpreferencetags":
+				return s.readPreference.tags.mapElem(t => pairsText(t)).join("|")
+			case "maxstalenessseconds":
+				let secs = int(s.readPreference.maxStaleness.seconds())
+				return secs == 0 ?? ("-1", "{secs}")
+			case "readconcernlevel":
+				return s.readConcern.level
+			case "w":
+				return s.writeConcern.w
+			case "journal":
+				let j = s.writeConcern.journal
+				return j is none ?? ("", "{j}")
+			case "wtimeoutms":
+				return "{s.writeConcern.wtimeout.milliseconds()}"
+			case "retrywrites":
+				return "{s.retryWrites}"
+			case "retryreads":
+				return "{s.retryReads}"
+			case "tls":
+				let t = s.tls
+				return t is none ?? ("", "{t}")
+			case "tlsinsecure":
+				return "{s.tlsAllowInvalidCertificates && s.tlsAllowInvalidHostnames}"
+			case "tlsallowinvalidcertificates":
+				return "{s.tlsAllowInvalidCertificates}"
+			case "tlsallowinvalidhostnames":
+				return "{s.tlsAllowInvalidHostnames}"
+			case "tlsdisableocspendpointcheck":
+				return "{s.tlsDisableOCSPEndpointCheck}"
+			case "tlsdisablecertificaterevocationcheck":
+				return "{s.tlsDisableCertificateRevocationCheck}"
+			case "tlscafile":
+				return s.tlsCAFile
+			case "tlscertificatekeyfile":
+				return s.tlsCertificateKeyFile
+			case "tlscertificatekeyfilepassword":
+				return s.tlsCertificateKeyFilePassword
+			case "srvservicename":
+				return s.srvServiceName
+			case "srvmaxhosts":
+				return "{s.srvMaxHosts}"
+			case "servermonitoringmode":
+				return s.monitoringMode.value
+			case "zlibcompressionlevel":
+				return "{s.zlibCompressionLevel}"
+			case "maxadaptiveretries":
+				return "{s.maxAdaptiveRetries}"
+			case "enableoverloadretargeting":
+				return "{s.enableOverloadRetargeting}"
+			case "proxyhost":
+				return s.proxyHost
+			case "proxyport":
+				return "{s.proxyPort}"
+			case "proxyusername":
+				return s.proxyUsername
+			case "proxypassword":
+				return s.proxyPassword
+			default:
+				return none
+		}
+	}
+
+	internal def pairsText(m map<string, string>) string {
+		let parts string[] = []
+		for let (k, v) in m {
+			parts.push("{k.upper()}:{v}")
+		}
+		parts.sort((a string, b string) => a < b ?? (-1, a == b ?? (0, 1)))
+		return parts.join(",")
+	}
+
+	// An expected option value as the same text.
+	internal def expectedText(v BSONValue) string {
+		switch v.kind {
+			case BSONKind.Bool:
+				return "{v.asBool() onerror recover false}"
+			case BSONKind.String:
+				return v.asString() onerror recover ""
+			case BSONKind.Int32, BSONKind.Int64, BSONKind.Double:
+				return "{v.asInt() onerror recover 0}"
+			case BSONKind.Array:
+				let parts string[] = []
+				for let item in v.elements() {
+					parts.push(item.kind == BSONKind.Document ?? (expectedPairs(item), expectedText(item)))
+				}
+				return parts.join(item0Separator(v))
+			case BSONKind.Document:
+				return expectedPairs(v)
+			default:
+				return ""
+		}
+	}
+
+	internal def item0Separator(v BSONValue) string {
+		return v.len() > 0 && v.at(0).kind == BSONKind.Document ?? ("|", ",")
+	}
+
+	internal def expectedPairs(v BSONValue) string {
+		let m = map<string, string>{}
+		for let entry in v.entries() {
+			let (k, item) = entry
+			m[k] = expectedText(item)
+		}
+		return pairsText(m)
+	}
+
+	// Runs the connection string and URI option tests of one file.
+	internal def runURIFile(path string) !string[] {
+		let problems string[] = []
+		for let t in (try readSpec(path)).get("tests").elements() {
+			let description = stringOf(t, "description")
+			let uri = stringOf(t, "uri")
+			let valid = boolOf(t, "valid")
+			let parsed = specSettings(uri) onerror (err error) {
+				problems.push("{description}: refused: {err.message}") when valid
+				continue
+			}
+			if !valid {
+				problems.push("{description}: accepted an invalid string")
+				continue
+			}
+			let warned = parsed.warnings.len() > 0
+			problems.push("{description}: warnings {parsed.warnings}, expected {boolOf(t, "warning")}") unless warned == boolOf(t, "warning")
+			if t.has("hosts") && t.get("hosts").kind != BSONKind.Null {
+				let want string[] = []
+				for let h in t.get("hosts").elements() {
+					let port = h.get("port").kind == BSONKind.Null ?? (0, intOf(h, "port", 0))
+					want.push("{stringOf(h, "type")} {stringOf(h, "host")}:{port}")
+				}
+				let have = parsed.hosts.mapElem(h => "{hostKind(h)} {h.host}:{h.port}")
+				problems.push("{description}: hosts {have}, want {want}") unless have.equals(want)
+			}
+			if t.has("auth") && t.get("auth").kind != BSONKind.Null {
+				let a = t.get("auth")
+				let user = optionalTextOf(a, "username")
+				problems.push("{description}: username") unless compareOptionalText(parsed.auth ?? (parsed.username, none), user) == 0
+				let pw = optionalTextOf(a, "password")
+				let password = parsed.password
+				let have ?string = password is none ?? (none, password.reveal())
+				problems.push("{description}: password {have}, want {pw}") unless compareOptionalText(have, pw) == 0
+				let db = optionalTextOf(a, "db")
+				problems.push("{description}: database {parsed.database}, want {db}") unless compareOptionalText(parsed.database == "" ?? (none, parsed.database), db) == 0
+			}
+			if t.has("options") && t.get("options").kind != BSONKind.Null {
+				for let entry in t.get("options").entries() {
+					let (key, value) = entry
+					let have = settingText(parsed, key)
+					let want = expectedText(value)
+					if have is none {
+						problems.push("{description}: option {key} not known")
+					} else if have.lower() != want.lower() {
+						problems.push("{description}: option {key} = {have}, want {want}")
+					}
+				}
+			}
+		}
+		return problems
+	}
+
+	// Runs the auth spec's connection string tests.
+	internal def runAuthFile(path string) !(string[], int) {
+		let problems string[] = []
+		let skipped = 0
+		for let t in (try readSpec(path)).get("tests").elements() {
+			let description = stringOf(t, "description")
+			let uri = stringOf(t, "uri")
+			// MONGODB-AWS credentials in the string were removed on
+			// 2025-09-30 (auth spec changelog); these two cases predate it.
+			let removed = description := "should use username and password if specified (MONGODB-AWS)" || "should use username, password and session token if specified (MONGODB-AWS)"
+			if removed || uri.contains("GSSAPI") || uri.contains("MONGODB-OIDC") || uri.contains("MONGODB-CR") {
+				skipped++
+				continue
+			}
+			let valid = boolOf(t, "valid")
+			let parsed = specSettings(uri) onerror (err error) {
+				problems.push("{description}: refused: {err.message}") when valid
+				continue
+			}
+			if !valid {
+				problems.push("{description}: accepted an invalid string")
+				continue
+			}
+			let c = t.get("credential")
+			if c.kind == BSONKind.Null {
+				problems.push("{description}: credentials where none were given") when parsed.auth
+				continue
+			}
+			problems.push("{description}: no credentials") unless parsed.auth
+			let user = optionalTextOf(c, "username")
+			problems.push("{description}: username {parsed.username}, want {user}") unless compareOptionalText(parsed.username == "" ?? (none, parsed.username), user) == 0
+			let source = optionalTextOf(c, "source")
+			let mechanism = optionalTextOf(c, "mechanism")
+			let effective = mechanism is none ?? ("", mechanism)
+			problems.push("{description}: source {sourceFor(parsed, effective)}, want {source}") unless compareOptionalText(sourceFor(parsed, effective), source) == 0
+			problems.push("{description}: mechanism {parsed.authMechanism}, want {mechanism}") unless compareOptionalText(parsed.authMechanism == "" ?? (none, parsed.authMechanism), mechanism) == 0
+			if c.has("mechanism_properties") && c.get("mechanism_properties").kind != BSONKind.Null {
+				let want = expectedPairs(c.get("mechanism_properties"))
+				problems.push("{description}: properties {pairsText(parsed.authProperties)}, want {want}") unless pairsText(parsed.authProperties).lower() == want.lower()
+			}
+		}
+		return (problems, skipped)
+	}
+
+	// A topology from a server selection test's `topology_description`.
+	internal def selectionTopology(doc BSONValue) TopologyDescription {
+		let td = new TopologyDescription()
+		let kind = stringOf(doc, "type")
+		for let k in [TopologyType.Unknown, TopologyType.Single, TopologyType.ReplicaSetNoPrimary, TopologyType.ReplicaSetWithPrimary, TopologyType.Sharded, TopologyType.LoadBalanced] {
+			td.kind = k when k.value == kind
+		}
+		for let item in doc.get("servers").elements() {
+			let sd = new ServerDescription(stringOf(item, "address"))
+			let typeName = stringOf(item, "type")
+			for let k in [ServerType.Unknown, ServerType.Standalone, ServerType.Mongos, ServerType.PossiblePrimary, ServerType.RSPrimary, ServerType.RSSecondary, ServerType.RSArbiter, ServerType.RSOther, ServerType.RSGhost, ServerType.LoadBalancer] {
+				sd.kind = k when k.value == typeName
+			}
+			sd.rtt = item.has("avg_rtt_ms") ?? (int64(intOf(item, "avg_rtt_ms", 0)) * 1000000, int64(-1))
+			sd.lastUpdateTime = int64(intOf(item, "lastUpdateTime", 0)) * 1000000
+			sd.lastWriteDate = int64(intOf(item.get("lastWrite"), "lastWriteDate", 0)) when item.has("lastWrite")
+			sd.maxWireVersion = intOf(item, "maxWireVersion", 21)
+			if item.has("tags") {
+				for let entry in item.get("tags").entries() {
+					let (name, value) = entry
+					sd.tags[name] = value.asString() onerror recover ""
+				}
+			}
+			td.servers[sd.address] = sd
+		}
+		return td
+	}
+
+	internal def selectionPreference(doc BSONValue) ReadPreference {
+		let rp = ReadPreference{}
+		return rp unless doc.has("read_preference")
+		let r = doc.get("read_preference")
+		let mode = readModeOf(stringOf(r, "mode"))
+		rp.mode = mode unless mode is none
+		if r.has("tag_sets") {
+			for let set in r.get("tag_sets").elements() {
+				let m = map<string, string>{}
+				for let entry in set.entries() {
+					let (name, value) = entry
+					m[name] = value.asString() onerror recover ""
+				}
+				rp.tags.push(m)
+			}
+		}
+		let seconds = intOf(r, "maxStalenessSeconds", -1)
+		rp.maxStaleness = seconds > 0 ?? (duration(int64(seconds) * 1000000000), 0s)
+		return rp
+	}
+
+	internal def addressesOf(list BSONValue) string[] {
+		let out string[] = []
+		for let item in list.elements() {
+			out.push(stringOf(item, "address"))
+		}
+		out.sort((a string, b string) => a < b ?? (-1, a == b ?? (0, 1)))
+		return out
+	}
+
+	internal def sortedAddresses(servers ServerDescription[]) string[] {
+		let out = servers.mapElem(s => s.address)
+		out.sort((a string, b string) => a < b ?? (-1, a == b ?? (0, 1)))
+		return out
+	}
+
+	// Runs one server selection or max staleness test file.
+	internal def runSelectionFile(path string) !string {
+		let doc = try readSpec(path)
+		let td = selectionTopology(doc.get("topology_description"))
+		let rp = selectionPreference(doc)
+		let write = stringOf(doc, "operation") == "write"
+		let heartbeat = duration(int64(intOf(doc, "heartbeatFrequencyMS", 10000)) * 1000000)
+		let expectError = boolOf(doc, "error")
+		// 0s means no limit in ReadPreference, so an explicit zero cannot be
+		// asked for: the case the test refuses does not arise.
+		return "" when doc.has("read_preference") && doc.get("read_preference").has("maxStalenessSeconds") && intOf(doc.get("read_preference"), "maxStalenessSeconds", -1) == 0
+		let deprioritized = doc.has("deprioritized_servers") ?? (addressesOf(doc.get("deprioritized_servers")), [])
+		let suitable = suitableServers(td, rp, write, heartbeat, deprioritized) onerror (err error) {
+			return expectError ?? ("", "failed: {err.message}")
+		}
+		return "no error" when expectError
+		let problems string[] = []
+		if doc.has("suitable_servers") {
+			let want = addressesOf(doc.get("suitable_servers"))
+			let have = sortedAddresses(suitable)
+			problems.push("suitable {have}, want {want}") unless have.equals(want)
+		}
+		if doc.has("in_latency_window") {
+			let want = addressesOf(doc.get("in_latency_window"))
+			let have = sortedAddresses(latencyWindow(suitable, 15ms))
+			problems.push("window {have}, want {want}") unless have.equals(want)
+		}
+		return problems.join("; ")
+	}
+
+	internal def runRTTFile(path string) !string {
+		let doc = try readSpec(path)
+		let old = doc.get("avg_rtt_ms")
+		let previous int64 = old.kind == BSONKind.String ?? (int64(-1), int64((old.asFloat() onerror recover 0.0) * 1000000.0))
+		let sample = int64((doc.get("new_rtt_ms").asFloat() onerror recover 0.0) * 1000000.0)
+		let want = (doc.get("new_avg_rtt").asFloat() onerror recover 0.0) * 1000000.0
+		let have = float(averageRTT(previous, sample))
+		return (have - want).abs() < 2.0 ?? ("", "average {have}, want {want}")
+	}
+
+	check "Specification tests" {
+		@test()
+		def passesSDAMSpec() !none {
+			return none when specsRoot == ""
+			let failed = 0
+			let total = 0
+			for let folder in ["single", "rs", "sharded", "errors", "load-balanced"] {
+				for let path in try specFiles("server-discovery-and-monitoring/tests/" + folder) {
+					total++
+					let problems = runSDAMFile(path) onerror (err error) {
+						recover "error: {err.message}"
+					}
+					if problems != "" {
+						failed++
+						println("SDAM {path.slice(path.lastIndexOf("/tests/") + 7, path.len())}: {problems}")
+					}
+				}
+			}
+			println("SDAM: {total - failed}/{total} pass")
+			assert failed == 0
+		}
+
+		@test()
+		def passesURISpecs() !none {
+			return none when specsRoot == ""
+			let failed = 0
+			for let folder in ["connection-string/tests", "uri-options/tests"] {
+				for let path in try specFiles(folder) {
+					for let problem in try runURIFile(path) {
+						failed++
+						println("URI {path.slice(path.lastIndexOf("/") + 1, path.len())}: {problem}")
+					}
+				}
+			}
+			let (authProblems, skipped) = try runAuthFile(specsRoot + "/auth/tests/legacy/connection-string.json")
+			for let problem in authProblems {
+				failed++
+				println("auth: {problem}")
+			}
+			println("URI: {failed} problems; {skipped} auth cases skipped (GSSAPI, MONGODB-OIDC, MONGODB-CR, pre-2025 MONGODB-AWS)")
+			assert failed == 0
+		}
+
+		@test()
+		def passesServerSelectionSpecs() !none {
+			return none when specsRoot == ""
+			let failed = 0
+			let total = 0
+			let folders string[] = []
+			for let topology in ["Unknown", "Single", "Sharded", "ReplicaSetWithPrimary", "ReplicaSetNoPrimary", "LoadBalanced"] {
+				folders.push("server-selection/tests/server_selection/{topology}/read")
+				folders.push("server-selection/tests/server_selection/{topology}/write")
+				folders.push("max-staleness/tests/{topology}")
+			}
+			for let folder in folders {
+				let files = specFiles(folder) onerror (err error) {
+					recover []
+				}
+				for let path in files {
+					total++
+					let problems = runSelectionFile(path) onerror (err error) {
+						recover "error: {err.message}"
+					}
+					if problems != "" {
+						failed++
+						println("selection {path.slice(path.lastIndexOf("/tests/") + 7, path.len())}: {problems}")
+					}
+				}
+			}
+			for let path in try specFiles("server-selection/tests/rtt") {
+				total++
+				let problems = try runRTTFile(path)
+				if problems != "" {
+					failed++
+					println("rtt {path}: {problems}")
+				}
+			}
+			println("server selection: {total - failed}/{total} pass")
+			assert failed == 0
+		}
+	}
+}

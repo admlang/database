@@ -1,0 +1,368 @@
+partial module adm.database.mongodb {
+	use (
+		std.crypto
+		std.crypto::(UUID)
+		std.data.encoding::(BSONValue, BSONKind)
+		std.time
+	)
+
+	// One server-side logical session: its id, when it was last used and
+	// its transaction number (Driver Sessions spec, "Server Session Pool").
+	internal type ServerSession {
+		id        BSONValue
+		lastUse   int64     = 0
+		txnNumber int64     = 0
+		// A network error happened on it: it is not pooled again.
+		dirty     bool      = false
+
+		def new() {
+			let doc = new BSONValue(BSONKind.Document)
+			doc.set("id", new BSONValue(new UUID()))
+			id = doc
+			lastUse = time.monoNs()
+		}
+	}
+
+	// The server sessions not in use, newest first. Sessions within a
+	// minute of the server's timeout are dropped instead of reused.
+	internal type SessionPool {
+		internal free ServerSession[] = []
+
+		def new() {}
+
+		atomic def acquire(timeoutMinutes int) ServerSession {
+			let now = time.monoNs()
+			for free.len() > 0 {
+				let session = free.pop()
+				return session unless aboutToExpire(session, timeoutMinutes, now)
+			}
+			return new ServerSession()
+		}
+
+		atomic def release(session ServerSession, timeoutMinutes int) {
+			let now = time.monoNs()
+			// Older sessions at the bottom of the stack go first.
+			for free.len() > 0 && aboutToExpire(free[0], timeoutMinutes, now) {
+				free.remove(0)
+			}
+			return when session.dirty || aboutToExpire(session, timeoutMinutes, now)
+			free.push(session)
+		}
+
+		atomic def drain() ServerSession[] {
+			let all = free
+			free = []
+			return all
+		}
+	}
+
+	internal def aboutToExpire(session ServerSession, timeoutMinutes int, now int64) bool {
+		return false when timeoutMinutes <= 0
+		let idle = now - session.lastUse
+		return idle > int64(timeoutMinutes - 1) * 60 * 1000000000
+	}
+
+	// Where a session's transaction stands (Transactions spec).
+	enum TransactionState {
+		None,
+		Starting,
+		InProgress,
+		Committed,
+		// Committed with no operation in it: nothing was sent.
+		CommittedEmpty,
+		Aborted,
+	}
+
+	// How a transaction reads and writes: unset fields come from the
+	// session's defaults, then the client.
+	struct TransactionOptions {
+		readConcern    ?ReadConcern    = none
+		writeConcern   ?WriteConcern   = none
+		readPreference ?ReadPreference = none
+		// How long commitTransaction may run on the server (0s: no limit).
+		maxCommitTime  duration        = 0s
+	}
+
+	// How a session behaves: causally consistent (its reads see its own
+	// earlier writes), or a snapshot (every read at one point in time),
+	// and the transaction options it starts with.
+	struct SessionOptions {
+		causalConsistency         ?bool              = none
+		snapshot                  bool               = false
+		defaultTransactionOptions TransactionOptions = TransactionOptions{}
+	}
+
+	// Session is a client session (Driver Sessions spec): operations given
+	// it are causally consistent with each other by default, and it runs
+	// transactions. Start one with `Client.startSession`, pass it to
+	// operations through their options, and `end` it when done.
+	//
+	//     let session = try client.startSession()
+	//     try session.withTransaction(s => {
+	//         try accounts.updateOne({"_id": 1}, {"$inc": {"balance": -10}}, UpdateOptions{session: s})
+	//         try accounts.updateOne({"_id": 2}, {"$inc": {"balance": 10}}, UpdateOptions{session: s})
+	//     })
+	//     session.end()
+	type Session {
+		internal client        Client
+		internal options       SessionOptions
+		internal explicit      bool               = true
+		internal server        ?ServerSession     = none
+		internal ended         bool               = false
+		internal operationTime ?BSONValue         = none
+		internal clusterTime   ?BSONValue         = none
+		internal snapshotTime  ?BSONValue         = none
+		internal state         TransactionState   = TransactionState.None
+		internal txnOptions    TransactionOptions = TransactionOptions{}
+		internal pinned        ?Server            = none
+		internal pinnedConn    ?Conn              = none
+		internal recoveryToken ?BSONValue         = none
+		// commitTransaction ran before: a new attempt uses w: majority.
+		internal commitTried   bool               = false
+
+		def new(client Client, options SessionOptions, explicit bool) {
+			self.client = client
+			self.options = options
+			self.explicit = explicit
+		}
+
+		// Whether the session's reads see its writes (on unless it is a
+		// snapshot session or turned off).
+		def isCausallyConsistent() bool {
+			let given = options.causalConsistency
+			return given is none ?? (!options.snapshot, given)
+		}
+
+		// Whether a transaction is open.
+		def inTransaction() bool {
+			return state := TransactionState.Starting || TransactionState.InProgress
+		}
+
+		// The session's id as the server knows it (`lsid`).
+		def id() BSONValue {
+			return serverSession().id
+		}
+
+		internal def serverSession() ServerSession {
+			return serverSessionOf(self)
+		}
+
+		// The operation time the session has seen (causal consistency).
+		def operationTimeNow() ?BSONValue {
+			return operationTime
+		}
+
+		// Moves the session's operation time forward, as when it continues
+		// work another session did.
+		def advanceOperationTime(timestamp BSONValue) {
+			let have = operationTime
+			operationTime = timestamp when have is none || timestampOf(timestamp) > timestampOf(have)
+		}
+
+		// Moves the session's cluster time forward.
+		def advanceClusterTime(clusterTime BSONValue) {
+			let have = self.clusterTime
+			self.clusterTime = clusterTime when have is none || timestampOf(clusterTime.get("clusterTime")) > timestampOf(have.get("clusterTime"))
+		}
+
+		// Starts a transaction: the operations given this session until
+		// commit or abort belong to it.
+		// Fails when a transaction is already open, the session is ended
+		// or a snapshot session, or the deployment has no transactions.
+		def startTransaction(transactionOptions TransactionOptions = TransactionOptions{}) !none {
+			fail mongoError(ErrorKind.Closed, "the session is ended") when ended
+			fail mongoError(ErrorKind.Argument, "Transactions are not supported in snapshot sessions") when options.snapshot
+			fail mongoError(ErrorKind.Argument, "Transaction already in progress") when inTransaction()
+			let merged = try mergeTransactionOptions(transactionOptions)
+			let wc = merged.writeConcern
+			fail mongoError(ErrorKind.Argument, "transactions do not take an unacknowledged write concern") when !(wc is none) && !acknowledged(wc)
+			try checkTransactionsSupported(client)
+			unpin()
+			serverSession().txnNumber++
+			txnOptions = merged
+			state = TransactionState.Starting
+			recoveryToken = none
+			commitTried = false
+			return none
+		}
+
+		internal def mergeTransactionOptions(given TransactionOptions) !TransactionOptions {
+			let defaults = options.defaultTransactionOptions
+			let out = TransactionOptions{maxCommitTime: given.maxCommitTime > 0s ?? (given.maxCommitTime, defaults.maxCommitTime)}
+			let rc = given.readConcern
+			out.readConcern = rc is none ?? (defaults.readConcern is none ?? (client.settings.readConcern, defaults.readConcern), rc)
+			let wc = given.writeConcern
+			out.writeConcern = wc is none ?? (defaults.writeConcern is none ?? (client.settings.writeConcern, defaults.writeConcern), wc)
+			let rp = given.readPreference
+			out.readPreference = rp is none ?? (defaults.readPreference is none ?? (client.settings.readPreference, defaults.readPreference), rp)
+			let chosen = out.readPreference
+			fail mongoError(ErrorKind.Argument, "a transaction reads from the primary") when !(chosen is none) && chosen.mode != ReadMode.Primary
+			return out
+		}
+
+		// Commits the open transaction. Committing again re-runs the commit
+		// (with w: majority).
+		// Fails when no transaction was started, it was aborted, or the
+		// commit fails; an error labelled UnknownTransactionCommitResult
+		// may have committed, one labelled TransientTransactionError did
+		// not and the whole transaction may be retried.
+		def commitTransaction() !none {
+			switch state {
+				case TransactionState.None:
+					fail mongoError(ErrorKind.Argument, "No transaction started")
+				case TransactionState.Aborted:
+					fail mongoError(ErrorKind.Argument, "Cannot call commitTransaction after calling abortTransaction")
+				case TransactionState.Starting, TransactionState.CommittedEmpty:
+					state = TransactionState.CommittedEmpty
+					return none
+				default:
+			}
+			let retry = state == TransactionState.Committed || commitTried
+			state = TransactionState.Committed
+			commitTried = true
+			try endTransaction(client, self, true, retry)
+			return none
+		}
+
+		// Aborts the open transaction; the server's answer is not reported.
+		// Fails when no transaction is open (never started, committed, or
+		// aborted already).
+		def abortTransaction() !none {
+			switch state {
+				case TransactionState.None:
+					fail mongoError(ErrorKind.Argument, "No transaction started")
+				case TransactionState.Committed, TransactionState.CommittedEmpty:
+					fail mongoError(ErrorKind.Argument, "Cannot call abortTransaction after calling commitTransaction")
+				case TransactionState.Aborted:
+					fail mongoError(ErrorKind.Argument, "Cannot call abortTransaction twice")
+				case TransactionState.Starting:
+					state = TransactionState.Aborted
+					unpin()
+					return none
+				default:
+			}
+			state = TransactionState.Aborted
+			endTransaction(client, self, commit = false, retry = false) onerror (err error) {
+				recover none
+			}
+			unpin()
+			return none
+		}
+
+		// Runs `body` in a transaction and commits it (Convenient
+		// Transactions API): a transaction that fails with a transient
+		// error runs again, and a commit with an unknown result is tried
+		// again, with backoff, for up to 120 seconds (or the client's
+		// `timeout`). `body` may therefore run more than once: keep its
+		// side effects to the session's operations.
+		// Fails with the error of `body` (after aborting) or of the commit
+		// when retrying cannot help, or when the time is up.
+		def withTransaction(body def (Session) !none, transactionOptions TransactionOptions = TransactionOptions{}) !none {
+			let started = time.monoNs()
+			let configured = client.settings.timeout
+			let limit = configured is none ?? (120s, configured)
+			let attempt = 0
+			let last ?error = none
+			for {
+				if attempt > 0 {
+					let growth = 1.0
+					for let i = 0; i < attempt; i++ {
+						growth *= 1.5
+					}
+					let backoff = duration(int64(crypto.randRange(0.0, 1.0) * min(5000000.0 * growth, 500000000.0)))
+					let failure = last
+					fail timedOutAfter(failure) when duration(time.monoNs() - started) + backoff > limit && !(failure is none)
+					time.sleep(backoff)
+				}
+				try startTransaction(transactionOptions)
+				attempt++
+				let bodyError = failureOf(body, self)
+				if !(bodyError is none) {
+					if inTransaction() {
+						abortTransaction() onerror recover none
+					}
+					last = bodyError
+					continue when hasLabel(bodyError, "TransientTransactionError")
+					fail bodyError
+				}
+				return none unless inTransaction()
+				for {
+					let commitError = commitFailure(self)
+					return none when commitError is none
+					last = commitError
+					if hasLabel(commitError, "UnknownTransactionCommitResult") && serverCodeOf(commitError) != 50 {
+						fail timedOutAfter(commitError) when duration(time.monoNs() - started) > limit
+						continue
+					}
+					break when hasLabel(commitError, "TransientTransactionError")
+					fail commitError
+				}
+			}
+		}
+
+		// Ends the session: an open transaction is aborted and the server
+		// session goes back to the pool.
+		def end() {
+			return when ended
+			if inTransaction() {
+				abortTransaction() onerror recover none
+			}
+			ended = true
+			unpin()
+			let have = server
+			if !(have is none) {
+				client.sessionPool.release(have, sessionTimeoutMinutes(client))
+				server = none
+			}
+		}
+
+		internal def unpin() {
+			unpinSession(self)
+		}
+	}
+
+	// The session's server session, taken from the pool on first use.
+	internal def serverSessionOf(session Session) ServerSession {
+		let have = session.server
+		return have unless have is none
+		let made = session.client.sessionPool.acquire(sessionTimeoutMinutes(session.client))
+		session.server = made
+		return made
+	}
+
+	internal def unpinSession(session Session) {
+		session.pinned = none
+		let conn = session.pinnedConn
+		if !(conn is none) {
+			session.pinnedConn = none
+			releasePinned(session.client, conn)
+		}
+	}
+
+	// The error a transaction body fails with, none when it succeeds.
+	internal def failureOf(body def (Session) !none, session Session) ?error {
+		body(session) onerror (err error) {
+			return err
+		}
+		return none
+	}
+
+	internal def commitFailure(session Session) ?error {
+		session.commitTransaction() onerror (err error) {
+			return err
+		}
+		return none
+	}
+
+	internal def min(a float, b float) float {
+		return a < b ?? (a, b)
+	}
+
+	// A timeout error that carries the error the time ran out on.
+	internal def timedOutAfter(last error) MongoError {
+		return last when last is MongoError && last.kind == ErrorKind.TimedOut
+		let out = mongoErrorCaused(ErrorKind.TimedOut, "withTransaction ran out of time", last)
+		out.labels = last.labels when last is MongoError
+		return out
+	}
+}

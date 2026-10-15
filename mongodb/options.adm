@@ -1,0 +1,430 @@
+partial module adm.database.mongodb {
+	use (
+		std.net.tls
+	)
+
+	// How the server monitors watch their servers: `Stream` keeps an
+	// awaitable `hello` open on servers that support it (4.4 and later),
+	// `Poll` asks every `heartbeatFrequency`, `Auto` streams except in a
+	// function-as-a-service environment.
+	enum MonitoringMode {
+		Auto   = "auto",
+		Stream = "stream",
+		Poll   = "poll",
+	}
+
+	// Settings is everything a client is configured with. `Client` holds
+	// one; a connection string fills it, and fields set in code before
+	// `connect` stay unless the string names the same option.
+	internal struct Settings {
+		appName                              string                  = ""
+		// Credentials: whether any were given (`@` in the string, or a
+		// mechanism that needs none), and their parts.
+		auth                                 bool                    = false
+		username                             string                  = ""
+		password                             ?Secret<string>         = none
+		authSource                           string                  = ""
+		authMechanism                        string                  = ""
+		authProperties                       map<string, string>     = map<string, string>{}
+		database                             string                  = ""
+		hosts                                HostAddress[]           = []
+		srv                                  bool                    = false
+		srvServiceName                       string                  = "mongodb"
+		srvMaxHosts                          int                     = 0
+		replicaSet                           string                  = ""
+		directConnection                     ?bool                   = none
+		loadBalanced                         bool                    = false
+		tls                                  ?bool                   = none
+		tlsConfig                            ?tls.Config             = none
+		tlsCAFile                            string                  = ""
+		tlsCertificateKeyFile                string                  = ""
+		tlsCertificateKeyFilePassword        string                  = ""
+		tlsAllowInvalidCertificates          bool                    = false
+		tlsAllowInvalidHostnames             bool                    = false
+		tlsDisableOCSPEndpointCheck          bool                    = false
+		tlsDisableCertificateRevocationCheck bool                    = false
+		connectTimeout                       duration                = 10s
+		socketTimeout                        duration                = 0s
+		timeout                              ?duration               = none
+		serverSelectionTimeout               duration                = 30s
+		serverSelectionTryOnce               bool                    = true
+		heartbeatFrequency                   duration                = 10s
+		localThreshold                       duration                = 15ms
+		monitoringMode                       MonitoringMode          = MonitoringMode.Auto
+		maxPoolSize                          int                     = 100
+		minPoolSize                          int                     = 0
+		maxIdleTime                          duration                = 0s
+		maxConnecting                        int                     = 2
+		waitQueueTimeout                     duration                = 0s
+		readPreference                       ReadPreference          = ReadPreference{}
+		readConcern                          ReadConcern             = ReadConcern{}
+		writeConcern                         WriteConcern            = WriteConcern{}
+		retryReads                           bool                    = true
+		retryWrites                          bool                    = true
+		compressors                          string[]                = []
+		zlibCompressionLevel                 int                     = -1
+		proxyHost                            string                  = ""
+		proxyPort                            int                     = 1080
+		proxyUsername                        string                  = ""
+		proxyPassword                        string                  = ""
+		serverApi                            ?ServerApi              = none
+		maxAdaptiveRetries                   int                     = 2
+		enableOverloadRetargeting            bool                    = false
+		// The SRV name of a `mongodb+srv` string, the parent domain its
+		// results may also be in, or a check of its own.
+		srvName                              string                  = ""
+		srvAllowedHostsSuffix                string                  = ""
+		srvHostValidator                     ?def (string) bool      = none
+		// Where MONGODB-AWS takes its credentials before looking at the
+		// environment.
+		awsCredentialProvider                ?def () !AWSCredentials = none
+		// The options the connection string gave (lower case).
+		given                                string[]                = []
+		// What reading the connection string warned about.
+		warnings                             string[]                = []
+	}
+
+	// Applies a connection string to the settings (the URI Options spec):
+	// unknown keys and invalid values warn and are ignored; conflicting
+	// options, and options that cannot go together, fail.
+	internal def applyConnectionString(s Settings, cs ConnectionString) !none {
+		s.warnings += cs.warnings
+		s.hosts = cs.hosts
+		s.srv = cs.srv
+		s.srvName = cs.srv ?? (cs.hosts[0].host, "")
+		s.database = cs.database
+		let user = cs.username
+		if !(user is none) {
+			s.auth = true
+			s.username = user
+			let password = cs.password
+			if !(password is none) {
+				let secret Secret<string> = password
+				s.password = secret
+			}
+		}
+		let seen string[] = []
+		let tlsValues string[] = []
+		let tagSets map<string, string>[] = []
+		let tagsGiven = false
+		let w ?string = none
+		for let option in cs.options {
+			let (key, value) = option
+			if seen.includes(key) && key != "readpreferencetags" {
+				fail uriError("\"{key}\" is given twice") when key := "proxyhost" || "proxyport" || "proxyusername" || "proxypassword"
+				s.warnings.push("\"{key}\" is given more than once; the last one counts")
+			}
+			seen.push(key)
+			switch key {
+				case "appname":
+					s.appName = value
+				case "authmechanism":
+					s.authMechanism = value
+					s.auth = true
+				case "authmechanismproperties":
+					let pairs = uriPairs(key, value, s.warnings)
+					if !(pairs is none) {
+						for let pair in pairs {
+							let (name, v) = pair
+							s.authProperties[name.upper()] = v
+						}
+					}
+				case "authsource":
+					fail uriError("authSource is empty") when value == ""
+					s.authSource = value
+				case "compressors":
+					s.compressors = []
+					for let name in value.split(",") {
+						if name := "snappy" || "zlib" || "zstd" || "noop" {
+							s.compressors.push(name)
+						} else {
+							s.warnings.push("unsupported compressor \"{name}\"")
+						}
+					}
+				case "zlibcompressionlevel":
+					let n = uriInt(key, value, -1, s.warnings)
+					if !(n is none) {
+						if n > 9 {
+							s.warnings.push("unsupported value for \"{key}\": \"{value}\"")
+						} else {
+							s.zlibCompressionLevel = n
+						}
+					}
+				case "connecttimeoutms":
+					let n = uriInt(key, value, 0, s.warnings)
+					s.connectTimeout = msDuration(n) unless n is none
+				case "sockettimeoutms":
+					let n = uriInt(key, value, 0, s.warnings)
+					s.socketTimeout = msDuration(n) unless n is none
+				case "timeoutms":
+					let n = uriInt(key, value, 0, s.warnings)
+					s.timeout = msDuration(n) unless n is none
+				case "serverselectiontimeoutms":
+					let n = uriInt(key, value, 1, s.warnings)
+					s.serverSelectionTimeout = msDuration(n) unless n is none
+				case "serverselectiontryonce":
+					let b = uriBool(key, value, s.warnings)
+					s.serverSelectionTryOnce = b unless b is none
+				case "heartbeatfrequencyms":
+					let n = uriInt(key, value, 500, s.warnings)
+					s.heartbeatFrequency = msDuration(n) unless n is none
+				case "localthresholdms":
+					let n = uriInt(key, value, 0, s.warnings)
+					s.localThreshold = msDuration(n) unless n is none
+				case "maxidletimems":
+					let n = uriInt(key, value, 0, s.warnings)
+					s.maxIdleTime = msDuration(n) unless n is none
+				case "maxpoolsize":
+					let n = uriInt(key, value, 0, s.warnings)
+					s.maxPoolSize = n unless n is none
+				case "minpoolsize":
+					let n = uriInt(key, value, 0, s.warnings)
+					s.minPoolSize = n unless n is none
+				case "maxconnecting":
+					let n = uriInt(key, value, 1, s.warnings)
+					s.maxConnecting = n unless n is none
+				case "waitqueuetimeoutms":
+					let n = uriInt(key, value, 1, s.warnings)
+					s.waitQueueTimeout = msDuration(n) unless n is none
+				case "replicaset":
+					s.replicaSet = value
+				case "directconnection":
+					let b = uriBool(key, value, s.warnings)
+					s.directConnection = b unless b is none
+				case "loadbalanced":
+					let b = uriBool(key, value, s.warnings)
+					s.loadBalanced = b unless b is none
+				case "readpreference":
+					let mode = readModeOf(value)
+					if mode is none {
+						s.warnings.push("unsupported value for \"{key}\": \"{value}\"")
+					} else {
+						s.readPreference.mode = mode
+					}
+				case "readpreferencetags":
+					tagsGiven = true
+					let pairs = uriPairs(key, value, s.warnings)
+					if !(pairs is none) {
+						let set = map<string, string>{}
+						for let pair in pairs {
+							let (name, v) = pair
+							set[name] = v
+						}
+						tagSets.push(set)
+					}
+				case "maxstalenessseconds":
+					let n = uriInt(key, value, -1, s.warnings)
+					s.readPreference.maxStaleness = n > 0 ?? (duration(int64(n) * 1000000000), 0s) unless (n is none)
+				case "readconcernlevel":
+					s.readConcern.level = value
+				case "w":
+					w = value
+				case "journal":
+					let b = uriBool(key, value, s.warnings)
+					s.writeConcern.journal = b unless b is none
+				case "wtimeoutms":
+					let n = uriInt(key, value, 0, s.warnings)
+					s.writeConcern.wtimeout = msDuration(n) unless n is none
+				case "wtimeout":
+					if optionGiven(cs, "wtimeoutms") {
+						s.warnings.push("deprecated key \"wtimeout\" ignored: \"wtimeoutMS\" is given")
+					} else {
+						s.warnings.push("deprecated key \"wtimeout\": use \"wtimeoutMS\"")
+						let n = uriInt(key, value, 0, s.warnings)
+						s.writeConcern.wtimeout = msDuration(n) unless n is none
+					}
+				case "retryreads":
+					let b = uriBool(key, value, s.warnings)
+					s.retryReads = b unless b is none
+				case "retrywrites":
+					let b = uriBool(key, value, s.warnings)
+					s.retryWrites = b unless b is none
+				case "tls", "ssl":
+					let b = uriBool(key, value, s.warnings)
+					if !(b is none) {
+						tlsValues.push(b ?? ("true", "false"))
+						s.tls = b
+					}
+				case "tlsinsecure":
+					let b = uriBool(key, value, s.warnings)
+					if !(b is none) {
+						s.tlsAllowInvalidCertificates = b
+						s.tlsAllowInvalidHostnames = b
+						s.tlsDisableOCSPEndpointCheck = b
+						s.tlsDisableCertificateRevocationCheck = b
+					}
+				case "tlsallowinvalidcertificates":
+					let b = uriBool(key, value, s.warnings)
+					s.tlsAllowInvalidCertificates = b unless b is none
+				case "tlsallowinvalidhostnames":
+					let b = uriBool(key, value, s.warnings)
+					s.tlsAllowInvalidHostnames = b unless b is none
+				case "tlsdisableocspendpointcheck":
+					let b = uriBool(key, value, s.warnings)
+					s.tlsDisableOCSPEndpointCheck = b unless b is none
+				case "tlsdisablecertificaterevocationcheck":
+					let b = uriBool(key, value, s.warnings)
+					s.tlsDisableCertificateRevocationCheck = b unless b is none
+				case "tlscafile":
+					s.tlsCAFile = value
+				case "tlscertificatekeyfile":
+					s.tlsCertificateKeyFile = value
+				case "tlscertificatekeyfilepassword":
+					s.tlsCertificateKeyFilePassword = value
+				case "srvservicename":
+					s.srvServiceName = value
+				case "srvallowedhostssuffix":
+					s.srvAllowedHostsSuffix = value
+					try allowedSuffixOf(value)
+				case "srvmaxhosts":
+					let n = uriInt(key, value, 0, s.warnings)
+					s.srvMaxHosts = n unless n is none
+				case "servermonitoringmode":
+					switch value {
+						case "auto":
+							s.monitoringMode = MonitoringMode.Auto
+						case "stream":
+							s.monitoringMode = MonitoringMode.Stream
+						case "poll":
+							s.monitoringMode = MonitoringMode.Poll
+						default:
+							s.warnings.push("unsupported value for \"{key}\": \"{value}\"")
+					}
+				case "proxyhost":
+					s.proxyHost = value
+				case "proxyport":
+					let n = uriInt(key, value, 0, s.warnings)
+					s.proxyPort = n unless n is none
+				case "proxyusername":
+					s.proxyUsername = value
+				case "proxypassword":
+					s.proxyPassword = value
+				case "maxadaptiveretries":
+					let n = uriInt(key, value, 0, s.warnings)
+					s.maxAdaptiveRetries = n unless n is none
+				case "enableoverloadretargeting":
+					let b = uriBool(key, value, s.warnings)
+					s.enableOverloadRetargeting = b unless b is none
+				default:
+					s.warnings.push("unsupported option \"{key}\"")
+			}
+		}
+		s.readPreference.tags = tagSets when tagsGiven
+		let wValue = w
+		if !(wValue is none) {
+			if /^-?[0-9]+$/.test(wValue) && wValue.startsWith("-") {
+				s.warnings.push("unsupported value for \"w\": \"{wValue}\"")
+			} else {
+				s.writeConcern.w = wValue
+			}
+		}
+		// TLS options that contradict each other (URI Options spec).
+		fail uriError("tls and ssl must not differ") when tlsValues.includes("true") && tlsValues.includes("false")
+		let tlsKeys = ["tlsinsecure", "tlsallowinvalidcertificates", "tlsallowinvalidhostnames", "tlsdisableocspendpointcheck", "tlsdisablecertificaterevocationcheck"]
+		let conflicts = [(0, 1), (0, 2), (0, 3), (0, 4), (1, 3), (1, 4), (3, 4)]
+		for let pair in conflicts {
+			let (a, b) = pair
+			fail uriError("{tlsKeys[a]} and {tlsKeys[b]} must not both be given") when seen.includes(tlsKeys[a]) && seen.includes(tlsKeys[b])
+		}
+		s.given = seen
+		try validateSettings(s, seen)
+		return none
+	}
+
+	// The rules between options that the connection string and the code
+	// share (URI Options, Initial DNS Seedlist Discovery, Load Balancer and
+	// SOCKS5 specs, and the auth spec's credential rules).
+	internal def validateSettings(s Settings, given string[]) !none {
+		let direct = s.directConnection
+		if !(direct is none) && direct {
+			fail uriError("directConnection=true takes one host") when s.hosts.len() > 1
+			fail uriError("directConnection=true does not go with mongodb+srv") when s.srv
+		}
+		if s.loadBalanced {
+			fail uriError("loadBalanced=true takes one host") when s.hosts.len() > 1
+			fail uriError("loadBalanced=true does not go with directConnection=true") when !(direct is none) && direct
+			fail uriError("loadBalanced=true does not go with replicaSet") when s.replicaSet != ""
+		}
+		fail uriError("srvAllowedHostsSuffix and srvHostValidator do not go together") when s.srvAllowedHostsSuffix != "" && !(s.srvHostValidator is none)
+		fail uriError("srvHostValidator takes mongodb+srv") when !s.srv && !(s.srvHostValidator is none)
+		if !s.srv {
+			fail uriError("srvServiceName takes mongodb+srv") when given.includes("srvservicename")
+			fail uriError("srvMaxHosts takes mongodb+srv") when given.includes("srvmaxhosts")
+			fail uriError("srvAllowedHostsSuffix takes mongodb+srv") when given.includes("srvallowedhostssuffix")
+		} else if s.srvMaxHosts > 0 {
+			fail uriError("srvMaxHosts does not go with replicaSet") when s.replicaSet != ""
+			fail uriError("srvMaxHosts does not go with loadBalanced=true") when s.loadBalanced
+		}
+		if s.proxyHost == "" {
+			fail uriError("proxyPort, proxyUsername and proxyPassword need proxyHost") when given.includes("proxyport") || given.includes("proxyusername") || given.includes("proxypassword")
+		}
+		fail uriError("proxyUsername and proxyPassword go together") when (s.proxyUsername == "") != (s.proxyPassword == "")
+		try validateCredential(s)
+		return none
+	}
+
+	// The credential rules of the auth spec that a connection string or
+	// the settings can break. A missing password is found at `connect`
+	// (the connection string spec takes `user@host`).
+	internal def validateCredential(s Settings) !none {
+		return none unless s.auth
+		let mechanism = s.authMechanism
+		let hasPassword = !(s.password is none)
+		switch mechanism {
+			case "", "SCRAM-SHA-1", "SCRAM-SHA-256", "PLAIN":
+				fail uriError("{mechanism == "" ?? ("authentication", mechanism)} needs a user name") when s.username == ""
+				fail uriError("{mechanism} takes no mechanism properties") when s.authProperties.len() > 0
+			case "MONGODB-X509":
+				fail uriError("MONGODB-X509 takes no password") when hasPassword
+				fail uriError("MONGODB-X509 authenticates against $external") when s.authSource != "" && s.authSource != "$external"
+				fail uriError("MONGODB-X509 takes no mechanism properties") when s.authProperties.len() > 0
+			case "MONGODB-AWS":
+				// Since 2025-09-30 the credentials come from the environment
+				// only (auth spec).
+				fail uriError("MONGODB-AWS takes its credentials from the environment, not a user name or password") when s.username != "" || hasPassword
+				fail uriError("MONGODB-AWS authenticates against $external") when s.authSource != "" && s.authSource != "$external"
+				fail uriError("MONGODB-AWS takes no mechanism properties in the connection string") when s.authProperties.len() > 0
+			case "GSSAPI":
+				fail uriError("GSSAPI needs a user name") when s.username == ""
+				fail uriError("GSSAPI authenticates against $external") when s.authSource != "" && s.authSource != "$external"
+			case "MONGODB-OIDC":
+				fail uriError("MONGODB-OIDC takes no password") when hasPassword
+				fail uriError("MONGODB-OIDC authenticates against $external") when s.authSource != "" && s.authSource != "$external"
+			default:
+				fail uriError("the authentication mechanism \"{mechanism}\" is not known")
+		}
+		return none
+	}
+
+	// The password rule the connection string spec leaves to `connect`.
+	internal def checkPassword(s Settings) !none {
+		return none unless s.auth && (s.authMechanism := "" || "SCRAM-SHA-1" || "SCRAM-SHA-256" || "PLAIN")
+		fail mongoError(ErrorKind.Argument, "{s.authMechanism == "" ?? ("authentication", s.authMechanism)} needs a password") when s.password is none
+		return none
+	}
+
+	internal def optionGiven(cs ConnectionString, key string) bool {
+		for let option in cs.options {
+			let (name, _) = option
+			return true when name == key
+		}
+		return false
+	}
+
+	// The database credentials authenticate against.
+	internal def credentialSource(s Settings) string {
+		return sourceFor(s, s.authMechanism)
+	}
+
+	internal def sourceFor(s Settings, mechanism string) string {
+		return s.authSource when s.authSource != ""
+		switch mechanism {
+			case "MONGODB-X509", "MONGODB-AWS", "GSSAPI", "MONGODB-OIDC":
+				return "$external"
+			case "PLAIN":
+				return s.database == "" ?? ("$external", s.database)
+			default:
+				return s.database == "" ?? ("admin", s.database)
+		}
+	}
+}

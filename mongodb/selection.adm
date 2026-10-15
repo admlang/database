@@ -1,0 +1,150 @@
+partial module adm.database.mongodb {
+	use std.crypto::(randRange)
+
+	// The idle write period of replica set primaries (Max Staleness spec):
+	// part of the smallest max staleness a client may ask for.
+	internal const idleWritePeriodMS = 10000
+	internal const smallestMaxStalenessSeconds = 90
+
+	// The new average round trip after a sample, both in nanoseconds; the
+	// first sample is the average (alpha 0.2, Server Selection spec).
+	internal def averageRTT(previous int64, sample int64) int64 {
+		return sample when previous < 0
+		return (sample + 4 * previous) / 5
+	}
+
+	// Checks a read preference against the topology (Server Selection,
+	// "maxStalenessSeconds" and "tag_sets").
+	internal def checkReadPreference(td TopologyDescription, rp ReadPreference, heartbeat duration) !none {
+		let staleness = rp.maxStaleness.seconds()
+		if rp.mode == ReadMode.Primary {
+			fail mongoError(ErrorKind.Argument, "a primary read preference takes no maxStaleness") when staleness > 0.0
+			for let set in rp.tags {
+				fail mongoError(ErrorKind.Argument, "a primary read preference takes no tag sets") when set.len() > 0
+			}
+		}
+		if staleness > 0.0 && (td.kind := TopologyType.ReplicaSetWithPrimary || TopologyType.ReplicaSetNoPrimary) {
+			fail mongoError(ErrorKind.Argument, "maxStaleness must be at least {smallestMaxStalenessSeconds} seconds") when staleness < float(smallestMaxStalenessSeconds)
+			fail mongoError(ErrorKind.Argument, "maxStaleness must be at least heartbeatFrequency plus 10 seconds") when staleness * 1000.0 < float(heartbeat.milliseconds() + idleWritePeriodMS)
+		}
+		return none
+	}
+
+	// The servers suitable for an operation, before the latency window
+	// (Server Selection, "Rules for server selection"). `deprioritized`
+	// addresses are passed over unless nothing else fits.
+	internal def suitableServers(td TopologyDescription, rp ReadPreference, write bool, heartbeat duration, deprioritized string[]) !ServerDescription[] {
+		try checkReadPreference(td, rp, heartbeat)
+		let preferred = suitableAmong(td, rp, write, heartbeat, deprioritized)
+		return preferred when preferred.len() > 0 || deprioritized.len() == 0
+		return suitableAmong(td, rp, write, heartbeat, [])
+	}
+
+	internal def suitableAmong(td TopologyDescription, rp ReadPreference, write bool, heartbeat duration, deprioritized string[]) ServerDescription[] {
+		let servers ServerDescription[] = []
+		for let (address, server) in td.servers {
+			servers.push(server) unless deprioritized.includes(address)
+		}
+		switch td.kind {
+			case TopologyType.Unknown:
+				return []
+			case TopologyType.Single:
+				return servers.filter(s => s.kind != ServerType.Unknown)
+			case TopologyType.LoadBalanced:
+				return servers.filter(s => s.kind == ServerType.LoadBalancer)
+			case TopologyType.Sharded:
+				return servers.filter(s => s.kind == ServerType.Mongos)
+			default:
+		}
+		let primaries = servers.filter(s => s.kind == ServerType.RSPrimary)
+		return primaries when write
+		switch rp.mode {
+			case ReadMode.Primary:
+				return primaries
+			case ReadMode.PrimaryPreferred:
+				return primaries when primaries.len() > 0
+				return selectMembers(td, servers, rp, false, heartbeat)
+			case ReadMode.Secondary:
+				return selectMembers(td, servers, rp, false, heartbeat)
+			case ReadMode.SecondaryPreferred:
+				let secondaries = selectMembers(td, servers, rp, false, heartbeat)
+				return secondaries when secondaries.len() > 0
+				return primaries
+			default:
+				return selectMembers(td, servers, rp, true, heartbeat)
+		}
+	}
+
+	// Secondaries (and the primary for `nearest`) within max staleness,
+	// then the first tag set that matches any of them.
+	internal def selectMembers(td TopologyDescription, servers ServerDescription[], rp ReadPreference, withPrimary bool, heartbeat duration) ServerDescription[] {
+		let candidates = servers.filter(s => s.kind == ServerType.RSSecondary || (withPrimary && s.kind == ServerType.RSPrimary))
+		let maxStaleness = rp.maxStaleness.seconds()
+		if maxStaleness > 0.0 {
+			let heartbeatMs = float(heartbeat.milliseconds())
+			let primary ?ServerDescription = none
+			for let (_, server) in td.servers {
+				primary = server when server.kind == ServerType.RSPrimary
+			}
+			let fresh ServerDescription[] = []
+			let maxWrite int64 = -1
+			for let (_, server) in td.servers {
+				maxWrite = server.lastWriteDate when server.kind == ServerType.RSSecondary && server.lastWriteDate > maxWrite
+			}
+			for let s in candidates {
+				let staleness = 0.0
+				if s.kind == ServerType.RSSecondary {
+					if primary is none {
+						staleness = float(maxWrite - s.lastWriteDate) + heartbeatMs
+					} else {
+						let sLag = float(s.lastUpdateTime / 1000000 - s.lastWriteDate)
+						let pLag = float(primary.lastUpdateTime / 1000000 - primary.lastWriteDate)
+						staleness = sLag - pLag + heartbeatMs
+					}
+				}
+				fresh.push(s) when staleness <= maxStaleness * 1000.0
+			}
+			candidates = fresh
+		}
+		return candidates when rp.tags.len() == 0
+		for let set in rp.tags {
+			let matching = candidates.filter(s => tagsMatch(set, s.tags))
+			return matching when matching.len() > 0
+		}
+		return []
+	}
+
+	// Whether a read preference tag set is a subset of a server's tags.
+	internal def tagsMatch(want map<string, string>, have map<string, string>) bool {
+		for let (name, value) in want {
+			let got = have.get(name)
+			return false when got is none || got != value
+		}
+		return true
+	}
+
+	// The suitable servers whose average round trip is within
+	// `localThreshold` of the fastest one.
+	internal def latencyWindow(servers ServerDescription[], localThreshold duration) ServerDescription[] {
+		return servers when servers.len() <= 1
+		let fastest int64 = -1
+		for let s in servers {
+			fastest = s.rtt when s.rtt >= 0 && (fastest < 0 || s.rtt < fastest)
+		}
+		return servers when fastest < 0
+		let limit = fastest + localThreshold.nanoseconds()
+		return servers.filter(s => s.rtt < 0 || s.rtt <= limit)
+	}
+
+	// Picks one server in the window: two at random, the one with fewer
+	// operations in progress (Server Selection, steps 6 and 7).
+	internal def pickServer(window ServerDescription[], operations def (string) int) ServerDescription {
+		return window[0] when window.len() == 1
+		let i = randRange(0, window.len())
+		let j = randRange(0, window.len() - 1)
+		j = j + 1 when j >= i
+		let a = window[i]
+		let b = window[j]
+		return operations(a.address) <= operations(b.address) ?? (a, b)
+	}
+}

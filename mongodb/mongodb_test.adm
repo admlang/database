@@ -1,0 +1,413 @@
+// These tests need a MongoDB server; without ADM_TEST_MONGODB they pass
+// without running. See README.md for the servers they expect.
+partial module adm.database.mongodb {
+	use (
+		std.data.encoding
+		std.data.encoding::(bson, BSONValue, BSONKind)
+		std.testing
+	)
+
+	// A replica set member as `host:port` (transactions and change streams
+	// need one); the tests create and drop the database `adm_test`.
+	@env("ADM_TEST_MONGODB")
+	internal const testServer string
+
+	// A server that requires authentication, as `user:password@host:port`.
+	@env("ADM_TEST_MONGODB_AUTH")
+	internal const testAuthServer string
+
+	internal struct TestCustomer {
+		@bson("_id")
+		id ObjectId
+		name string
+		email ?string
+		tags string[]
+		visits int = 0
+	}
+
+	internal def testClient(options string = "") !Client {
+		return try connect("mongodb://{testServer}/?serverSelectionTimeoutMS=5000{options}")
+	}
+
+	internal def freshCollection<T>(client Client, name string) !Collection<T> {
+		let c = client.database("adm_test").collection<T>(name)
+		try c.drop()
+		return c
+	}
+
+	check "MongoDB" {
+		@test()
+		def insertsFindsUpdatesAndDeletes() !none {
+			return none when testServer == ""
+			let client = try testClient()
+			let customers = try freshCollection<TestCustomer>(client, "customers")
+			let inserted = try customers.insert(TestCustomer{name: "Ana", tags: ["new"]})
+			assert inserted.insertedId.kind == BSONKind.ObjectId
+			let many = try customers.insert([TestCustomer{name: "Bo", tags: ["new", "vip"]}, TestCustomer{name: "Cy", tags: []}])
+			assert many.insertedIds.len() == 2
+			let ana = try customers.findOne({"name": "Ana"})
+			assert !(ana is none) && ana.name == "Ana" && ana.email is none
+			let fresh = try customers.find({"tags": "new"}).sort({"name": 1}).limit(100).all()
+			assert fresh.len() == 2 && fresh[0].name == "Ana" && fresh[1].name == "Bo"
+			let updated = try customers.updateOne({"name": "Ana"}, {"$set": {"email": "ana@example.net"}})
+			assert updated.matched == 1 && updated.modified == 1
+			let again = try customers.findOne({"name": "Ana"})
+			assert !(again is none) && textOf(again.email) == "ana@example.net"
+			let bumped = try customers.updateMany(none, {"$inc": {"visits": 2}})
+			assert bumped.matched == 3
+			assert (try customers.countDocuments({"visits": 2})) == 3
+			assert (try customers.estimatedDocumentCount()) == 3
+			let upserted = try customers.updateOne({"name": "Di"}, {"$set": {"tags": ["late"]}}, UpdateOptions{upsert: true})
+			assert upserted.upserted == 1 && !(upserted.upsertedId is none)
+			let previous = try customers.findOneAndUpdate({"name": "Bo"}, {"$set": {"visits": 10}})
+			assert !(previous is none) && previous.visits == 2
+			let after = try customers.findOneAndUpdate({"name": "Bo"}, {"$inc": {"visits": 1}}, FindAndModifyOptions{returnNew: true})
+			assert !(after is none) && after.visits == 11
+			let names = try customers.distinct("name")
+			assert names.len() == 4
+			let deleted = try customers.deleteMany({"tags": "new"})
+			assert deleted.deleted == 2
+			assert (try customers.countDocuments()) == 2
+			try client.close()
+		}
+
+		@test()
+		def reportsWriteErrorsAndBulkResults() !none {
+			return none when testServer == ""
+			let client = try testClient()
+			let docs = try freshCollection<Document>(client, "bulk")
+			let first = new BSONValue(BSONKind.Document)
+			first.set("_id", new BSONValue(1))
+			try docs.insert(first)
+			let duplicate = false
+			docs.insert(first) onerror (err error) {
+				duplicate = err is MongoError && err.kind == ErrorKind.Write && err.writeErrors[0].code == 11000
+				recover InsertResult{insertedId: new BSONValue()}
+			}
+			assert duplicate
+			let result = try docs.bulkWrite([
+				WriteModel<Document>{kind: WriteKind.InsertOne, document: doc("_id", 2)},
+				WriteModel<Document>{kind: WriteKind.UpdateOne, filter: doc("_id", 1), update: {"$set": {"x": 1}}},
+				WriteModel<Document>{kind: WriteKind.DeleteOne, filter: doc("_id", 2)},
+			])
+			assert result.inserted == 1 && result.matched == 1 && result.modified == 1 && result.deleted == 1
+			// Unordered: the duplicate fails, the others still go in.
+			let failed = false
+			docs.bulkWrite([WriteModel<Document>{kind: WriteKind.InsertOne, document: doc("_id", 1)}, WriteModel<Document>{kind: WriteKind.InsertOne, document: doc("_id", 3)}], BulkWriteOptions{ordered: false}) onerror (err error) {
+				if err is MongoError {
+					let written = err.result
+					failed = err.writeErrors.len() == 1 && err.writeErrors[0].index == 0 && written.inserted == 1 unless (written is none)
+				}
+				recover BulkWriteResult{}
+			}
+			assert failed
+			// A large insert goes in several batches.
+			let big Document[] = []
+			for let i = 0; i < 2500; i++ {
+				big.push(doc("_id", 1000 + i))
+			}
+			let inserted = try docs.insert(big)
+			assert inserted.insertedIds.len() == 2500
+			assert (try docs.countDocuments()) == 2502
+			let cursor = try docs.find().batchSize(100).cursor()
+			let seen = 0
+			for let _ in cursor {
+				seen++
+			}
+			try cursor.close()
+			assert seen == 2502
+			try client.close()
+		}
+
+		@test()
+		def aggregatesAndRunsCommands() !none {
+			return none when testServer == ""
+			let client = try testClient()
+			let sales = try freshCollection<Document>(client, "sales")
+			try sales.insert([doc("item", "a"), doc("item", "b"), doc("item", "a")])
+			let counts = try (try sales.aggregate<Document>([{"$group": {"_id": "$item", "n": {"$sum": 1}}}, {"$sort": {"_id": 1}}])).all()
+			assert counts.len() == 2 && intOf(counts[0], "n", 0) == 2
+			// $out under a secondary read preference: a 5.0+ deployment keeps
+			// the preference, and the write lands.
+			let reading = try testClient("&readPreference=secondaryPreferred")
+			let copied = try (try reading.database("adm_test").collection<Document>("sales").aggregate<Document>([{"$out": "sales_copy"}])).all()
+			assert copied.len() == 0
+			assert (try client.database("adm_test").collection<Document>("sales_copy").countDocuments()) == 3
+			try reading.close()
+			let reply = try client.database("admin").runCommand({"ping": 1})
+			assert okOf(reply)
+			let names = try client.database("adm_test").listCollectionNames()
+			assert names.includes("sales")
+			try client.close()
+		}
+
+		// An exhaust cursor: the server streams the batches after the first,
+		// and a cursor closed in the middle of a stream leaves the client
+		// usable.
+		@test()
+		def streamsExhaustCursors() !none {
+			return none when testServer == ""
+			let client = try testClient()
+			let items = try freshCollection<Document>(client, "items")
+			let docs Document[] = []
+			for let i = 0; i < 50; i++ {
+				docs.push(doc("n", i))
+			}
+			try items.insert(docs)
+			let all = try items.find().sort({"n": 1}).batchSize(5).cursorType(CursorType.Exhaust).all()
+			assert all.len() == 50 && intOf(all[49], "n", 0) == 49
+			let c = try items.find().batchSize(5).cursorType(CursorType.Exhaust).cursor()
+			for let i = 0; i < 11; i++ {
+				assert !((try c.next()) is none)
+			}
+			let held = c.conn
+			fail "the exhaust cursor holds no connection" when held is none
+			assert held.streaming
+			try c.close()
+			assert held.broken
+			assert (try items.countDocuments()) == 50
+			try client.close()
+		}
+
+		@test()
+		def runsTransactions() !none {
+			return none when testServer == ""
+			let client = try testClient()
+			let accounts = try freshCollection<Document>(client, "accounts")
+			try accounts.insert([doc2("_id", 1, "balance", 100), doc2("_id", 2, "balance", 0)])
+			let session = try client.startSession()
+			try session.withTransaction(def (s Session) !none {
+				try accounts.updateOne(doc("_id", 1), {"$inc": {"balance": -30}}, UpdateOptions{session: s})
+				try accounts.updateOne(doc("_id", 2), {"$inc": {"balance": 30}}, UpdateOptions{session: s})
+				return none
+			})
+			let second = try accounts.findOne(doc("_id", 2))
+			assert !(second is none) && intOf(second, "balance", 0) == 30
+			// An aborted transaction leaves nothing behind.
+			try session.startTransaction()
+			try accounts.updateOne(doc("_id", 1), {"$inc": {"balance": -1000}}, UpdateOptions{session: session})
+			try session.abortTransaction()
+			let first = try accounts.findOne(doc("_id", 1))
+			assert !(first is none) && intOf(first, "balance", 0) == 70
+			session.end()
+			try client.close()
+		}
+
+		@test()
+		def managesIndexes() !none {
+			return none when testServer == ""
+			let client = try testClient()
+			let people = try freshCollection<Document>(client, "people")
+			try people.insert(doc("email", "a@example.org"))
+			let name = try people.createIndex({"email": 1}, IndexOptions{unique: true})
+			assert name == "email_1"
+			let names = try people.createIndexes([IndexModel{keys: {"city": 1, "age": -1}}, IndexModel{keys: {"notes": "text"}}])
+			assert names.equals(["city_1_age_-1", "notes_text"])
+			let listed = try people.listIndexNames()
+			assert listed.includes("_id_") && listed.includes("email_1") && listed.len() == 4
+			let duplicate = false
+			people.insert(doc("email", "a@example.org")) onerror (err error) {
+				duplicate = serverCodeOf(err) == 11000
+				recover InsertResult{insertedId: new BSONValue()}
+			}
+			assert duplicate
+			try people.dropIndex("email_1")
+			try people.dropIndexes()
+			assert (try people.listIndexNames()).equals(["_id_"])
+			let databases = try client.listDatabaseNames()
+			assert databases.includes("adm_test")
+			try client.close()
+		}
+
+		@test()
+		def watchesChangesAndResumes() !none {
+			return none when testServer == ""
+			let client = try testClient()
+			let events = try freshCollection<TestCustomer>(client, "events")
+			try events.insert(TestCustomer{name: "seed", tags: []})
+			let stream = try events.watch([], ChangeStreamOptions{maxAwaitTime: 500ms})
+			try events.insert(TestCustomer{name: "Eve", tags: ["watched"]})
+			let first = try stream.next()
+			fail "the stream ended" when first is none
+			assert first.operationType == "insert"
+			let inserted = first.fullDocument
+			fail "the insert has no document" when inserted is none
+			assert inserted.name == "Eve"
+			// The server forgets the cursor: the next getMore fails with
+			// CursorNotFound and the stream resumes after the last change.
+			let c = stream.cursor
+			if !(c is none) {
+				let kill = new BSONValue(BSONKind.Document)
+				kill.set("killCursors", new BSONValue("events"))
+				let ids = new BSONValue(BSONKind.Array)
+				ids.push(new BSONValue(c.cursorId))
+				kill.set("cursors", ids)
+				try client.database("adm_test").runCommand(kill)
+			}
+			try events.updateOne({"name": "Eve"}, {"$set": {"visits": 5}})
+			let second = try stream.next()
+			fail "the stream ended after resuming" when second is none
+			assert second.operationType == "update"
+			assert !(stream.resumeToken() is none)
+			try stream.close()
+			try client.close()
+		}
+
+		@test()
+		def storesFilesInGridFS() !none {
+			return none when testServer == ""
+			let client = try testClient()
+			let db = client.database("adm_test")
+			let bucket = db.bucket(BucketOptions{name: "files", chunkSize: 1000})
+			try bucket.drop()
+			let data byte[] = []
+			for let i = 0; i < 4500; i++ {
+				data.push(byte(i % 251))
+			}
+			let id = try bucket.upload("report.bin", data, UploadOptions{metadata: {"owner": "ana"}})
+			assert (try bucket.download(id)).equals(data)
+			let blank = try bucket.upload("empty.bin", byte[])
+			assert (try bucket.download(blank)).len() == 0
+			try bucket.upload("report.bin", "second".bytes())
+			assert string(try bucket.downloadByName("report.bin")) == "second"
+			assert (try bucket.downloadByName("report.bin", 0)).equals(data)
+			let missing = false
+			bucket.downloadByName("report.bin", 5) onerror (err error) {
+				missing = err is MongoError && err.kind == ErrorKind.NotFound
+				recover []
+			}
+			assert missing
+			let listed = try bucket.find({"metadata.owner": "ana"}).all()
+			assert listed.len() == 1 && listed[0].length == 4500 && listed[0].chunkSize == 1000
+			try bucket.rename(id, "renamed.bin")
+			assert (try bucket.downloadByName("renamed.bin")).len() == 4500
+			try bucket.delete(id)
+			let gone = false
+			bucket.download(id) onerror (err error) {
+				gone = err is MongoError && err.kind == ErrorKind.NotFound
+				recover []
+			}
+			assert gone
+			try bucket.deleteByName("report.bin")
+			try client.close()
+		}
+
+		@test()
+		def authenticatesWithScram() !none {
+			return none when testAuthServer == ""
+			let client = try connect("mongodb://{testAuthServer}/?serverSelectionTimeoutMS=5000")
+			let reply = try client.database("admin").runCommand({"ping": 1})
+			assert okOf(reply)
+			try client.close()
+			let host = testAuthServer.slice(testAuthServer.indexOf("@") + 1, testAuthServer.len())
+			// The users testservers/auth.sh makes: SCRAM-SHA-1 only, and the
+			// RFC 4013 example whose name and password SASLprep changes.
+			for let account in ["sha1user:sha1pass", "%E2%85%A8%E2%85%A8:I%C2%ADX"] {
+				let user = try connect("mongodb://{account}@{host}/?serverSelectionTimeoutMS=5000")
+				assert okOf(try user.database("admin").runCommand({"ping": 1}))
+				try user.close()
+			}
+			let wrong = try connect("mongodb://root:wrong@{host}/?serverSelectionTimeoutMS=2000")
+			let refused = false
+			wrong.database("admin").runCommand({"ping": 1}) onerror (err error) {
+				refused = true
+				recover new BSONValue()
+			}
+			assert refused
+			try wrong.close()
+		}
+	}
+
+	check "Server selection" {
+		// An aggregate with $out or $merge keeps a secondary read preference
+		// only when no available server is older than 5.0 (CRUD spec).
+		@test()
+		def selectsWriteStageAggregates() !none {
+			let secondary = ReadPreference{mode: ReadMode.Secondary}
+			let td = new TopologyDescription()
+			td.kind = TopologyType.ReplicaSetWithPrimary
+			let modern = new ServerDescription("a:27017")
+			modern.kind = ServerType.RSPrimary
+			modern.maxWireVersion = 25
+			td.servers["a:27017"] = modern
+			assert writeStagePreference(td, secondary).mode == ReadMode.Secondary
+			let unknown = new ServerDescription("c:27017")
+			unknown.maxWireVersion = 0
+			td.servers["c:27017"] = unknown
+			assert writeStagePreference(td, secondary).mode == ReadMode.Secondary
+			let old = new ServerDescription("b:27017")
+			old.kind = ServerType.RSSecondary
+			old.maxWireVersion = 12
+			td.servers["b:27017"] = old
+			assert writeStagePreference(td, secondary).mode == ReadMode.Primary
+			td.kind = TopologyType.LoadBalanced
+			assert writeStagePreference(td, secondary).mode == ReadMode.Secondary
+		}
+	}
+
+	check "MONGODB-AWS" {
+		// botocore's SigV4 signature of the same GetCallerIdentity request,
+		// and the region table of the auth spec.
+		@test()
+		def signsLikeBotocore() !none {
+			let secret Secret<string> = "secretkeyEXAMPLE"
+			let creds = AWSCredentials{accessKeyId: "AKIAICGVLKOKZVY3X3DA", secretAccessKey: secret, sessionToken: "tokenEXAMPLE"}
+			let (authorization, _) = sigV4(creds, "sts.amazonaws.com", "us-east-1", "20261015T054222Z", "bm9uY2U=")
+			assert authorization == "AWS4-HMAC-SHA256 Credential=AKIAICGVLKOKZVY3X3DA/20261015/us-east-1/sts/aws4_request, SignedHeaders=content-length;content-type;host;x-amz-date;x-amz-security-token;x-mongodb-gs2-cb-flag;x-mongodb-server-nonce, Signature=94da16de6975be8b4a4aa3f496608f04297093a2fbd011d70c7fe271d0f485b0"
+			assert (try stsRegion("sts.amazonaws.com")) == "us-east-1"
+			assert (try stsRegion("sts.us-west-2.amazonaws.com")) == "us-west-2"
+			assert (try stsRegion("sts.us-west-2.amazonaws.com.ch")) == "us-west-2"
+			assert (try stsRegion("example.com")) == "com"
+			assert (try stsRegion("localhost")) == "us-east-1"
+			for let bad in ["sts..com", ".amazonaws.com", "sts.amazonaws.", ""] {
+				assert stsRegion(bad) is error
+			}
+		}
+
+		// The credential endpoints' JSON (EC2 and ECS spell the session
+		// token "Token", STS "SessionToken" with epoch seconds).
+		@test()
+		def readsCredentialEndpoints() !none {
+			let ec2 = new AWSCredentialJSON()
+			try (new encoding.JSON()).decode("{\"AccessKeyId\": \"AKID\", \"SecretAccessKey\": \"S\", \"Token\": \"T\", \"Expiration\": \"2026-10-15T06:00:00Z\"}".bytes(), ec2)
+			let a = try credentialsOf(ec2)
+			assert a.accessKeyId == "AKID" && a.sessionToken == "T"
+			assert !(a.expires is none)
+			let web = new AWSWebIdentityJSON()
+			try (new encoding.JSON()).decode("{\"AssumeRoleWithWebIdentityResponse\": {\"AssumeRoleWithWebIdentityResult\": {\"Credentials\": {\"AccessKeyId\": \"AKID2\", \"SecretAccessKey\": \"S\", \"SessionToken\": \"T2\", \"Expiration\": 1760508000}}}}".bytes(), web)
+			let response = web.assumeRoleWithWebIdentityResponse
+			fail "no response" when response is none
+			let result = response.assumeRoleWithWebIdentityResult
+			fail "no result" when result is none
+			let creds = result.credentials
+			fail "no credentials" when creds is none
+			let b = try credentialsOf(creds)
+			assert b.accessKeyId == "AKID2" && b.sessionToken == "T2"
+			let expires = b.expires
+			fail "no expiry" when expires is none
+			assert expires.unixNs() == int64(1760508000) * 1000000000
+		}
+	}
+
+	internal def textOf(v ?string) string {
+		return v is none ?? ("(none)", v)
+	}
+
+	internal def doc(name string, value any) Document {
+		let d = new BSONValue(BSONKind.Document)
+		d.set(name, valueOf(value))
+		return d
+	}
+
+	internal def doc2(a string, av any, b string, bv any) Document {
+		let d = doc(a, av)
+		d.set(b, valueOf(bv))
+		return d
+	}
+
+	internal def valueOf(value any) BSONValue {
+		return new BSONValue(value) when value is int
+		return new BSONValue(value) when value is string
+		return new BSONValue()
+	}
+}

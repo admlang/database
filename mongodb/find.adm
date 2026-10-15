@@ -1,0 +1,255 @@
+partial module adm.database.mongodb {
+	use (
+		std.data.encoding::(BSONValue, BSONKind)
+	)
+
+	// Find is a query being put together: the filter from `find`, then the
+	// order, the fields, paging and the other find options, each returning
+	// the query. Nothing is sent until the results are asked for with
+	// `cursor`, `all` or `first`.
+	//
+	//     let open = try orders.find({"status": "open"}).sort({"created": -1}).limit(50).all()
+	type Find<T> {
+		internal collection     Collection<T>
+		internal filter         any
+		internal sortBy         any             = none
+		internal projectionOf   any             = none
+		internal skipCount      int             = 0
+		internal limitCount     int             = 0
+		internal batch          int             = 0
+		internal hintOf         any             = none
+		internal collationOf    any             = none
+		internal commentOf      any             = none
+		internal letOf          any             = none
+		internal minOf          any             = none
+		internal maxOf          any             = none
+		internal maxTimeOf      duration        = 0s
+		internal maxAwaitOf     duration        = 0s
+		internal diskUse        ?bool           = none
+		internal noTimeout      bool            = false
+		internal partialResults bool            = false
+		internal keyOnly        bool            = false
+		internal recordId       bool            = false
+		internal kindOf         CursorType      = CursorType.NonTailable
+		internal sessionOf      ?Session        = none
+		internal preference     ?ReadPreference = none
+		internal concern        ?ReadConcern    = none
+
+		def new(collection Collection<T>, filter any) {
+			self.collection = collection
+			self.filter = filter
+		}
+
+		// The order of the results: `{"field": 1}` ascending, -1 descending.
+		def sort(order any) Find<T> {
+			sortBy = order
+			return self
+		}
+
+		// The fields of each result: `{"name": 1}` only these, `{"notes": 0}`
+		// all but these.
+		def projection(fields any) Find<T> {
+			projectionOf = fields
+			return self
+		}
+
+		// Skips the first `count` results.
+		def skip(count int) Find<T> {
+			skipCount = count
+			return self
+		}
+
+		// At most `count` results (0: no limit). A negative count asks for
+		// one batch of at most -count.
+		def limit(count int) Find<T> {
+			limitCount = count
+			return self
+		}
+
+		// How many results each round trip brings.
+		def batchSize(count int) Find<T> {
+			batch = count
+			return self
+		}
+
+		// The index to use: its name or its key pattern.
+		def hint(index any) Find<T> {
+			hintOf = index
+			return self
+		}
+
+		// The collation strings compare by (`{"locale": "fr"}`).
+		def collation(rules any) Find<T> {
+			collationOf = rules
+			return self
+		}
+
+		// A note the server keeps in its logs and profiler.
+		def comment(note any) Find<T> {
+			commentOf = note
+			return self
+		}
+
+		// Variables the filter can read as `$$name`.
+		def variables(values any) Find<T> {
+			letOf = values
+			return self
+		}
+
+		// Index bounds (with `hint`): the lower one inclusive...
+		def min(bound any) Find<T> {
+			minOf = bound
+			return self
+		}
+
+		// ...and the upper one exclusive.
+		def max(bound any) Find<T> {
+			maxOf = bound
+			return self
+		}
+
+		// The time the server may spend on the query.
+		def maxTime(limit duration) Find<T> {
+			maxTimeOf = limit
+			return self
+		}
+
+		// How long a TailableAwait cursor's getMore waits for new documents.
+		def maxAwaitTime(limit duration) Find<T> {
+			maxAwaitOf = limit
+			return self
+		}
+
+		// Lets the server use temporary files for a large sort.
+		def allowDiskUse(allow bool = true) Find<T> {
+			diskUse = allow
+			return self
+		}
+
+		// Keeps an idle cursor open past the server's timeout.
+		def noCursorTimeout(keep bool = true) Find<T> {
+			noTimeout = keep
+			return self
+		}
+
+		// On a sharded cluster, returns what the reachable shards have when
+		// some are down.
+		def allowPartialResults(allow bool = true) Find<T> {
+			partialResults = allow
+			return self
+		}
+
+		// Returns only the index keys of the results.
+		def returnKey(only bool = true) Find<T> {
+			keyOnly = only
+			return self
+		}
+
+		// Adds each result's record id as `$recordId`.
+		def showRecordId(show bool = true) Find<T> {
+			recordId = show
+			return self
+		}
+
+		// Tailable cursors on a capped collection, or an exhaust cursor.
+		def cursorType(kind CursorType) Find<T> {
+			kindOf = kind
+			return self
+		}
+
+		// Runs the query in a session (and its transaction).
+		def session(s Session) Find<T> {
+			sessionOf = s
+			return self
+		}
+
+		// Which members may answer, instead of the collection's preference.
+		def readPreference(rp ReadPreference) Find<T> {
+			preference = rp
+			return self
+		}
+
+		// The read concern, instead of the collection's.
+		def readConcern(rc ReadConcern) Find<T> {
+			concern = rc
+			return self
+		}
+
+		// Runs the query and returns a cursor over its results.
+		// Fails when the server refuses the query.
+		def cursor() !Cursor<T> {
+			let command = new BSONValue(BSONKind.Document)
+			command.set("find", new BSONValue(collection.name))
+			command.set("filter", filter is none ?? (new BSONValue(BSONKind.Document), try toDocument(filter)))
+			try setValue(command, "sort", sortBy)
+			try setValue(command, "projection", projectionOf)
+			command.set("skip", new BSONValue(int64(skipCount))) when skipCount > 0
+			let limitValue = limitCount < 0 ?? (-limitCount, limitCount)
+			command.set("limit", new BSONValue(int64(limitValue))) when limitValue > 0
+			let size = batch
+			size = limitValue when limitValue > 0 && (size == 0 || size > limitValue) && limitCount > 0
+			command.set("batchSize", new BSONValue(int32(size))) when size > 0
+			command.set("singleBatch", new BSONValue(true)) when limitCount < 0
+			try setValue(command, "hint", hintOf)
+			try setValue(command, "collation", collationOf)
+			try setValue(command, "comment", commentOf)
+			try setValue(command, "let", letOf)
+			try setValue(command, "min", minOf)
+			try setValue(command, "max", maxOf)
+			command.set("maxTimeMS", new BSONValue(int64(maxTimeOf.milliseconds()))) when maxTimeOf > 0s
+			let disk = diskUse
+			command.set("allowDiskUse", new BSONValue(disk)) unless disk is none
+			command.set("noCursorTimeout", new BSONValue(true)) when noTimeout
+			command.set("allowPartialResults", new BSONValue(true)) when partialResults
+			command.set("returnKey", new BSONValue(true)) when keyOnly
+			command.set("showRecordId", new BSONValue(true)) when recordId
+			if kindOf == CursorType.Tailable || kindOf == CursorType.TailableAwait {
+				command.set("tailable", new BSONValue(true))
+				command.set("awaitData", new BSONValue(true)) when kindOf == CursorType.TailableAwait
+			}
+			let rp = preference
+			let rc = concern
+			let spec = OpSpec{name: "find", database: collection.database.name, readPreference: rp is none ?? (collectionReadPreference(collection), rp), retryRead: true, readConcern: rc is none ?? (collectionReadConcern(collection), rc), session: sessionOf}
+			let exhaust = kindOf == CursorType.Exhaust
+			let result = try openCursor<T>(collection.database.client, spec, command, batch, limitValue, holdConn = exhaust)
+			result.exhaust = exhaust
+			result.tailable = kindOf == CursorType.Tailable || kindOf == CursorType.TailableAwait
+			result.maxAwait = kindOf == CursorType.TailableAwait ?? (maxAwaitOf, 0s)
+			let note = commentOf
+			result.comment = toCommentValue(note) unless (note is none)
+			return result
+		}
+
+		// Runs the query and reads every result.
+		// Fails when the query or a result fails.
+		def all() !T[] {
+			let c = try cursor()
+			let out = c.all() onerror (err error) {
+				c.close() onerror recover none
+				fail err
+			}
+			try c.close()
+			return out
+		}
+
+		// Runs the query for its first result (none when nothing matches).
+		// Fails when the query or the result fails.
+		def first() !?T {
+			limitCount = 1 when limitCount == 0 || limitCount > 1
+			let c = try cursor()
+			let item = c.next() onerror (err error) {
+				c.close() onerror recover none
+				fail err
+			}
+			try c.close()
+			return item
+		}
+	}
+
+	internal def toCommentValue(note any) ?BSONValue {
+		return new BSONValue(note) when note is string
+		return toDocument(note) onerror (err error) {
+			return none
+		}
+	}
+}

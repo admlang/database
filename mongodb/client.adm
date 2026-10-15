@@ -1,0 +1,244 @@
+partial module adm.database.mongodb {
+	use (
+		std.data.encoding::(BSONValue, BSONKind)
+		std.net.tls
+		std.time
+	)
+
+	// How a client connects and behaves, for what a connection string
+	// cannot say (a TLS configuration, credentials kept out of the string)
+	// or as defaults: an option the string gives wins over the field.
+	struct ClientOptions {
+		appName                   string                  = ""
+		username                  string                  = ""
+		password                  ?Secret<string>         = none
+		authSource                string                  = ""
+		// SCRAM-SHA-256, SCRAM-SHA-1, PLAIN, MONGODB-X509 or MONGODB-AWS;
+		// "" negotiates SCRAM.
+		authMechanism             string                  = ""
+		// TLS with this configuration (its root CAs, client certificate,
+		// server name).
+		tls                       ?tls.Config             = none
+		// The time an operation may take in all (server selection, waiting
+		// for a connection, retries); none for no overall limit.
+		timeout                   ?duration               = none
+		connectTimeout            duration                = 10s
+		// The time one network read or write may take; 0s for no limit.
+		socketTimeout             duration                = 0s
+		serverSelectionTimeout    duration                = 30s
+		heartbeatFrequency        duration                = 10s
+		localThreshold            duration                = 15ms
+		maxPoolSize               int                     = 100
+		minPoolSize               int                     = 0
+		maxIdleTime               duration                = 0s
+		maxConnecting             int                     = 2
+		readPreference            ReadPreference          = ReadPreference{}
+		readConcern               ReadConcern             = ReadConcern{}
+		writeConcern              WriteConcern            = WriteConcern{}
+		retryReads                bool                    = true
+		retryWrites               bool                    = true
+		// "zstd", "snappy", "zlib", in the order of preference.
+		compressors               string[]                = []
+		serverApi                 ?ServerApi              = none
+		replicaSet                string                  = ""
+		directConnection          ?bool                   = none
+		loadBalanced              bool                    = false
+		monitoringMode            MonitoringMode          = MonitoringMode.Auto
+		// Retries of operations the server refuses as overloaded.
+		maxAdaptiveRetries        int                     = 2
+		// Retry an overloaded operation on another server when one fits.
+		enableOverloadRetargeting bool                    = false
+		// Decides which hosts of a `mongodb+srv` lookup may be used, in
+		// place of the domain check. WARNING: Modifying the default SRV
+		// domain name validation can create vulnerabilities.
+		srvHostValidator          ?def (string) bool      = none
+		// Gives MONGODB-AWS its credentials (the AWS_CREDENTIAL_PROVIDER
+		// of the auth spec), ahead of the environment and the metadata
+		// endpoints.
+		awsCredentialProvider     ?def () !AWSCredentials = none
+	}
+
+	internal def settingsOf(o ClientOptions) Settings {
+		let s = Settings{}
+		s.appName = o.appName
+		if o.username != "" || !(o.password is none) {
+			s.auth = true
+			s.username = o.username
+			s.password = o.password
+		}
+		s.authSource = o.authSource
+		s.authMechanism = o.authMechanism
+		s.auth = true when o.authMechanism != ""
+		let config = o.tls
+		if !(config is none) {
+			s.tls = true
+			s.tlsConfig = config
+		}
+		s.timeout = o.timeout
+		s.connectTimeout = o.connectTimeout
+		s.socketTimeout = o.socketTimeout
+		s.serverSelectionTimeout = o.serverSelectionTimeout
+		s.heartbeatFrequency = o.heartbeatFrequency
+		s.localThreshold = o.localThreshold
+		s.maxPoolSize = o.maxPoolSize
+		s.minPoolSize = o.minPoolSize
+		s.maxIdleTime = o.maxIdleTime
+		s.maxConnecting = o.maxConnecting
+		s.readPreference = o.readPreference
+		s.readConcern = o.readConcern
+		s.writeConcern = o.writeConcern
+		s.retryReads = o.retryReads
+		s.retryWrites = o.retryWrites
+		s.compressors = o.compressors
+		s.serverApi = o.serverApi
+		s.replicaSet = o.replicaSet
+		s.directConnection = o.directConnection
+		s.loadBalanced = o.loadBalanced
+		s.monitoringMode = o.monitoringMode
+		s.maxAdaptiveRetries = o.maxAdaptiveRetries
+		s.enableOverloadRetargeting = o.enableOverloadRetargeting
+		s.srvHostValidator = o.srvHostValidator
+		s.awsCredentialProvider = o.awsCredentialProvider
+		return s
+	}
+
+	// connect makes a client for a connection string (`mongodb://` or
+	// `mongodb+srv://`): it reads the string, looks up a seed list in DNS,
+	// and starts watching the servers in the background. Operations wait
+	// for a suitable server; `connect` itself does not.
+	//
+	//     let client = try mongodb.connect("mongodb://app:secret@db1,db2/shop?replicaSet=rs0")
+	//
+	// Fails with ErrorKind.Argument when the string or the options are
+	// invalid, ErrorKind.Connection when a `mongodb+srv` name does not
+	// resolve.
+	def connect(uri string, options ClientOptions = ClientOptions{}) !Client {
+		let s = settingsOf(options)
+		let cs = try parseConnectionString(uri)
+		try applyConnectionString(s, cs)
+		if s.srv {
+			try resolveSeedList(s)
+		}
+		try checkPassword(s)
+		let client = new Client(s)
+		startClient(client)
+		return client
+	}
+
+	// Client is a connection to a deployment: a standalone server, a
+	// replica set, a sharded cluster or a load balancer in front of one.
+	// It keeps a pool of connections per server and is safe to share
+	// between tasks; make one per deployment and `close` it at the end.
+	partial type Client {
+		internal settings    Settings
+		internal cluster     Cluster
+		internal sessionPool SessionPool
+		internal srvPoller   ?SrvPoller  = none
+
+		def new(settings Settings) {
+			self.settings = settings
+			let seeds string[] = []
+			for let h in settings.hosts {
+				seeds.push(addressOf(h))
+			}
+			let direct = settings.directConnection
+			let ts = TopologySettings{seeds: seeds, setName: settings.replicaSet, direct: !(direct is none) && direct, loadBalanced: settings.loadBalanced}
+			cluster = new Cluster(settings, ts)
+			sessionPool = new SessionPool()
+		}
+
+		// What reading the connection string warned about: unknown options
+		// and values that were ignored.
+		def warnings() string[] {
+			return settings.warnings
+		}
+
+		// The database of a name.
+		def database(name string) Database {
+			return new Database(self, name)
+		}
+
+		// Starts a client session (for causal consistency, snapshot reads
+		// and transactions). End it with `Session.end`.
+		// Fails when the client is closed or the deployment has no
+		// sessions.
+		def startSession(options SessionOptions = SessionOptions{}) !Session {
+			fail mongoError(ErrorKind.Closed, "the client is closed") when cluster.isClosed()
+			let given = options.causalConsistency
+			fail mongoError(ErrorKind.Argument, "a session cannot be both causally consistent and a snapshot") when options.snapshot && !(given is none) && given
+			return new Session(self, options, true)
+		}
+
+		// Closes the client: ends the server sessions it pooled, stops
+		// monitoring and closes every connection.
+		// Fails when ending the sessions fails; the client is closed anyway.
+		def close() !none {
+			let poller = srvPoller
+			poller.stop() unless poller is none
+			let sessions = sessionPool.drain()
+			let failure ?error = none
+			if sessions.len() > 0 {
+				endSessions(self, sessions) onerror (err error) {
+					failure = err
+					recover none
+				}
+			}
+			cluster.close()
+			let err = failure
+			fail err unless err is none
+			return none
+		}
+	}
+
+	internal def startClient(client Client) {
+		client.cluster.start()
+		if client.settings.srv && !client.settings.loadBalanced {
+			let poller = new SrvPoller(client)
+			client.srvPoller = poller
+			poller.start()
+		}
+	}
+
+	// Ends server sessions on the server, 10000 at a time.
+	internal def endSessions(client Client, sessions ServerSession[]) !none {
+		let start = 0
+		for start < sessions.len() {
+			let end = start + 10000 < sessions.len() ?? (start + 10000, sessions.len())
+			let ids = new BSONValue(BSONKind.Array)
+			for let i = start; i < end; i++ {
+				ids.push(sessions[i].id)
+			}
+			let command = new BSONValue(BSONKind.Document)
+			command.set("endSessions", ids)
+			let rp = ReadPreference{mode: ReadMode.PrimaryPreferred}
+			try runInternal(client, "admin", command, rp, time.monoNs() + 5000000000)
+			start = end
+		}
+		return none
+	}
+
+	// The logical session timeout of the deployment, 0 when it has no
+	// sessions.
+	internal def sessionTimeoutMinutes(client Client) int {
+		let minutes = client.cluster.description().logicalSessionTimeoutMinutes
+		return minutes is none ?? (0, minutes)
+	}
+
+	internal def checkTransactionsSupported(client Client) !none {
+		let td = client.cluster.description()
+		fail mongoError(ErrorKind.Argument, "transactions need a replica set or a sharded cluster") when td.kind == TopologyType.Single && singleIsStandalone(td)
+		return none
+	}
+
+	internal def releasePinned(client Client, conn Conn) {
+		let server = client.cluster.server(conn.address)
+		server.pool.checkIn(conn) unless server is none
+	}
+
+	internal def singleIsStandalone(td TopologyDescription) bool {
+		for let (_, server) in td.servers {
+			return true when server.kind == ServerType.Standalone
+		}
+		return false
+	}
+}

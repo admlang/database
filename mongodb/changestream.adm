@@ -1,0 +1,283 @@
+partial module adm.database.mongodb {
+	use (
+		std.data.encoding::(bson, BSONValue, BSONKind)
+		std.time
+	)
+
+	// The codes of a resumable change stream error on servers older than
+	// 4.4 (Change Streams spec).
+	internal const resumableChangeStreamCodes = [6, 7, 89, 91, 189, 262, 9001, 10107, 11600, 11602, 13435, 13436, 63, 150, 13388, 234, 133]
+
+	// A namespace a change happened in.
+	struct ChangeNamespace {
+		db   string
+		coll string = ""
+	}
+
+	// One change: what happened (`operationType`: insert, update, replace,
+	// delete, drop, rename, dropDatabase, invalidate...), to which document,
+	// and the document itself when the stream asks for it. `id` is the
+	// resume token of this change.
+	struct ChangeEvent<T> {
+		@bson("_id")
+		id Document
+		operationType string
+		ns ?ChangeNamespace = none
+		to ?ChangeNamespace = none
+		documentKey ?Document = none
+		updateDescription ?Document = none
+		fullDocument ?T = none
+		fullDocumentBeforeChange ?T = none
+		clusterTime ?Document = none
+		wallTime ?time.Time = none
+		operationDescription ?Document = none
+	}
+
+	// How a change stream watches.
+	struct ChangeStreamOptions {
+		// "updateLookup" adds the current document to update events;
+		// "whenAvailable" or "required" use the post-image the collection
+		// keeps.
+		fullDocument             string    = ""
+		// "whenAvailable" or "required": the document before the change.
+		fullDocumentBeforeChange string    = ""
+		resumeAfter              ?Document = none
+		startAfter               ?Document = none
+		// A Timestamp: changes from this cluster time on.
+		startAtOperationTime     ?Document = none
+		maxAwaitTime             duration  = 0s
+		batchSize                int       = 0
+		collation                any       = none
+		comment                  any       = none
+		showExpandedEvents       bool      = false
+		session                  ?Session  = none
+	}
+
+	// ChangeStream follows the changes of a collection, a database or the
+	// whole deployment (Change Streams spec): it reads them as they happen
+	// and resumes after a network failure or an election from the last
+	// change it returned. Loop over it with `for`, or call `next`; `close`
+	// ends it and reports the error that stopped a loop.
+	//
+	//     let changes = try orders.watch([{"$match": {"operationType": "insert"}}])
+	//     for let change in changes {
+	//         handle(change.fullDocument)
+	//     }
+	type ChangeStream<T> {
+		internal client        Client
+		internal database      string
+		internal collection    string
+		internal pipeline      BSONValue
+		internal options       ChangeStreamOptions
+		internal preference    ReadPreference
+		internal concern       ReadConcern
+		internal wholeCluster  bool
+		internal cursor        ?Cursor<Document>   = none
+		internal token         ?Document           = none
+		internal operationTime ?Document           = none
+		internal returnedAny   bool                = false
+		internal failure       ?error              = none
+		internal closed        bool                = false
+
+		def new(client Client, database string, collection string, pipeline BSONValue, options ChangeStreamOptions, preference ReadPreference, concern ReadConcern, wholeCluster bool) {
+			self.client = client
+			self.database = database
+			self.collection = collection
+			self.pipeline = pipeline
+			self.options = options
+			self.preference = preference
+			self.concern = concern
+			self.wholeCluster = wholeCluster
+			token = options.startAfter is none ?? (options.resumeAfter, options.startAfter)
+			operationTime = options.startAtOperationTime
+		}
+
+		// The resume token to start a new stream after the last change this
+		// one returned (or the server's position after an empty batch).
+		def resumeToken() ?Document {
+			return token
+		}
+
+		// Implements Iterator<ChangeEvent<T>>: the next change, waiting for
+		// one; none when the stream ends or fails (`close` reports why).
+		def iterate() ?ChangeEvent<T> {
+			let change = next() onerror (err error) {
+				failure = err
+				return none
+			}
+			return change
+		}
+
+		// The next change, waiting for one to happen; none once the stream
+		// is closed or invalidated.
+		// Fails when the server refuses the stream, resuming fails, or a
+		// change does not convert to T.
+		def next() !?ChangeEvent<T> {
+			for !closed {
+				let change = try tryNext()
+				return change unless change is none
+			}
+			return none
+		}
+
+		// One look for a change: none when nothing new arrived within
+		// `maxAwaitTime`.
+		// Fails as `next` does.
+		def tryNext() !?ChangeEvent<T> {
+			fail mongoError(ErrorKind.Closed, "the change stream is closed") when closed
+			let doc = try nextChange(self)
+			if doc is none {
+				let c = cursor
+				if !(c is none) {
+					let pbrt = c.postBatchResumeToken
+					token = pbrt unless pbrt is none || c.available() > 0
+				}
+				return none
+			}
+			if !doc.has("_id") {
+				try close()
+				fail mongoError(ErrorKind.Protocol, "Cannot provide resume functionality when the resume token is missing")
+			}
+			token = doc.get("_id")
+			let c = cursor
+			if !(c is none) && c.available() == 0 {
+				let pbrt = c.postBatchResumeToken
+				token = pbrt unless pbrt is none
+			}
+			returnedAny = true
+			return try decodeAs<ChangeEvent<T>>(doc)
+		}
+
+		// Ends the stream; reports the error that ended a loop over it.
+		// Fails with that error.
+		def close() !none {
+			closed = true
+			let c = cursor
+			if !(c is none) {
+				cursor = none
+				c.close() onerror recover none
+			}
+			let err = failure
+			failure = none
+			fail err unless err is none
+			return none
+		}
+	}
+
+	// Opens (or reopens, when resuming) the change stream's cursor.
+	internal def openStream<T>(stream ChangeStream<T>, resuming bool) !none {
+		let stage = new BSONValue(BSONKind.Document)
+		let o = stream.options
+		stage.set("fullDocument", new BSONValue(o.fullDocument)) unless o.fullDocument == ""
+		stage.set("fullDocumentBeforeChange", new BSONValue(o.fullDocumentBeforeChange)) unless o.fullDocumentBeforeChange == ""
+		stage.set("allChangesForCluster", new BSONValue(true)) when stream.wholeCluster
+		stage.set("showExpandedEvents", new BSONValue(true)) when o.showExpandedEvents
+		let token = stream.token
+		let started = !(o.startAfter is none) && !stream.returnedAny
+		if !(token is none) {
+			stage.set(started ?? ("startAfter", "resumeAfter"), token)
+		} else {
+			let at = stream.operationTime
+			stage.set("startAtOperationTime", at) unless at is none
+		}
+		let changeStage = new BSONValue(BSONKind.Document)
+		changeStage.set("$changeStream", stage)
+		let stages = new BSONValue(BSONKind.Array)
+		stages.push(changeStage)
+		for let s in stream.pipeline.elements() {
+			stages.push(s)
+		}
+		let command = new BSONValue(BSONKind.Document)
+		command.set("aggregate", stream.collection == "" ?? (new BSONValue(int32(1)), new BSONValue(stream.collection)))
+		command.set("pipeline", stages)
+		let cursorDoc = new BSONValue(BSONKind.Document)
+		cursorDoc.set("batchSize", new BSONValue(int32(o.batchSize))) when o.batchSize > 0
+		command.set("cursor", cursorDoc)
+		try setValue(command, "collation", o.collation)
+		try setValue(command, "comment", o.comment)
+		let spec = OpSpec{name: "aggregate", database: stream.database, readPreference: stream.preference, retryRead: true, readConcern: stream.concern, session: o.session}
+		let cursor = try openCursor<Document>(stream.client, spec, command, o.batchSize, 0)
+		cursor.tailable = true
+		cursor.maxAwait = o.maxAwaitTime
+		let note = o.comment
+		cursor.comment = note is none ?? (none, toCommentValue(note))
+		stream.cursor = cursor
+		// The position to resume from when nothing comes back at first.
+		stream.operationTime = clusterTimeOfCursor(stream.client, cursor) when !resuming && stream.token is none && stream.operationTime is none && cursor.available() == 0 && cursor.postBatchResumeToken is none
+		return none
+	}
+
+	internal def clusterTimeOfCursor(client Client, cursor Cursor<Document>) ?Document {
+		return cursor.operationTime
+	}
+
+	// The next document of a change stream, resuming once after a
+	// resumable error.
+	internal def nextChange<T>(stream ChangeStream<T>) !?BSONValue {
+		let c = stream.cursor
+		fail mongoError(ErrorKind.Closed, "the change stream is closed") when c is none
+		let described = stream.client.cluster.description().servers.get(c.server.address)
+		let wire = described is none ?? (maxWireVersion, described.maxWireVersion)
+		let doc = cursorNext(c) onerror (err error) {
+			fail err unless resumable(err, wire)
+			cursorKill(c)
+			cursorWrapUp(c)
+			try openStream(stream, true)
+			let again = stream.cursor
+			return none when again is none
+			recover try cursorNext(again)
+		}
+		return doc
+	}
+
+	// Whether a getMore error lets a change stream resume.
+	internal def resumable(err error, wire int) bool {
+		return true unless err is MongoError
+		return true when err.labels.includes("NetworkError") || err.kind == ErrorKind.TimedOut
+		return true when err.serverCode == 43
+		return err.labels.includes("ResumableChangeStreamError") when wire >= 9
+		return resumableChangeStreamCodes.includes(err.serverCode)
+	}
+
+	internal def changeStreamPipeline(pipeline any[]) !BSONValue {
+		let stages = new BSONValue(BSONKind.Array)
+		for let stage in pipeline {
+			stages.push(try toDocument(stage))
+		}
+		return stages
+	}
+
+	partial type Collection<T> {
+		// Follows the changes of the collection; the pipeline filters or
+		// reshapes them. Events carry the documents as T.
+		// Fails when the server refuses the stream (a standalone server has
+		// none).
+		def watch(pipeline any[] = [], options ChangeStreamOptions = ChangeStreamOptions{}) !ChangeStream<T> {
+			let stream = new ChangeStream<T>(database.client, database.name, name, try changeStreamPipeline(pipeline), options, collectionReadPreference(self), collectionReadConcern(self), false)
+			try openStream(stream, false)
+			return stream
+		}
+	}
+
+	partial type Database {
+		// Follows the changes of every collection of the database.
+		// Fails when the server refuses the stream (a standalone server has
+		// none).
+		def watch(pipeline any[] = [], options ChangeStreamOptions = ChangeStreamOptions{}) !ChangeStream<Document> {
+			let stream = new ChangeStream<Document>(client, name, "", try changeStreamPipeline(pipeline), options, readPreferenceOf(self), readConcernOf(self), false)
+			try openStream(stream, false)
+			return stream
+		}
+	}
+
+	partial type Client {
+		// Follows the changes of the whole deployment.
+		// Fails when the server refuses the stream (a standalone server has
+		// none).
+		def watch(pipeline any[] = [], options ChangeStreamOptions = ChangeStreamOptions{}) !ChangeStream<Document> {
+			let stream = new ChangeStream<Document>(self, "admin", "", try changeStreamPipeline(pipeline), options, settings.readPreference, settings.readConcern, true)
+			try openStream(stream, false)
+			return stream
+		}
+	}
+}

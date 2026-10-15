@@ -1,0 +1,201 @@
+partial module adm.database.mongodb {
+	use (
+		std.data.encoding::(BSONValue, BSONKind)
+	)
+
+	// How an index is made (the createIndexes command's options).
+	struct IndexOptions {
+		// Made from the keys when empty: "name_1_age_-1".
+		name                    string    = ""
+		unique                  bool      = false
+		sparse                  bool      = false
+		hidden                  bool      = false
+		// Documents expire this long after the date in the indexed field
+		// (a TTL index).
+		expireAfter             ?duration = none
+		partialFilterExpression any       = none
+		collation               any       = none
+		// Text indexes.
+		weights                 any       = none
+		defaultLanguage         string    = ""
+		languageOverride        string    = ""
+		// Wildcard indexes.
+		wildcardProjection      any       = none
+		// Other options the server takes, as a document.
+		extra                   any       = none
+	}
+
+	// One index to make: its keys in order (`{"name": 1, "age": -1}`, or
+	// "text", "2dsphere", "hashed" as values) and its options.
+	struct IndexModel {
+		keys    any
+		options IndexOptions = IndexOptions{}
+	}
+
+	// What a deployment lists about one of its databases.
+	struct DatabaseInfo {
+		name       string
+		sizeOnDisk int64
+		// Whether it holds no data.
+		isEmpty    bool
+	}
+
+	// The name the server would give an index: each key and its value,
+	// joined with "_".
+	internal def indexName(keys BSONValue) string {
+		let parts string[] = []
+		for let entry in keys.entries() {
+			let (key, value) = entry
+			let text = value.kind == BSONKind.String ?? (value.asString() onerror recover "", "{value.asInt() onerror recover 1}")
+			parts.push("{key}_{text}")
+		}
+		return parts.join("_")
+	}
+
+	internal def indexSpec(model IndexModel) !BSONValue {
+		let keys = try toDocument(model.keys)
+		fail mongoError(ErrorKind.Argument, "an index needs at least one key") when keys.len() == 0
+		let o = model.options
+		let spec = new BSONValue(BSONKind.Document)
+		spec.set("key", keys)
+		spec.set("name", new BSONValue(o.name == "" ?? (indexName(keys), o.name)))
+		spec.set("unique", new BSONValue(true)) when o.unique
+		spec.set("sparse", new BSONValue(true)) when o.sparse
+		spec.set("hidden", new BSONValue(true)) when o.hidden
+		let ttl = o.expireAfter
+		spec.set("expireAfterSeconds", new BSONValue(int64(ttl.milliseconds() / 1000))) unless ttl is none
+		try setValue(spec, "partialFilterExpression", o.partialFilterExpression)
+		try setValue(spec, "collation", o.collation)
+		try setValue(spec, "weights", o.weights)
+		spec.set("default_language", new BSONValue(o.defaultLanguage)) unless o.defaultLanguage == ""
+		spec.set("language_override", new BSONValue(o.languageOverride)) unless o.languageOverride == ""
+		try setValue(spec, "wildcardProjection", o.wildcardProjection)
+		if !(o.extra is none) {
+			for let entry in (try toDocument(o.extra)).entries() {
+				let (key, value) = entry
+				spec.set(key, value)
+			}
+		}
+		return spec
+	}
+
+	// Makes indexes on a collection and returns their names.
+	internal def createIndexesOn<T>(c Collection<T>, models IndexModel[], session ?Session) !string[] {
+		fail mongoError(ErrorKind.Argument, "createIndexes needs at least one index") when models.len() == 0
+		let specs = new BSONValue(BSONKind.Array)
+		let names string[] = []
+		for let model in models {
+			let spec = try indexSpec(model)
+			names.push(try spec.get("name").asString())
+			specs.push(spec)
+		}
+		let command = new BSONValue(BSONKind.Document)
+		command.set("createIndexes", new BSONValue(c.name))
+		command.set("indexes", specs)
+		try runWrite(c.database.client, c.database.name, command, writeConcernFor(c, none), session)
+		return names
+	}
+
+	partial type Collection<T> {
+		// Makes an index and returns its name; one that exists with the same
+		// keys and options is left as it is.
+		// Fails when an index of that name differs, or the server refuses.
+		def createIndex(keys any, options IndexOptions = IndexOptions{}, session ?Session = none) !string {
+			let names = try createIndexesOn(self, [IndexModel{keys: keys, options: options}], session)
+			return names[0]
+		}
+
+		// Makes several indexes in one command.
+		// Fails when the list is empty, an index has no keys, or the server
+		// refuses one of them.
+		def createIndexes(models IndexModel[], session ?Session = none) !string[] {
+			return try createIndexesOn(self, models, session)
+		}
+
+		// Drops an index by name.
+		// Fails when there is no such index.
+		def dropIndex(indexName string, session ?Session = none) !none {
+			fail mongoError(ErrorKind.Argument, "use dropIndexes to drop every index") when indexName == "*"
+			let command = new BSONValue(BSONKind.Document)
+			command.set("dropIndexes", new BSONValue(name))
+			command.set("index", new BSONValue(indexName))
+			try runWrite(database.client, database.name, command, writeConcernFor(self, none), session)
+			return none
+		}
+
+		// Drops every index but the one on _id.
+		// Fails when the collection does not exist or the server refuses.
+		def dropIndexes(session ?Session = none) !none {
+			let command = new BSONValue(BSONKind.Document)
+			command.set("dropIndexes", new BSONValue(name))
+			command.set("index", new BSONValue("*"))
+			try runWrite(database.client, database.name, command, writeConcernFor(self, none), session)
+			return none
+		}
+
+		// The collection's indexes as the server describes them (key, name,
+		// options); empty for a collection that does not exist.
+		// Fails when the server refuses the command.
+		def listIndexes(session ?Session = none) !Document[] {
+			let command = new BSONValue(BSONKind.Document)
+			command.set("listIndexes", new BSONValue(name))
+			let spec = OpSpec{name: "listIndexes", database: database.name, readPreference: ReadPreference{}, retryRead: true, session: session}
+			let cursor = openCursor<Document>(database.client, spec, command, 0, 0) onerror (err error) {
+				// A collection that does not exist has no indexes.
+				return [] when serverCodeOf(err) == 26
+				fail err
+			}
+			return try cursor.all()
+		}
+
+		// The names of the collection's indexes.
+		// Fails as listIndexes does.
+		def listIndexNames(session ?Session = none) !string[] {
+			let out string[] = []
+			for let index in try listIndexes(session) {
+				out.push(stringOf(index, "name"))
+			}
+			return out
+		}
+	}
+
+	partial type Client {
+		// The databases of the deployment, with their sizes.
+		// Fails when the server refuses the command.
+		def listDatabases(filter any = none, session ?Session = none) !DatabaseInfo[] {
+			let reply = try listDatabasesReply(self, filter, false, session)
+			let out DatabaseInfo[] = []
+			if reply.has("databases") {
+				for let db in reply.get("databases").elements() {
+					out.push(DatabaseInfo{name: stringOf(db, "name"), sizeOnDisk: int64(intOf(db, "sizeOnDisk", 0)), isEmpty: boolOf(db, "empty")})
+				}
+			}
+			return out
+		}
+
+		// The names of the deployment's databases.
+		// Fails as listDatabases does.
+		def listDatabaseNames(filter any = none, session ?Session = none) !string[] {
+			let reply = try listDatabasesReply(self, filter, true, session)
+			let out string[] = []
+			if reply.has("databases") {
+				for let db in reply.get("databases").elements() {
+					out.push(stringOf(db, "name"))
+				}
+			}
+			return out
+		}
+	}
+
+	internal def listDatabasesReply(client Client, filter any, nameOnly bool, session ?Session) !BSONValue {
+		let command = new BSONValue(BSONKind.Document)
+		command.set("listDatabases", new BSONValue(int32(1)))
+		command.set("nameOnly", new BSONValue(true)) when nameOnly
+		command.set("filter", try toDocument(filter)) unless (filter is none)
+		let spec = OpSpec{name: "listDatabases", database: "admin", readPreference: ReadPreference{}, retryRead: true, session: session}
+		let result = try execute(client, spec, def (c Conn) !(BSONValue, Sequence[]) {
+			return (try copyDocument(command), [])
+		})
+		return result.reply
+	}
+}

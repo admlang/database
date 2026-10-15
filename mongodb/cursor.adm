@@ -1,0 +1,256 @@
+partial module adm.database.mongodb {
+	use (
+		std.data.encoding::(BSONValue, BSONKind)
+	)
+
+	// What kind of cursor a find opens (CRUD spec, "CursorType").
+	enum CursorType {
+		// Closes when the results run out.
+		NonTailable,
+		// Stays open on a capped collection, returning documents as they are
+		// added; each `next` asks once.
+		Tailable,
+		// Tailable, and the server waits up to `maxAwaitTime` for new
+		// documents before answering.
+		TailableAwait,
+		// Closes when the results run out; after the first batch the server
+		// streams the rest without a getMore per batch, over a connection
+		// the cursor holds until it ends (closing it early closes the
+		// connection).
+		Exhaust,
+	}
+
+	// Cursor reads the results of a find or an aggregation a batch at a
+	// time, asking the server for the next batch as it goes (getMore).
+	// Loop over it with `for`; a failure while fetching ends the loop and
+	// `close` reports it. `next` reads one result and fails at once.
+	//
+	//     let cursor = try orders.find({"status": "open"}).cursor()
+	//     for let order in cursor {
+	//         handle(order)
+	//     }
+	//     try cursor.close()
+	type Cursor<T> {
+		internal client               Client
+		internal server               Server
+		internal conn                 ?Conn      = none
+		internal session              ?Session   = none
+		// The session was made for this cursor: it ends with it.
+		internal implicit             bool       = false
+		internal namespace            string
+		internal database             string
+		internal collection           string
+		internal cursorId             int64      = 0
+		internal batch                BSONValue
+		internal position             int        = 0
+		internal batchSize            int        = 0
+		internal limit                int        = 0
+		internal returned             int        = 0
+		internal maxAwait             duration   = 0s
+		internal comment              ?BSONValue = none
+		internal tailable             bool       = false
+		internal exhaust              bool       = false
+		internal closed               bool       = false
+		// The error that ended an iteration, until `close` reports it.
+		internal failure              ?error     = none
+		// The resume token of a change stream's last batch.
+		internal postBatchResumeToken ?BSONValue = none
+		// The operationTime of the reply that opened the cursor.
+		internal operationTime        ?BSONValue = none
+
+		def new(client Client, server Server, reply BSONValue) {
+			self.client = client
+			self.server = server
+			let cursor = reply.get("cursor")
+			namespace = stringOf(cursor, "ns")
+			let dot = namespace.indexOf(".")
+			database = dot < 0 ?? (namespace, namespace.slice(0, dot))
+			collection = dot < 0 ?? ("", namespace.slice(dot + 1, namespace.len()))
+			cursorId = int64(intOf(cursor, "id", 0))
+			batch = cursor.has("firstBatch") ?? (cursor.get("firstBatch"), new BSONValue(BSONKind.Array))
+			postBatchResumeToken = cursor.get("postBatchResumeToken") when cursor.has("postBatchResumeToken")
+		}
+
+		// The cursor's id on the server; 0 once it is exhausted.
+		def id() int64 {
+			return cursorId
+		}
+
+		// Implements Iterator<T>: the next result, none at the end or on a
+		// failure (which `close` reports).
+		def iterate() ?T {
+			let item = next() onerror (err error) {
+				failure = err
+				return none
+			}
+			return item
+		}
+
+		// The next result, fetching the next batch when the current one is
+		// used up; none when the results run out (a tailable cursor: when
+		// nothing new arrived).
+		// Fails when fetching fails, or a document does not convert to T.
+		def next() !?T {
+			let doc = try nextDocument()
+			return none when doc is none
+			return try decodeAs<T>(doc)
+		}
+
+		internal def nextDocument() !?BSONValue {
+			return try cursorNext(self)
+		}
+
+		// The documents left in the current batch, without fetching more.
+		def available() int {
+			return batch.len() - position
+		}
+
+		// Reads every remaining result.
+		// Fails as `next` does.
+		def all() !T[] {
+			let out T[] = []
+			for {
+				let item = try next()
+				break when item is none
+				out.push(item)
+			}
+			return out
+		}
+
+		// Closes the cursor: kills it on the server when it is still open,
+		// and reports the error that ended an iteration, if one did.
+		// Fails with that error.
+		def close() !none {
+			cursorKill(self)
+			cursorWrapUp(self)
+			let err = failure
+			failure = none
+			fail err unless err is none
+			return none
+		}
+	}
+
+	// Kills a cursor still open on the server; errors are not reported.
+	internal def cursorKill<T>(c Cursor<T>) {
+		return when c.closed || c.cursorId == 0
+		let held = c.conn
+		if !(held is none) && held.streaming {
+			// A connection in the middle of a stream takes no other command;
+			// the server kills the cursor when it closes, which the pool
+			// does when it gets it back.
+			c.cursorId = 0
+			return
+		}
+		let command = new BSONValue(BSONKind.Document)
+		command.set("killCursors", new BSONValue(c.collection))
+		let ids = new BSONValue(BSONKind.Array)
+		ids.push(new BSONValue(c.cursorId))
+		command.set("cursors", ids)
+		let spec = OpSpec{name: "killCursors", database: c.database, session: c.session, server: c.server, conn: c.conn, keepConn: !(c.conn is none)}
+		execute(c.client, spec, def (conn Conn) !(BSONValue, Sequence[]) {
+			return (command, [])
+		}) onerror (err error) {
+			recover OpResult{reply: new BSONValue(BSONKind.Document), server: c.server, session: none, conn: none}
+		}
+		c.cursorId = 0
+	}
+
+	// The next document of a cursor, fetching the next batch when the
+	// current one is used up.
+	internal def cursorNext<T>(c Cursor<T>) !?BSONValue {
+		for {
+			if c.position < c.batch.len() {
+				let doc = c.batch.at(c.position)
+				c.position++
+				c.returned++
+				return doc
+			}
+			if c.cursorId == 0 || c.closed {
+				cursorWrapUp(c)
+				return none
+			}
+			if c.limit > 0 && c.returned >= c.limit {
+				cursorKill(c)
+				cursorWrapUp(c)
+				return none
+			}
+			try cursorGetMore(c)
+			return none when c.tailable && c.batch.len() == 0
+		}
+	}
+
+	internal def cursorGetMore<T>(c Cursor<T>) !none {
+		let command = new BSONValue(BSONKind.Document)
+		command.set("getMore", new BSONValue(c.cursorId))
+		command.set("collection", new BSONValue(c.collection))
+		let size = c.batchSize
+		if c.limit > 0 {
+			let left = c.limit - c.returned
+			size = size == 0 || left < size ?? (left, size)
+		}
+		command.set("batchSize", new BSONValue(int32(size))) when size > 0
+		command.set("maxTimeMS", new BSONValue(int64(c.maxAwait.milliseconds()))) when c.maxAwait > 0s
+		let note = c.comment
+		command.set("comment", note) unless note is none
+		let held = c.conn
+		let streamed = c.exhaust && !(held is none) && held.streaming
+		let spec = OpSpec{name: "getMore", database: c.database, session: c.session, server: c.server, conn: held, keepConn: !(held is none), exhaust: c.exhaust, streamed: streamed}
+		let result = execute(c.client, spec, def (conn Conn) !(BSONValue, Sequence[]) { return (command, []) }) onerror (err error) {
+			// The cursor is gone or unusable: it is not killed again.
+			c.cursorId = 0
+			cursorWrapUp(c)
+			fail err
+		}
+		let cursor = result.reply.get("cursor")
+		c.cursorId = int64(intOf(cursor, "id", 0))
+		c.batch = cursor.has("nextBatch") ?? (cursor.get("nextBatch"), new BSONValue(BSONKind.Array))
+		c.position = 0
+		c.postBatchResumeToken = cursor.get("postBatchResumeToken") when cursor.has("postBatchResumeToken")
+		cursorWrapUp(c) when c.cursorId == 0
+		return none
+	}
+
+	// Ends a finished cursor's implicit session and gives back the
+	// connection it held.
+	internal def cursorWrapUp<T>(c Cursor<T>) {
+		return when c.closed
+		c.closed = true
+		let held = c.conn
+		if !(held is none) {
+			c.conn = none
+			c.server.pool.checkIn(held)
+		}
+		let s = c.session
+		if c.implicit && !(s is none) {
+			s.end()
+			c.session = none
+		}
+	}
+
+	// A document as T: the BSON tree itself for Document, else decoded into
+	// a new T.
+	internal def decodeAs<T>(doc BSONValue) !T {
+		let value = new T()
+		bsonCodec.bind(doc, value) onerror (err error) {
+			fail mongoErrorCaused(ErrorKind.Decode, "a document does not convert", err)
+		}
+		return value
+	}
+
+	// A cursor of an operation's reply.
+	internal def cursorOf<T>(client Client, result OpResult, implicitSession bool, batchSize int, limit int) Cursor<T> {
+		let cursor = new Cursor<T>(client, result.server, result.reply)
+		cursor.session = result.session
+		cursor.operationTime = result.reply.get("operationTime") when result.reply.has("operationTime")
+		cursor.implicit = implicitSession
+		cursor.conn = result.conn
+		cursor.batchSize = batchSize
+		cursor.limit = limit
+		let held = cursor.conn
+		if cursor.cursorId == 0 && !(held is none) {
+			cursor.conn = none
+			result.server.pool.checkIn(held)
+		}
+		return cursor
+	}
+}

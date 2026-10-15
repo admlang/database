@@ -1,0 +1,583 @@
+partial module adm.database.mongodb {
+	use (
+		std.crypto::(randRange)
+		std.data.encoding::(BSONValue, BSONKind)
+		std.time
+	)
+
+	// The codes that make a read retryable (Retryable Reads spec), and a
+	// write on a server older than 4.4 (Retryable Writes spec).
+	internal const retryableReadCodes = [11600, 11602, 10107, 13435, 13436, 189, 91, 7, 6, 89, 9001, 262, 134]
+	// The commands that take a read concern (and so causal consistency's
+	// afterClusterTime).
+	internal const readConcernCommands = ["find", "aggregate", "count", "distinct"]
+
+	internal const retryableWriteCodes = [11600, 11602, 10107, 13435, 13436, 189, 91, 7, 6, 89, 9001, 262]
+
+	// What an operation needs from the executor: where it goes, how it may
+	// be retried, and what it carries.
+	internal struct OpSpec {
+		// The command's name (insert, find, getMore, commitTransaction...).
+		name           string
+		database       string
+		write          bool           = false
+		readPreference ReadPreference = ReadPreference{}
+		retryRead      bool           = false
+		retryWrite     bool           = false
+		session        ?Session       = none
+		readConcern    ?ReadConcern   = none
+		writeConcern   ?WriteConcern  = none
+		// A generic command: retried only on overload, and both
+		// retryReads and retryWrites must allow it.
+		runCommand     bool           = false
+		// The server (and connection, behind a load balancer) the operation
+		// must go to: a cursor's getMore and killCursors.
+		server         ?Server        = none
+		conn           ?Conn          = none
+		// Keep the connection out of the pool after the reply (a cursor
+		// behind a load balancer).
+		keepConn       bool           = false
+		// Deadline of the whole operation (monotonic ns); 0 computes one
+		// from the client's timeout.
+		deadline       int64          = 0
+		// Leave out the session (killCursors of an implicit one is still
+		// sent with it).
+		noSession      bool           = false
+		// An aggregate ending in $out or $merge: a write that may still run
+		// on a secondary when every server is 5.0 or later (CRUD spec,
+		// "Read preferences and server selection").
+		writeStage     bool           = false
+		// A getMore that lets the server stream the following batches
+		// (OP_MSG exhaustAllowed), and one that sends nothing but reads the
+		// next streamed reply on `conn`.
+		exhaust        bool           = false
+		streamed       bool           = false
+	}
+
+	// What the executor gives back: the reply, where it ran, the session
+	// used (implicit sessions of cursors must live on) and the connection
+	// kept for the cursor.
+	internal struct OpResult {
+		reply   BSONValue
+		server  Server
+		session ?Session
+		conn    ?Conn
+	}
+
+	// Builds the command for an attempt on a connection: the document and
+	// its sequences. Called again for each retry.
+	internal type Builder = def (Conn) !(BSONValue, Sequence[])
+
+	// The deadline an operation runs to: the client's `timeout` from now,
+	// or none (0).
+	internal def operationDeadline(s Settings) int64 {
+		let t = s.timeout
+		return 0 when t is none || t == 0s
+		return time.monoNs() + t.nanoseconds()
+	}
+
+	internal def selectionDeadline(s Settings, deadline int64) int64 {
+		let selection = time.monoNs() + s.serverSelectionTimeout.nanoseconds()
+		return deadline > 0 && deadline < selection ?? (deadline, selection)
+	}
+
+	// The time a network read or write may take now; negative when it has
+	// no limit (std.net waits without end then).
+	internal def ioWait(s Settings, deadline int64) !duration {
+		if deadline > 0 {
+			let left = deadline - time.monoNs()
+			fail mongoError(ErrorKind.TimedOut, "the operation ran out of time") when left <= 0
+			let wait = duration(left)
+			return s.socketTimeout > 0s && s.socketTimeout < wait ?? (s.socketTimeout, wait)
+		}
+		return unlimited(s.socketTimeout)
+	}
+
+	// A configured duration where 0s means no limit, as std.net takes it.
+	internal def unlimited(d duration) duration {
+		return d == 0s ?? (duration(-1), d)
+	}
+
+	// Runs an operation (the server selection, connection, session,
+	// retry and error rules of the driver specifications).
+	internal def execute(client Client, spec OpSpec, build Builder) !OpResult {
+		let s = client.settings
+		let deadline = spec.deadline > 0 ?? (spec.deadline, operationDeadline(s))
+		let endingTransaction = spec.name := "commitTransaction" || "abortTransaction"
+		let inTransaction = false
+		let rp = spec.readPreference
+		let explicit = spec.session
+		if !(explicit is none) {
+			fail mongoError(ErrorKind.Closed, "the session is ended") when explicit.ended
+			fail mongoError(ErrorKind.Argument, "the session belongs to another client") unless explicit.client == client
+			inTransaction = explicit.inTransaction() && !endingTransaction
+			unpinSession(explicit) when !explicit.inTransaction() && !endingTransaction
+			if inTransaction {
+				let txnRP = explicit.txnOptions.readPreference
+				rp = txnRP is none ?? (ReadPreference{}, txnRP)
+			}
+		}
+		let state = new Attempts(spec, s, deadline)
+		for {
+			let outcome = attemptOnce(client, spec, build, state, rp, inTransaction, endingTransaction)
+			let err = outcome.failure
+			if err is none {
+				let result = outcome.result
+				return result unless result is none
+				fail mongoError(ErrorKind.ServerSelection, "no server was selected")
+			}
+			try retryOrFail(client, spec, state, err, outcome, inTransaction, endingTransaction)
+		}
+	}
+
+	// What the attempts of one operation share: the session, the retry
+	// counts and the errors seen so far.
+	internal type Attempts {
+		settings         Settings
+		deadline         int64
+		session          ?Session = none
+		attempt          int      = 0
+		allowedRetries   int      = 1
+		deprioritized    string[] = []
+		retryWriteActive bool     = false
+		txnNumber        int64    = -1
+		firstError       ?error   = none
+		lastAttemptError ?error   = none
+
+		def new(spec OpSpec, settings Settings, deadline int64) {
+			self.settings = settings
+			self.deadline = deadline
+			session = spec.session
+			allowedRetries = deadline > 0 ?? (1000000, 1)
+		}
+	}
+
+	// One attempt's outcome.
+	internal struct AttemptOutcome {
+		result    ?OpResult = none
+		failure   ?error    = none
+		server    ?Server   = none
+		attempted bool      = false
+		wire      int       = 0
+	}
+
+	internal def trySelect(client Client, rp ReadPreference, write bool, writeStage bool, deadline int64, deprioritized string[]) (?Server, ReadPreference, ?error) {
+		let (server, used) = client.cluster.selectServer(rp, write, deadline, deprioritized, writeStage) onerror (err error) {
+			return (none, rp, err)
+		}
+		return (server, used, none)
+	}
+
+	internal def tryCheckOut(pool Pool, deadline int64) (?Conn, ?error) {
+		let conn = pool.checkOut(deadline) onerror (err error) {
+			return (none, err)
+		}
+		return (conn, none)
+	}
+
+	internal def tryRoundTrip(conn Conn, command BSONValue, sequences Sequence[], wait duration, moreToCome bool, exhaust bool, streamed bool) (BSONValue, ?error) {
+		if streamed {
+			let next = conn.next(wait) onerror (err error) {
+				return (new BSONValue(BSONKind.Document), err)
+			}
+			return (next, none)
+		}
+		let reply = conn.roundTrip(command, sequences, wait, moreToCome = moreToCome, exhaust = exhaust) onerror (err error) {
+			return (new BSONValue(BSONKind.Document), err)
+		}
+		return (reply, none)
+	}
+
+	internal def tryBuild(build Builder, conn Conn) (BSONValue, Sequence[], ?error) {
+		let (command, sequences) = build(conn) onerror (err error) {
+			return (new BSONValue(BSONKind.Document), [], err)
+		}
+		return (command, sequences, none)
+	}
+
+	// One attempt: select, check out, build, send, read.
+	internal def attemptOnce(client Client, spec OpSpec, build Builder, state Attempts, rp ReadPreference, inTransaction bool, endingTransaction bool) AttemptOutcome {
+		let s = state.settings
+		let out = AttemptOutcome{}
+		let explicit = spec.session
+		// 1. The server.
+		let server ?Server = spec.server
+		server = explicit.pinned when server is none && inTransaction && !(explicit is none)
+		// The read preference the server was selected with, which the
+		// command then carries.
+		let used = rp
+		if server is none {
+			let (chosen, selectedWith, err) = trySelect(client, rp, spec.write, spec.writeStage, selectionDeadline(s, state.deadline), state.deprioritized)
+			if !(err is none) {
+				out.failure = err
+				return out
+			}
+			server = chosen
+			used = selectedWith
+		} else {
+			server.operationStarted()
+		}
+		let srv = server
+		if srv is none {
+			out.failure = mongoError(ErrorKind.ServerSelection, "no server was selected")
+			return out
+		}
+		out.server = srv
+		// 2. The connection.
+		let conn ?Conn = spec.conn
+		conn = explicit.pinnedConn when conn is none && inTransaction && !(explicit is none)
+		let fromPool = conn is none
+		if conn is none {
+			let (made, err) = tryCheckOut(srv.pool, state.deadline)
+			if !(err is none) {
+				srv.operationEnded()
+				let pooled = err is MongoError && err.labels.includes("PoolClearedError")
+				client.cluster.onError(srv, srv.pool.generationNow(), err, false) unless pooled
+				out.failure = err
+				return out
+			}
+			conn = made
+			explicit.pinnedConn = made when s.loadBalanced && inTransaction && !(explicit is none)
+		}
+		let c = conn
+		if c is none {
+			srv.operationEnded()
+			out.failure = mongoError(ErrorKind.Connection, "no connection")
+			return out
+		}
+		out.wire = c.maxWireVersion
+		// 3. The command.
+		let td = client.cluster.description()
+		let sessionsSupported = !(td.logicalSessionTimeoutMinutes is none) || td.kind == TopologyType.LoadBalanced
+		let wc = spec.writeConcern
+		let unacknowledged = !(wc is none) && !acknowledged(wc) && !inTransaction
+		state.session = new Session(client, SessionOptions{}, false) when state.session is none && sessionsSupported && !unacknowledged && !spec.noSession
+		let serverDesc = td.servers.get(c.address)
+		let standalone = !(serverDesc is none) && serverDesc.kind == ServerType.Standalone
+		let (command, sequences, buildError) = tryBuild(build, c)
+		if !(buildError is none) {
+			finishConn(spec, srv, c, fromPool, false, s, inTransaction)
+			out.failure = buildError
+			return out
+		}
+		state.retryWriteActive = spec.retryWrite && s.retryWrites && sessionsSupported && !standalone && !unacknowledged && !inTransaction && !(state.session is none) when state.attempt == 0
+		let failure ?error = none
+		let sess = state.session
+		command.set("$db", new BSONValue(spec.database))
+		if !(sess is none) && sessionsSupported && !spec.noSession {
+			let ss = serverSessionOf(sess)
+			command.set("lsid", ss.id)
+			ss.lastUse = time.monoNs()
+			if inTransaction || endingTransaction {
+				command.set("txnNumber", new BSONValue(ss.txnNumber))
+				if inTransaction && sess.state == TransactionState.Starting {
+					command.set("startTransaction", new BSONValue(true))
+					let txnRC = sess.txnOptions.readConcern
+					let rcDoc = txnRC is none ?? (new BSONValue(BSONKind.Document), readConcernDocument(txnRC))
+					addAfterClusterTime(rcDoc, sess)
+					command.set("readConcern", rcDoc) when rcDoc.len() > 0
+				}
+				command.set("autocommit", new BSONValue(false))
+			} else if state.retryWriteActive {
+				if state.txnNumber < 0 {
+					ss.txnNumber++
+					state.txnNumber = ss.txnNumber
+				}
+				command.set("txnNumber", new BSONValue(state.txnNumber))
+			}
+		}
+		if !inTransaction && !endingTransaction && readConcernCommands.includes(spec.name) {
+			let rc = spec.readConcern
+			let rcDoc = rc is none ?? (new BSONValue(BSONKind.Document), readConcernDocument(rc))
+			if !(sess is none) && !spec.write && !spec.noSession {
+				if sess.options.snapshot {
+					rcDoc.set("level", new BSONValue("snapshot"))
+					let at = sess.snapshotTime
+					rcDoc.set("atClusterTime", at) unless at is none
+				} else {
+					addAfterClusterTime(rcDoc, sess)
+				}
+			}
+			command.set("readConcern", rcDoc) when rcDoc.len() > 0 && !command.has("readConcern")
+		}
+		command.set("writeConcern", writeConcernDocument(wc)) when !inTransaction && !endingTransaction && !(wc is none) && !isDefaultConcern(wc) && !command.has("writeConcern")
+		if !spec.write || spec.runCommand || spec.writeStage {
+			let rpDoc = readPreferenceFor(td, serverDesc, used)
+			command.set("$readPreference", rpDoc) unless rpDoc is none
+		}
+		let gossip = clusterTimeFor(client, sess)
+		command.set("$clusterTime", gossip) unless gossip is none
+		addServerApi(command, s.serverApi)
+		if state.deadline > 0 && !command.has("maxTimeMS") && spec.name != "getMore" {
+			let left = (state.deadline - time.monoNs()) / 1000000
+			let rtt = serverDesc is none ?? (int64(0), serverDesc.rtt / 1000000)
+			if left - rtt <= 0 {
+				failure = mongoError(ErrorKind.TimedOut, "the operation ran out of time")
+			} else {
+				command.set("maxTimeMS", new BSONValue(int64(left - rtt)))
+			}
+		}
+		// 4. The round trip.
+		let reply = new BSONValue(BSONKind.Document)
+		if failure is none {
+			let wait = ioWait(s, state.deadline) onerror (err error) {
+				failure = err
+				recover 0s
+			}
+			if failure is none {
+				out.attempted = true
+				let (got, sendError) = tryRoundTrip(c, command, sequences, wait, unacknowledged, spec.exhaust, spec.streamed)
+				reply = got
+				failure = sendError
+			}
+		}
+		// 5. The reply.
+		if failure is none {
+			client.cluster.advanceClusterTime(reply)
+			if !(sess is none) {
+				sess.advanceClusterTime(reply.get("$clusterTime")) when reply.has("$clusterTime")
+				sess.advanceOperationTime(reply.get("operationTime")) when reply.has("operationTime") && sess.isCausallyConsistent()
+				sess.snapshotTime = snapshotTimeOf(reply) when sess.options.snapshot && sess.snapshotTime is none
+				sess.recoveryToken = reply.get("recoveryToken") when inTransaction && reply.has("recoveryToken")
+			}
+			if !okOf(reply) {
+				failure = commandError(reply)
+			} else if reply.has("writeConcernError") && (state.retryWriteActive || endingTransaction) && wceRetryable(reply, c) {
+				failure = writeConcernFailure(reply)
+			}
+		}
+		if !(sess is none) && inTransaction && sess.state == TransactionState.Starting && out.attempted {
+			sess.state = TransactionState.InProgress
+			sess.pinned = srv when td.kind == TopologyType.Sharded
+		}
+		let keep = spec.keepConn && failure is none
+		finishConn(spec, srv, c, fromPool, keep, s, inTransaction)
+		if failure is none {
+			let resultSession = state.session
+			if !(resultSession is none) && explicit is none && !spec.keepConn && !needsSessionAfter(reply) {
+				resultSession.end()
+				state.session = none
+			}
+			out.result = OpResult{reply: reply, server: srv, session: state.session, conn: keep ?? (c, none)}
+			return out
+		}
+		out.failure = failure
+		let err = failure
+		if !(err is none) && out.attempted {
+			client.cluster.onError(srv, c.generation, err, true)
+			serverSessionOf(sess).dirty = true when !(sess is none) && hasLabel(err, "NetworkError")
+		}
+		return out
+	}
+
+	// Gives the connection back after an attempt, unless the cursor keeps
+	// it or a load-balanced transaction holds it.
+	internal def finishConn(spec OpSpec, server Server, conn Conn, fromPool bool, keep bool, s Settings, inTransaction bool) {
+		server.operationEnded()
+		return unless fromPool && spec.conn is none
+		return when keep
+		return when s.loadBalanced && inTransaction
+		server.pool.checkIn(conn)
+	}
+
+	// After a failed attempt: labels the error, and either returns to try
+	// again (after an overload backoff) or fails with the error the
+	// specifications say to report.
+	internal def retryOrFail(client Client, spec OpSpec, state Attempts, err error, outcome AttemptOutcome, inTransaction bool, endingTransaction bool) !none {
+		let s = state.settings
+		labelFailure(err, spec, s, inTransaction, endingTransaction, state.retryWriteActive, outcome.attempted, outcome.wire)
+		let sess = state.session
+		if !(sess is none) {
+			sess.pinned = none when inTransaction && hasLabel(err, "TransientTransactionError")
+			sess.pinned = none when endingTransaction && hasLabel(err, "UnknownTransactionCommitResult") && hasLabel(err, "RetryableWriteError")
+		}
+		state.firstError = err when state.firstError is none
+		state.lastAttemptError = err when outcome.attempted && !hasLabel(err, "NoWritesPerformed")
+		let isOverload = hasLabel(err, "SystemOverloadedError")
+		let overloadRetryable = isOverload && hasLabel(err, "RetryableError")
+		let writeRetry = (state.retryWriteActive || endingTransaction) && hasLabel(err, "RetryableWriteError")
+		let readRetry = spec.retryRead && s.retryReads && !inTransaction && !spec.write && retryableRead(err)
+		let enabled = spec.runCommand ?? (s.retryReads && s.retryWrites, spec.write ?? (s.retryWrites || endingTransaction, s.retryReads))
+		let allowed = overloadRetryable ?? (enabled, writeRetry || readRetry)
+		state.attempt++
+		state.allowedRetries = s.maxAdaptiveRetries when isOverload
+		let reportedLast = state.lastAttemptError
+		let reportedFirst = state.firstError
+		let reported = reportedLast is none ?? (reportedFirst is none ?? (err, reportedFirst), reportedLast)
+		fail reported when !allowed || state.attempt > state.allowedRetries || !(spec.server is none)
+		let srv = outcome.server
+		if !(srv is none) {
+			let sharded = client.cluster.description().kind == TopologyType.Sharded
+			let retarget = isOverload ?? (s.enableOverloadRetargeting, sharded)
+			state.deprioritized.push(srv.address) when retarget
+		}
+		if !(sess is none) && endingTransaction {
+			sess.pinned = none
+			sess.commitTried = true when spec.name == "commitTransaction" && !isOverload
+		}
+		if isOverload {
+			let base = baseBackoffOf(err)
+			let growth = 1.0
+			for let i = 0; i < state.attempt; i++ {
+				growth *= 2.0
+			}
+			let cap = base * growth < 10000.0 ?? (base * growth, 10000.0)
+			let backoff = duration(int64(randRange(0.0, 1.0) * cap * 1000000.0))
+			fail reported when state.deadline > 0 && time.monoNs() + backoff.nanoseconds() > state.deadline
+			time.sleep(backoff)
+		}
+		return none
+	}
+
+	// Labels a failure as the specifications say: RetryableWriteError on
+	// network errors (and listed codes from servers older than 4.4),
+	// TransientTransactionError on network and selection errors inside a
+	// transaction, UnknownTransactionCommitResult on unclear commits.
+	internal def labelFailure(err error, spec OpSpec, s Settings, inTransaction bool, ending bool, retryWriteActive bool, attempted bool, wire int) {
+		return unless err is MongoError
+		let network = err.labels.includes("NetworkError")
+		let pool = err.labels.includes("PoolClearedError")
+		let selection = err.kind == ErrorKind.ServerSelection
+		let writeContext = (retryWriteActive || ending) && (s.retryWrites || ending)
+		if writeContext && !inTransaction {
+			withLabel(err, "RetryableWriteError") when network || pool || (attempted && wire < 9 && retryableWriteCodes.includes(err.serverCode))
+			let wce = err.writeConcernError
+			withLabel(err, "RetryableWriteError") when !(wce is none) && wire < 9 && retryableWriteCodes.includes(wce.code)
+		}
+		withLabel(err, "TransientTransactionError") when inTransaction && (network || selection || pool)
+		if ending && spec.name == "commitTransaction" {
+			let wce = err.writeConcernError
+			let unsatisfiable = !(wce is none) && (wce.code := 100 || 79)
+			let timeLimit = err.serverCode == 50
+			withLabel(err, "UnknownTransactionCommitResult") when network || selection || pool || err.labels.includes("RetryableWriteError") || timeLimit || (!(wce is none) && !unsatisfiable)
+			// A commit failure is never transient once sent.
+			err.labels = err.labels.filter(l => l != "TransientTransactionError") when network
+		}
+	}
+
+	internal def retryableRead(err error) bool {
+		return false unless err is MongoError
+		return true when err.labels.includes("NetworkError") || err.labels.includes("PoolClearedError")
+		return retryableReadCodes.includes(err.serverCode)
+	}
+
+	// The base backoff of an overload retry in milliseconds: the server's
+	// `baseBackoffMS` when it gives a positive one, else 100.
+	internal def baseBackoffOf(err error) float {
+		if err is MongoError {
+			let reply = err.response
+			if !(reply is none) && reply.has("baseBackoffMS") {
+				let given = reply.get("baseBackoffMS").asFloat() onerror recover 0.0
+				return given when given > 0.0
+			}
+		}
+		return 100.0
+	}
+
+	// Whether a write concern error in a successful reply may be retried.
+	internal def wceRetryable(reply BSONValue, conn Conn) bool {
+		return true when labelsOf(reply).includes("RetryableWriteError")
+		return false unless conn.maxWireVersion < 9
+		let wce = reply.get("writeConcernError")
+		return retryableWriteCodes.includes(intOf(wce, "code", 0))
+	}
+
+	// The error of a reply whose writes were applied but whose write
+	// concern failed.
+	internal def writeConcernFailure(reply BSONValue) MongoError {
+		let wce = reply.get("writeConcernError")
+		let info = WriteConcernError{code: intOf(wce, "code", 0), codeName: stringOf(wce, "codeName"), message: stringOf(wce, "errmsg"), details: wce.has("errInfo") ?? (wce.get("errInfo"), none)}
+		let err = mongoError(ErrorKind.WriteConcern, "write concern error: {info.message}")
+		err.writeConcernError = info
+		err.serverCode = info.code
+		err.codeName = info.codeName
+		err.labels = labelsOf(reply)
+		return err
+	}
+
+	// The read concern's afterClusterTime of a causally consistent session.
+	internal def addAfterClusterTime(rcDoc BSONValue, session Session) {
+		return unless session.isCausallyConsistent()
+		let at = session.operationTime
+		rcDoc.set("afterClusterTime", at) unless at is none
+	}
+
+	// The $clusterTime to send: the greater of the client's and the
+	// session's.
+	internal def clusterTimeFor(client Client, session ?Session) ?BSONValue {
+		let mine = client.cluster.clusterTimeNow()
+		return mine when session is none
+		let theirs = session.clusterTime
+		return mine when theirs is none
+		return theirs when mine is none
+		return timestampOf(theirs.get("clusterTime")) > timestampOf(mine.get("clusterTime")) ?? (theirs, mine)
+	}
+
+	// The $readPreference a read carries (Server Selection, "Passing read
+	// preference"): none for the primary of a replica set or a standalone.
+	internal def readPreferenceFor(td TopologyDescription, server ?ServerDescription, rp ReadPreference) ?BSONValue {
+		let kind = server is none ?? (ServerType.Unknown, server.kind)
+		switch td.kind {
+			case TopologyType.Single:
+				return none when kind == ServerType.Standalone
+				return rp.mode == ReadMode.Primary ?? (none, readPreferenceDocument(rp)) when kind == ServerType.Mongos
+				return rp.mode == ReadMode.Primary ?? (readPreferenceDocument(ReadPreference{mode: ReadMode.PrimaryPreferred}), readPreferenceDocument(rp))
+			default:
+				return rp.mode == ReadMode.Primary ?? (none, readPreferenceDocument(rp))
+		}
+	}
+
+	// The atClusterTime a snapshot session's first read fixes: from the
+	// cursor of a find or aggregate, else the reply.
+	internal def snapshotTimeOf(reply BSONValue) ?BSONValue {
+		return reply.get("cursor").get("atClusterTime") when reply.has("cursor") && reply.get("cursor").has("atClusterTime")
+		return reply.has("atClusterTime") ?? (reply.get("atClusterTime"), none)
+	}
+
+	// Whether the reply opens a cursor that still needs its implicit
+	// session.
+	internal def needsSessionAfter(reply BSONValue) bool {
+		return false unless reply.has("cursor")
+		let id = reply.get("cursor").get("id").asInt() onerror recover 0
+		return id != 0
+	}
+
+	// Runs commitTransaction or abortTransaction for a session (Transactions
+	// spec): retried once like a retryable write, with w: majority (and a
+	// 10 s wtimeout) when the commit runs again.
+	internal def endTransaction(client Client, session Session, commit bool, retry bool) !none {
+		let name = commit ?? ("commitTransaction", "abortTransaction")
+		let wc = session.txnOptions.writeConcern
+		let concern = wc is none ?? (WriteConcern{}, wc)
+		concern = WriteConcern{w: "majority", journal: concern.journal, wtimeout: concern.wtimeout == 0s ?? (10s, concern.wtimeout)} when commit && retry
+		let spec = OpSpec{name: name, database: "admin", write: true, session: session, writeConcern: concern}
+		let maxCommit = session.txnOptions.maxCommitTime
+		let result = try execute(client, spec, def (_ Conn) !(BSONValue, Sequence[]) {
+			let command = new BSONValue(BSONKind.Document)
+			command.set(name, new BSONValue(int32(1)))
+			command.set("maxTimeMS", new BSONValue(int64(maxCommit.milliseconds()))) when commit && maxCommit > 0s
+			let token = session.recoveryToken
+			command.set("recoveryToken", token) unless token is none
+			command.set("writeConcern", writeConcernDocument(concern)) unless isDefaultConcern(concern)
+			return (command, [])
+		})
+		let reply = result.reply
+		if reply.has("writeConcernError") {
+			let err = writeConcernFailure(reply)
+			let code = err.serverCode
+			withLabel(err, "UnknownTransactionCommitResult") when commit && !(code := 100 || 79)
+			fail err
+		}
+		return none
+	}
+
+	// Runs a command document the client builds itself (endSessions,
+	// killCursors): no retries, no session.
+	internal def runInternal(client Client, database string, command BSONValue, rp ReadPreference, deadline int64) !BSONValue {
+		let spec = OpSpec{name: command.names()[0], database: database, readPreference: rp, noSession: true, deadline: deadline}
+		let result = try execute(client, spec, def (conn Conn) !(BSONValue, Sequence[]) {
+			return (command, [])
+		})
+		return result.reply
+	}
+}

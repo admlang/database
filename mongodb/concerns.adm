@@ -1,0 +1,103 @@
+partial module adm.database.mongodb {
+	use std.data.encoding::(BSONValue, BSONKind)
+
+	// Which members of a replica set may serve a read.
+	enum ReadMode {
+		Primary            = "primary",
+		PrimaryPreferred   = "primaryPreferred",
+		Secondary          = "secondary",
+		SecondaryPreferred = "secondaryPreferred",
+		Nearest            = "nearest",
+	}
+
+	// ReadPreference says which servers may answer a read: the mode, tag
+	// sets tried in order (an empty set matches any member), and how far
+	// behind the primary a secondary may be (0s: no limit; else at least
+	// 90 seconds).
+	struct ReadPreference {
+		mode         ReadMode              = ReadMode.Primary
+		tags         map<string, string>[] = []
+		maxStaleness duration              = 0s
+	}
+
+	// ReadConcern is the consistency a read asks for: "local", "majority",
+	// "linearizable", "available" or "snapshot"; "" leaves it to the server.
+	struct ReadConcern {
+		level string = ""
+	}
+
+	// WriteConcern is the acknowledgement a write waits for: `w` a number
+	// of members ("0" asks for none, "1" the primary), "majority" or a tag
+	// set's name, "" the server's default; `journal` to wait for the
+	// journal; `wtimeout` how long the server waits for it (0s without
+	// end).
+	struct WriteConcern {
+		w        string   = ""
+		journal  ?bool    = none
+		wtimeout duration = 0s
+	}
+
+	// ServerApi declares the Stable API version the application is written
+	// for (`version` "1"); `strict` refuses commands outside it and
+	// `deprecationErrors` fails deprecated ones.
+	struct ServerApi {
+		version           string = "1"
+		strict            ?bool  = none
+		deprecationErrors ?bool  = none
+	}
+
+	// Whether a write concern asks for an acknowledgement.
+	internal def acknowledged(wc WriteConcern) bool {
+		let journal = wc.journal
+		return wc.w != "0" || (!(journal is none) && journal)
+	}
+
+	internal def isDefaultConcern(wc WriteConcern) bool {
+		return wc.w == "" && wc.journal is none && wc.wtimeout == 0s
+	}
+
+	// The `writeConcern` document of a write concern.
+	internal def writeConcernDocument(wc WriteConcern) BSONValue {
+		let doc = new BSONValue(BSONKind.Document)
+		if wc.w != "" {
+			let n = /^[0-9]+$/.test(wc.w) ?? (wc.w.toInt<int>(), -1)
+			doc.set("w", n >= 0 ?? (new BSONValue(int32(n)), new BSONValue(wc.w)))
+		}
+		let journal = wc.journal
+		doc.set("j", new BSONValue(journal)) unless journal is none
+		doc.set("wtimeout", new BSONValue(int64(wc.wtimeout.milliseconds()))) when wc.wtimeout > 0s
+		return doc
+	}
+
+	internal def readConcernDocument(rc ReadConcern) BSONValue {
+		let doc = new BSONValue(BSONKind.Document)
+		doc.set("level", new BSONValue(rc.level)) unless rc.level == ""
+		return doc
+	}
+
+	// The `$readPreference` document of a preference.
+	internal def readPreferenceDocument(rp ReadPreference) BSONValue {
+		let doc = new BSONValue(BSONKind.Document)
+		doc.set("mode", new BSONValue(rp.mode.value))
+		if rp.tags.len() > 0 {
+			let sets = new BSONValue(BSONKind.Array)
+			for let set in rp.tags {
+				let tagDoc = new BSONValue(BSONKind.Document)
+				for let (name, value) in set {
+					tagDoc.set(name, new BSONValue(value))
+				}
+				sets.push(tagDoc)
+			}
+			doc.set("tags", sets)
+		}
+		doc.set("maxStalenessSeconds", new BSONValue(int32(int(rp.maxStaleness.seconds())))) when rp.maxStaleness > 0s
+		return doc
+	}
+
+	internal def readModeOf(text string) ?ReadMode {
+		for let mode in [ReadMode.Primary, ReadMode.PrimaryPreferred, ReadMode.Secondary, ReadMode.SecondaryPreferred, ReadMode.Nearest] {
+			return mode when mode.value.lower() == text.lower()
+		}
+		return none
+	}
+}

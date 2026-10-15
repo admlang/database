@@ -1,0 +1,18 @@
+partial module adm.database.mongodb {
+	use std.data.encoding::(BSONValue)
+
+	// What a write did: documents inserted, matched, modified, deleted and
+	// upserted, with the ids the server or the driver gave the inserted and
+	// upserted ones (keyed by their position in the request).
+	struct BulkWriteResult {
+		inserted     int                 = 0
+		matched      int                 = 0
+		modified     int                 = 0
+		deleted      int                 = 0
+		upserted     int                 = 0
+		insertedIds  map<int, BSONValue> = map<int, BSONValue>{}
+		upsertedIds  map<int, BSONValue> = map<int, BSONValue>{}
+		// False for a write concern of w: 0: the counts are then unknown.
+		acknowledged bool                = true
+	}
+}

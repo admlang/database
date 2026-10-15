@@ -1,0 +1,214 @@
+partial module adm.database.mongodb {
+	use (
+		std.data.encoding::(BSONValue, BSONKind)
+	)
+
+	// What a database lists about one of its collections.
+	struct CollectionInfo {
+		name    string
+		// "collection", "view" or "timeseries".
+		kind    string
+		options BSONValue
+		info    BSONValue
+	}
+
+	// How createCollection makes a collection: capped, with a validator,
+	// as a time series, clustered; anything else the server takes goes in
+	// `extra`.
+	struct CreateCollectionOptions {
+		capped                       bool          = false
+		size                         int64         = 0
+		max                          int64         = 0
+		validator                    any           = none
+		validationLevel              string        = ""
+		validationAction             string        = ""
+		timeseries                   any           = none
+		expireAfter                  duration      = 0s
+		clusteredIndex               any           = none
+		collation                    any           = none
+		changeStreamPreAndPostImages any           = none
+		extra                        any           = none
+		writeConcern                 ?WriteConcern = none
+		session                      ?Session      = none
+	}
+
+	// Database is one database of a deployment. Read and write concerns
+	// and the read preference are the client's unless set here.
+	partial type Database {
+		internal client Client
+		name            string
+		readPreference  ?ReadPreference = none
+		readConcern     ?ReadConcern    = none
+		writeConcern    ?WriteConcern   = none
+
+		def new(client Client, name string) {
+			self.client = client
+			self.name = name
+		}
+
+		// The collection of a name, whose documents read and write as T:
+		// a struct (fields by `@bson` name) or Document for untyped ones.
+		def collection<T>(name string) Collection<T> {
+			return new Collection<T>(self, name)
+		}
+
+		// Runs a command as given and returns the server's reply. The
+		// command is a document (a struct, a map or a Document) whose first
+		// field names it; it goes to the primary unless a read preference
+		// says otherwise. It is not retried, except when the server says it
+		// is overloaded.
+		// Fails with ErrorKind.Server when the server refuses it.
+		def runCommand(command any, readPreference ReadPreference = ReadPreference{}, session ?Session = none) !Document {
+			let doc = try toDocument(command)
+			fail mongoError(ErrorKind.Argument, "a command needs a name") when doc.len() == 0
+			fail mongoError(ErrorKind.Argument, "Cannot set read concern after starting a transaction.") when !(session is none) && session.inTransaction() && doc.has("readConcern")
+			let spec = OpSpec{name: doc.names()[0], database: name, readPreference: readPreference, runCommand: true, session: session, write: readPreference.mode == ReadMode.Primary}
+			let result = try execute(client, spec, def (c Conn) !(BSONValue, Sequence[]) {
+				return (try copyDocument(doc), [])
+			})
+			return result.reply
+		}
+
+		// The collections and views of the database.
+		// Fails when the server refuses the command.
+		def listCollections(filter any = none, session ?Session = none) !CollectionInfo[] {
+			let out CollectionInfo[] = []
+			let command = new BSONValue(BSONKind.Document)
+			command.set("listCollections", new BSONValue(int32(1)))
+			command.set("filter", try toDocument(filter)) unless (filter is none)
+			let cursor = try openCursor<Document>(client, OpSpec{name: "listCollections", database: name, readPreference: ReadPreference{}, retryRead: true, session: session}, command, 0, 0)
+			for let doc in try cursor.all() {
+				out.push(CollectionInfo{name: stringOf(doc, "name"), kind: stringOf(doc, "type"), options: doc.has("options") ?? (doc.get("options"), new BSONValue(BSONKind.Document)), info: doc.has("info") ?? (doc.get("info"), new BSONValue(BSONKind.Document))})
+			}
+			return out
+		}
+
+		// The names of the collections and views.
+		// Fails when the server refuses the command.
+		def listCollectionNames(filter any = none, session ?Session = none) !string[] {
+			let command = new BSONValue(BSONKind.Document)
+			command.set("listCollections", new BSONValue(int32(1)))
+			command.set("nameOnly", new BSONValue(true))
+			command.set("authorizedCollections", new BSONValue(true))
+			command.set("filter", try toDocument(filter)) unless (filter is none)
+			let cursor = try openCursor<Document>(client, OpSpec{name: "listCollections", database: name, readPreference: ReadPreference{}, retryRead: true, session: session}, command, 0, 0)
+			let out string[] = []
+			for let doc in try cursor.all() {
+				out.push(stringOf(doc, "name"))
+			}
+			return out
+		}
+
+		// Creates a collection (or a time series, capped or clustered one).
+		// Fails when it exists, or the options are refused.
+		def createCollection(collectionName string, options CreateCollectionOptions = CreateCollectionOptions{}) !none {
+			let command = new BSONValue(BSONKind.Document)
+			command.set("create", new BSONValue(collectionName))
+			command.set("capped", new BSONValue(true)) when options.capped
+			command.set("size", new BSONValue(options.size)) when options.size > 0
+			command.set("max", new BSONValue(options.max)) when options.max > 0
+			try setDocument(command, "validator", options.validator)
+			command.set("validationLevel", new BSONValue(options.validationLevel)) unless options.validationLevel == ""
+			command.set("validationAction", new BSONValue(options.validationAction)) unless options.validationAction == ""
+			try setDocument(command, "timeseries", options.timeseries)
+			command.set("expireAfterSeconds", new BSONValue(int64(options.expireAfter.milliseconds() / 1000))) when options.expireAfter > 0s
+			try setDocument(command, "clusteredIndex", options.clusteredIndex)
+			try setDocument(command, "collation", options.collation)
+			try setDocument(command, "changeStreamPreAndPostImages", options.changeStreamPreAndPostImages)
+			if !(options.extra is none) {
+				for let entry in (try toDocument(options.extra)).entries() {
+					let (key, value) = entry
+					command.set(key, value)
+				}
+			}
+			let given = options.writeConcern
+			try runWrite(client, name, command, given is none ?? (writeConcernOf(self), given), options.session)
+			return none
+		}
+
+		// Drops the database.
+		// Fails when the server refuses.
+		def drop(session ?Session = none) !none {
+			let command = new BSONValue(BSONKind.Document)
+			command.set("dropDatabase", new BSONValue(int32(1)))
+			try runWrite(client, name, command, writeConcernOf(self), session)
+			return none
+		}
+
+		// Runs a database-level aggregation (`$currentOp`, `$listLocalSessions`,
+		// `$documents`) and returns its results as R.
+		// Fails when the server refuses the pipeline.
+		def aggregate<R>(pipeline any[], options AggregateOptions = AggregateOptions{}) !Cursor<R> {
+			return try runAggregate<R>(client, name, "", pipeline, options, readPreferenceOf(self), readConcernOf(self), writeConcernOf(self))
+		}
+	}
+
+	internal def readPreferenceOf(db Database) ReadPreference {
+		let rp = db.readPreference
+		return rp is none ?? (db.client.settings.readPreference, rp)
+	}
+
+	internal def readConcernOf(db Database) ReadConcern {
+		let rc = db.readConcern
+		return rc is none ?? (db.client.settings.readConcern, rc)
+	}
+
+	internal def writeConcernOf(db Database) WriteConcern {
+		let wc = db.writeConcern
+		return wc is none ?? (db.client.settings.writeConcern, wc)
+	}
+
+	// Runs a write command (create, drop, createIndexes...): to the
+	// primary, with the write concern, retried only on overload.
+	internal def runWrite(client Client, database string, command BSONValue, wc WriteConcern, session ?Session) !BSONValue {
+		let spec = OpSpec{name: command.names()[0], database: database, write: true, writeConcern: wc, session: session}
+		let result = try execute(client, spec, def (c Conn) !(BSONValue, Sequence[]) {
+			return (try copyDocument(command), [])
+		})
+		try checkWriteConcernError(result.reply)
+		return result.reply
+	}
+
+	// Fails when a successful reply carries a write concern error.
+	internal def checkWriteConcernError(reply BSONValue) !none {
+		fail writeConcernFailure(reply) when reply.has("writeConcernError")
+		return none
+	}
+
+	// A value as a document: a Document is used as is, anything else is
+	// encoded.
+	internal def toDocument(value any) !BSONValue {
+		return value when value is BSONValue
+		let bytes = bsonCodec.encode(value) onerror (err error) {
+			fail mongoErrorCaused(ErrorKind.Argument, "the value is not a document", err)
+		}
+		return try bsonCodec.parse(bytes)
+	}
+
+	// A copy of a document, so a command's fields are added to a fresh one
+	// on each attempt and never to what the caller passed.
+	internal def copyDocument(doc BSONValue) !BSONValue {
+		let out = new BSONValue(BSONKind.Document)
+		for let entry in doc.entries() {
+			let (key, value) = entry
+			out.set(key, value)
+		}
+		return out
+	}
+
+	internal def setDocument(command BSONValue, name string, value any) !none {
+		return none when value is none
+		command.set(name, try toDocument(value))
+		return none
+	}
+
+	// Opens a cursor with a command that returns one (find, aggregate,
+	// listCollections, listIndexes).
+	internal def openCursor<T>(client Client, spec OpSpec, command BSONValue, batchSize int, limit int, holdConn bool = false) !Cursor<T> {
+		spec.keepConn = client.settings.loadBalanced || holdConn
+		let result = try execute(client, spec, def (c Conn) !(BSONValue, Sequence[]) {
+			return (try copyDocument(command), [])
+		})
+		return cursorOf<T>(client, result, spec.session is none, batchSize, limit)
+	}
+}

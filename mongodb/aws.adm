@@ -1,0 +1,255 @@
+partial module adm.database.mongodb {
+	use (
+		std.crypto
+		std.crypto.hash
+		std.crypto.hash::(Hash)
+		std.data.encoding
+		std.data.encoding::(BSONValue, BSONKind, base64encode)
+		std.net.http
+		std.net.url
+		std.os
+		std.services.runtime::(Runtime)
+		std.time
+	)
+
+	// AWS credentials: an access key, its secret, and the session token of
+	// temporary ones; `expires` when they run out (none for long-term
+	// keys).
+	struct AWSCredentials {
+		accessKeyId     string
+		secretAccessKey Secret<string>
+		sessionToken    string         = ""
+		expires         ?time.Time     = none
+	}
+
+	// The STS GetCallerIdentity body MONGODB-AWS signs.
+	internal const stsBody = "Action=GetCallerIdentity&Version=2011-06-15"
+
+	// The MONGODB-AWS conversation (auth spec): a client nonce, the
+	// server's nonce and STS host, and a SigV4-signed GetCallerIdentity
+	// request the server forwards to STS.
+	internal def runAWS(auth Authenticator, conn Conn, wait duration) !none {
+		let credentials = try awsCredentials(auth)
+		let nonce = try crypto.rand(32)
+		let first = new BSONValue(BSONKind.Document)
+		first.set("r", new BSONValue(nonce, 0))
+		first.set("p", new BSONValue(int32(110)))
+		let start = new BSONValue(BSONKind.Document)
+		start.set("saslStart", new BSONValue(int32(1)))
+		start.set("mechanism", new BSONValue("MONGODB-AWS"))
+		start.set("payload", new BSONValue(try bsonCodec.encode(first), 0))
+		start.set("$db", new BSONValue("$external"))
+		let reply = try authCommand(conn, start, wait)
+		let serverFirst = try bsonCodec.parse(try payloadOf(reply))
+		let serverNonce = serverFirst.get("s").asBytes() onerror (err error) {
+			fail mongoError(ErrorKind.Authentication, "MONGODB-AWS: the server sent no nonce")
+		}
+		fail mongoError(ErrorKind.Authentication, "MONGODB-AWS: the server nonce is not 64 bytes starting with ours") unless serverNonce.len() == 64 && serverNonce[0:32].equals(nonce)
+		let host = stringOf(serverFirst, "h")
+		let region = try stsRegion(host)
+		let now = time.now()
+		let date = amzDate(now)
+		let (authorization, _) = sigV4(credentials, host, region, date, base64encode(serverNonce))
+		let second = new BSONValue(BSONKind.Document)
+		second.set("a", new BSONValue(authorization))
+		second.set("d", new BSONValue(date))
+		second.set("t", new BSONValue(credentials.sessionToken)) unless credentials.sessionToken == ""
+		let next = continueCommand(reply.get("conversationId"), try bsonCodec.encode(second), "$external")
+		let last = authCommand(conn, next, wait) onerror (err error) {
+			forgetAWSCredentials(auth)
+			fail err
+		}
+		fail mongoError(ErrorKind.Authentication, "MONGODB-AWS: the server did not finish the conversation") unless boolOf(last, "done")
+		return none
+	}
+
+	// The STS host's region (auth spec, "Region Calculation").
+	// Fails when the host is empty, longer than 255 bytes, or has an empty
+	// label.
+	internal def stsRegion(host string) !string {
+		fail mongoError(ErrorKind.Authentication, "MONGODB-AWS: the STS host \"{host}\" is not a host name") when host == "" || host.len() > 255 || host.startsWith(".") || host.endsWith(".") || host.contains("..")
+		return "us-east-1" when host := "sts.amazonaws.com" || "aws.amazonaws.com"
+		let labels = host.split(".")
+		return labels.len() > 1 ?? (labels[1], "us-east-1")
+	}
+
+	// The X-Amz-Date of a time: `20191107T002607Z`.
+	internal def amzDate(t time.Time) string {
+		return "%04d%02d%02dT%02d%02d%02dZ".format(t.year(), t.month(), t.day(), t.hour(), t.minute(), t.second())
+	}
+
+	// The Authorization header of the GetCallerIdentity request (AWS
+	// Signature Version 4) and the signed headers.
+	internal def sigV4(c AWSCredentials, host string, region string, date string, serverNonce string) (string, string) {
+		let headers (string, string)[] = [
+			("content-length", "{stsBody.len()}"),
+			("content-type", "application/x-www-form-urlencoded"),
+			("host", host),
+			("x-amz-date", date),
+		]
+		headers.push(("x-amz-security-token", c.sessionToken)) unless c.sessionToken == ""
+		headers.push(("x-mongodb-gs2-cb-flag", "n"))
+		headers.push(("x-mongodb-server-nonce", serverNonce))
+		let canonicalHeaders = ""
+		let names string[] = []
+		for let h in headers {
+			let (name, value) = h
+			canonicalHeaders += "{name}:{value}\n"
+			names.push(name)
+		}
+		let signedHeaders = names.join(";")
+		let canonicalRequest = "POST\n/\n\n{canonicalHeaders}\n{signedHeaders}\n{hash.digest(Hash.SHA256, stsBody.bytes()).hex().lower()}"
+		let day = date.slice(0, 8)
+		let scope = "{day}/{region}/sts/aws4_request"
+		let toSign = "AWS4-HMAC-SHA256\n{date}\n{scope}\n{hash.digest(Hash.SHA256, canonicalRequest.bytes()).hex().lower()}"
+		let kDate = hash.hmac(Hash.SHA256, ("AWS4" + c.secretAccessKey.reveal()).bytes(), day.bytes())
+		let kRegion = hash.hmac(Hash.SHA256, kDate, region.bytes())
+		let kService = hash.hmac(Hash.SHA256, kRegion, "sts".bytes())
+		let kSigning = hash.hmac(Hash.SHA256, kService, "aws4_request".bytes())
+		let signature = hash.hmac(Hash.SHA256, kSigning, toSign.bytes()).hex().lower()
+		return ("AWS4-HMAC-SHA256 Credential={c.accessKeyId}/{scope}, SignedHeaders={signedHeaders}, Signature={signature}", signedHeaders)
+	}
+
+	// The credentials to sign with (auth spec, "Credential Fetching
+	// Order"): the custom provider, the environment, a web identity token,
+	// the ECS task role, the EC2 instance role. Temporary ones are kept
+	// until five minutes before they expire.
+	internal def awsCredentials(auth Authenticator) !AWSCredentials {
+		let cache = auth.cache
+		let provider = auth.awsProvider
+		if !(provider is none) {
+			return provider() onerror (err error) {
+				fail mongoErrorCaused(ErrorKind.Authentication, "MONGODB-AWS: the credential provider failed", err)
+			}
+		}
+		let key = Runtime.getEnv("AWS_ACCESS_KEY_ID")
+		let secret = Runtime.getEnv("AWS_SECRET_ACCESS_KEY")
+		if !(key is none) && !(secret is none) {
+			let token = Runtime.getEnv("AWS_SESSION_TOKEN")
+			let secretValue Secret<string> = secret
+			return AWSCredentials{accessKeyId: key, secretAccessKey: secretValue, sessionToken: token is none ?? ("", token)}
+		}
+		if !(cache is none) {
+			let kept = cache.aws
+			if !(kept is none) {
+				let until = kept.expires
+				return kept when until is none || until.unixNs() - time.wallNs() > 300000000000
+			}
+		}
+		let fetched = try fetchAWSCredentials()
+		cache.aws = fetched unless (cache is none)
+		return fetched
+	}
+
+	internal def forgetAWSCredentials(auth Authenticator) {
+		let cache = auth.cache
+		cache.aws = none unless (cache is none)
+	}
+
+	// The AWS JSON shapes the credential endpoints answer with.
+	internal struct AWSCredentialJSON {
+		accessKeyId     string = ""
+		secretAccessKey string = ""
+		token           string = ""
+		sessionToken    string = ""
+		// ISO 8601 text from ECS and EC2, epoch seconds from STS.
+		expiration      any    = none
+	}
+
+	internal struct AWSWebIdentityJSON {
+		assumeRoleWithWebIdentityResponse ?AWSWebIdentityResult = none
+	}
+
+	internal struct AWSWebIdentityResult {
+		assumeRoleWithWebIdentityResult ?AWSWebIdentityCredentials = none
+	}
+
+	internal struct AWSWebIdentityCredentials {
+		credentials ?AWSCredentialJSON = none
+	}
+
+	internal def fetchAWSCredentials() !AWSCredentials {
+		let client = new http.Client()
+		client.timeout = 10s
+		let tokenFile = Runtime.getEnv("AWS_WEB_IDENTITY_TOKEN_FILE")
+		let roleArn = Runtime.getEnv("AWS_ROLE_ARN")
+		if !(tokenFile is none) && !(roleArn is none) {
+			let token = os.readFile(tokenFile) onerror (err error) {
+				fail mongoErrorCaused(ErrorKind.Authentication, "MONGODB-AWS: the web identity token file", err)
+			}
+			let session = Runtime.getEnv("AWS_ROLE_SESSION_NAME")
+			let name = session is none ?? ("adm-" + (try crypto.rand(8)).hex().lower(), session)
+			let target = "https://sts.amazonaws.com/?Action=AssumeRoleWithWebIdentity&RoleSessionName={queryText(name)}&RoleArn={queryText(roleArn)}&WebIdentityToken={queryText(string(token).trim())}&Version=2011-06-15"
+			let req = try http.newRequest(http.Method.POST, target, "")
+			req.headers.set("Accept", "application/json")
+			let res = client.do(req) onerror (err error) {
+				fail mongoErrorCaused(ErrorKind.Authentication, "MONGODB-AWS: AssumeRoleWithWebIdentity", err)
+			}
+			fail mongoError(ErrorKind.Authentication, "MONGODB-AWS: AssumeRoleWithWebIdentity answered {res.status}") unless res.ok()
+			let parsed = new AWSWebIdentityJSON()
+			try (new encoding.JSON()).decode(try res.bytes(), parsed)
+			let response = parsed.assumeRoleWithWebIdentityResponse
+			fail mongoError(ErrorKind.Authentication, "MONGODB-AWS: AssumeRoleWithWebIdentity sent no credentials") when response is none
+			let result = response.assumeRoleWithWebIdentityResult
+			fail mongoError(ErrorKind.Authentication, "MONGODB-AWS: AssumeRoleWithWebIdentity sent no credentials") when result is none
+			let creds = result.credentials
+			fail mongoError(ErrorKind.Authentication, "MONGODB-AWS: AssumeRoleWithWebIdentity sent no credentials") when creds is none
+			return try credentialsOf(creds)
+		}
+		let relative = Runtime.getEnv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI")
+		if !(relative is none) {
+			let res = client.get("http://169.254.170.2" + relative) onerror (err error) {
+				fail mongoErrorCaused(ErrorKind.Authentication, "MONGODB-AWS: the ECS credential endpoint", err)
+			}
+			fail mongoError(ErrorKind.Authentication, "MONGODB-AWS: the ECS credential endpoint answered {res.status}") unless res.ok()
+			let parsed = new AWSCredentialJSON()
+			try (new encoding.JSON()).decode(try res.bytes(), parsed)
+			return try credentialsOf(parsed)
+		}
+		// EC2 instance metadata, IMDSv2.
+		let tokenRequest = try http.newRequest(http.Method.PUT, "http://169.254.169.254/latest/api/token", "")
+		tokenRequest.headers.set("X-aws-ec2-metadata-token-ttl-seconds", "30")
+		let tokenResponse = client.do(tokenRequest) onerror (err error) {
+			fail mongoErrorCaused(ErrorKind.Authentication, "MONGODB-AWS: no credentials in the environment, and the EC2 metadata service did not answer", err)
+		}
+		fail mongoError(ErrorKind.Authentication, "MONGODB-AWS: the EC2 metadata service answered {tokenResponse.status}") unless tokenResponse.ok()
+		let imdsToken = try tokenResponse.text()
+		let roleRequest = try http.newRequest(http.Method.GET, "http://169.254.169.254/latest/meta-data/iam/security-credentials/", "")
+		roleRequest.headers.set("X-aws-ec2-metadata-token", imdsToken)
+		let roleResponse = try client.do(roleRequest)
+		fail mongoError(ErrorKind.Authentication, "MONGODB-AWS: the instance has no IAM role") unless roleResponse.ok()
+		let role = (try roleResponse.text()).trim()
+		let credsRequest = try http.newRequest(http.Method.GET, "http://169.254.169.254/latest/meta-data/iam/security-credentials/" + role, "")
+		credsRequest.headers.set("X-aws-ec2-metadata-token", imdsToken)
+		let credsResponse = try client.do(credsRequest)
+		fail mongoError(ErrorKind.Authentication, "MONGODB-AWS: the instance role's credentials could not be read") unless credsResponse.ok()
+		let parsed = new AWSCredentialJSON()
+		try (new encoding.JSON()).decode(try credsResponse.bytes(), parsed)
+		return try credentialsOf(parsed)
+	}
+
+	internal def credentialsOf(j AWSCredentialJSON) !AWSCredentials {
+		fail mongoError(ErrorKind.Authentication, "MONGODB-AWS: the credentials have no access key") when j.accessKeyId == "" || j.secretAccessKey == ""
+		let secret Secret<string> = j.secretAccessKey
+		let out = AWSCredentials{accessKeyId: j.accessKeyId, secretAccessKey: secret, sessionToken: j.token != "" ?? (j.token, j.sessionToken)}
+		let expiration = j.expiration
+		if expiration is string {
+			out.expires = expiryOf(expiration)
+		} else if expiration is float {
+			out.expires = time.fromUnixNs(int64(expiration * 1000000000.0))
+		} else if expiration is int {
+			out.expires = time.fromUnixNs(int64(expiration) * 1000000000)
+		}
+		return out
+	}
+
+	internal def expiryOf(text string) ?time.Time {
+		return time.parse(text) onerror (err error) {
+			return none
+		}
+	}
+
+	internal def queryText(text string) string {
+		return url.queryEscape(text)
+	}
+}

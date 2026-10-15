@@ -1,3 +1,16 @@
 partial module adm.database.mongodb {
-	// MongoDB over std.net: OP_MSG with std.data.encoding.bson, SCRAM authentication, TLS, server discovery and monitoring for replica sets and sharded clusters, read and write concerns, CRUD and aggregation on typed structs, indexes, change streams, sessions and transactions, bulk writes, GridFS; also DocumentDB, Cosmos DB and FerretDB
+	use std.data.encoding
+
+	// MongoDB over std.net: OP_MSG with std.data.encoding's BSON, SCRAM,
+	// X.509 and AWS authentication, TLS, server discovery and monitoring for
+	// replica sets and sharded clusters, read and write concerns, CRUD and
+	// aggregation on typed structs, indexes, change streams, sessions and
+	// transactions, bulk writes and GridFS; also DocumentDB, Cosmos DB and
+	// FerretDB.
+
+	// ObjectId is the 12-byte identifier MongoDB gives documents.
+	type ObjectId = encoding.ObjectId
+
+	// Document is an untyped document: `collection<Document>("logs")`.
+	type Document = encoding.BSONValue
 }

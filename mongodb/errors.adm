@@ -1,0 +1,131 @@
+partial module adm.database.mongodb {
+	use (
+		std.data.encoding::(BSONValue)
+		std.errors
+	)
+
+	// ErrorKind says what went wrong, for a handler that narrowed the error
+	// with `err is MongoError`.
+	enum ErrorKind {
+		// A server cannot be reached, or a connection broke.
+		Connection      = "connection",
+		// The operation ran out of time: `timeout`, `socketTimeout` or the
+		// wait for a pooled connection.
+		TimedOut        = "timeout",
+		// No server fit the operation (its read preference, or a primary
+		// for a write) within `serverSelectionTimeout`.
+		ServerSelection = "serverSelection",
+		// The client, session, cursor or change stream was closed.
+		Closed          = "closed",
+		// A server sent something that is not the wire protocol, or the
+		// client was used in a way the protocol does not allow.
+		Protocol        = "protocol",
+		// An argument, option or connection string the driver does not take.
+		Argument        = "argument",
+		// The credentials were refused, or the mechanism failed.
+		Authentication  = "authentication",
+		// A command failed on the server (`ok: 0`); `serverCode` and
+		// `codeName` say which.
+		Server          = "server",
+		// A write was refused for some of its documents (`writeErrors`): a
+		// duplicate key, a validation failure.
+		Write           = "write",
+		// The writes were applied but the write concern was not met
+		// (`writeConcernError`).
+		WriteConcern    = "writeConcern",
+		// A document did not convert to or from the type asked for.
+		Decode          = "decode",
+		// A GridFS file or revision does not exist.
+		NotFound        = "notFound",
+	}
+
+	// One document a write refused (`MongoError.writeErrors`).
+	struct WriteError {
+		// The position of the operation in the batch the caller gave.
+		index    int
+		code     int
+		codeName string     = ""
+		message  string
+		details  ?BSONValue = none
+	}
+
+	// The write concern a write could not satisfy.
+	struct WriteConcernError {
+		code     int
+		codeName string     = ""
+		message  string
+		details  ?BSONValue = none
+	}
+
+	// MongoError is the payload every failure of this library carries.
+	// `code` repeats `kind.value`.
+	struct MongoError {
+		message           string
+		code              string
+		cause             ?error
+		stack             errors.StackTrace
+		kind              ErrorKind
+		// The server's error code and name for a failed command, 0 and ""
+		// otherwise.
+		serverCode        int                = 0
+		codeName          string             = ""
+		// The server's and driver's labels (`TransientTransactionError`,
+		// `UnknownTransactionCommitResult`, `RetryableWriteError`,
+		// `NetworkError`, `ResumableChangeStreamError`).
+		labels            string[]           = []
+		writeErrors       WriteError[]       = []
+		writeConcernError ?WriteConcernError = none
+		// What a write did before it failed: counts and inserted or upserted
+		// ids.
+		result            ?BulkWriteResult   = none
+		// The server's reply, for a command that failed on the server.
+		response          ?BSONValue         = none
+	}
+
+	internal def mongoError(kind ErrorKind, message string) MongoError {
+		return MongoError{message: "mongodb: " + message, code: kind.value, kind: kind}
+	}
+
+	internal def mongoErrorCaused(kind ErrorKind, message string, cause error) MongoError {
+		return MongoError{message: "mongodb: " + message + ": " + cause.message, code: kind.value, kind: kind, cause: cause}
+	}
+
+	// Whether an error carries a label.
+	internal def hasLabel(err error, label string) bool {
+		return err is MongoError && err.labels.includes(label)
+	}
+
+	internal def kindOf(err error) ?ErrorKind {
+		return err is MongoError ?? (err.kind, none)
+	}
+
+	internal def serverCodeOf(err error) int {
+		return err is MongoError ?? (err.serverCode, 0)
+	}
+
+	// The error of a command reply with `ok: 0`.
+	internal def commandError(reply BSONValue) MongoError {
+		let code = reply.has("code") ?? (reply.get("code").asInt() onerror recover 0, 0)
+		let codeName = reply.has("codeName") ?? (reply.get("codeName").asString() onerror recover "", "")
+		let text = reply.has("errmsg") ?? (reply.get("errmsg").asString() onerror recover "", "command failed")
+		return MongoError{message: "mongodb: " + text + (codeName != "" ?? (" ({codeName})", "")), code: ErrorKind.Server.value, kind: ErrorKind.Server, serverCode: code, codeName: codeName, labels: labelsOf(reply), response: reply}
+	}
+
+	internal def labelsOf(reply BSONValue) string[] {
+		let out string[] = []
+		return out unless reply.has("errorLabels")
+		for let label in reply.get("errorLabels").elements() {
+			let text = label.asString() onerror recover ""
+			out.push(text) unless text == ""
+		}
+		return out
+	}
+
+	// Adds a label to an error when it is a MongoError without it.
+	internal def withLabel(err error, label string) error {
+		if err is MongoError {
+			err.labels.push(label) unless err.labels.includes(label)
+		}
+		return err
+	}
+}

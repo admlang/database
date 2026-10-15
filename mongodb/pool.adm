@@ -1,0 +1,325 @@
+partial module adm.database.mongodb {
+	use (
+		std.time
+	)
+
+	// A task waiting in a pool's queue for a connection.
+	internal type Waiter {
+		wake    channel<bool>
+		// Why the pool turned the waiter away, "" while it waits.
+		failure string        = ""
+
+		def new() {
+			wake = new channel<bool>(size = 1)
+		}
+
+		def signal() {
+			wake <- true when wake.len() == 0
+		}
+	}
+
+	// What a waiter at the head of the queue may do now.
+	internal enum Step {
+		Wait,
+		Take,
+		Create,
+	}
+
+	// The connections to one server (CMAP): available ones are reused
+	// newest first, new ones are made up to `maxSize` with at most
+	// `maxConnecting` being established at once, and tasks wait their turn
+	// in order. Clearing bumps the generation, which perishes every older
+	// connection.
+	internal type Pool {
+		address                string
+		plan                   DialPlan
+		maxSize                int
+		minSize                int
+		maxConnecting          int
+		maxIdle                duration
+		internal generation    int              = 0
+		internal services      map<string, int> = map<string, int>{}
+		internal serviceCounts map<string, int> = map<string, int>{}
+		internal ready         bool             = false
+		internal closed        bool             = false
+		internal available     Conn[]           = []
+		internal inUse         Conn[]           = []
+		internal total         int              = 0
+		internal pending       int              = 0
+		internal queue         Waiter[]         = []
+		// Connections that must be closed once the lock is let go.
+		internal doomed        Conn[]           = []
+
+		def new(address string, plan DialPlan) {
+			self.address = address
+			self.plan = plan
+			maxSize = plan.settings.maxPoolSize
+			minSize = plan.settings.minPoolSize
+			maxConnecting = plan.settings.maxConnecting
+			maxIdle = plan.settings.maxIdleTime
+			ready = plan.settings.loadBalanced
+		}
+
+		// Takes a connection, making one when none is free and the pool
+		// has room, waiting in turn otherwise, until `deadline` (monotonic
+		// ns; 0 waits without end).
+		// Fails with ErrorKind.Closed when the pool is closed,
+		// ErrorKind.Connection (labelled retryable) when it is paused or
+		// cleared while waiting, ErrorKind.TimedOut when the wait runs out,
+		// and as `dial` does when a new connection fails.
+		def checkOut(deadline int64) !Conn {
+			let waiter = try enter()
+			for {
+				let (step, conn) = attempt(waiter)
+				closeDoomed()
+				switch step {
+					case Step.Take:
+						return conn unless conn is none
+					case Step.Create:
+						return try create()
+					default:
+				}
+				let now = time.monoNs()
+				if deadline > 0 && now >= deadline {
+					leave(waiter)
+					fail mongoError(ErrorKind.TimedOut, "timed out waiting for a connection to {address}")
+				}
+				if deadline > 0 {
+					let timer = time.sleepChan(duration(deadline - now))
+					select {
+						case waiter.wake:
+							waiter.wake.flush()
+						case timer:
+					}
+				} else {
+					let _ = <-waiter.wake
+				}
+				if waiter.failure != "" {
+					let err = mongoError(ErrorKind.Connection, waiter.failure)
+					err.labels.push("RetryableWriteError")
+					err.labels.push("PoolClearedError")
+					fail err
+				}
+			}
+		}
+
+		internal atomic def enter() !Waiter {
+			fail mongoError(ErrorKind.Closed, "the pool for {address} is closed") when closed
+			if !ready {
+				let err = mongoError(ErrorKind.Connection, "the pool for {address} is paused after an error")
+				err.labels.push("PoolClearedError")
+				fail err
+			}
+			let waiter = new Waiter()
+			queue.push(waiter)
+			return waiter
+		}
+
+		internal atomic def leave(waiter Waiter) {
+			let index = queue.indexOf(waiter)
+			return when index < 0
+			queue.remove(index)
+			queue[0].signal() when index == 0 && queue.len() > 0
+		}
+
+		// What the waiter may do: nothing until it heads the queue; then
+		// take an available connection that has not perished, or make one
+		// when the pool and `maxConnecting` allow.
+		internal atomic def attempt(waiter Waiter) (Step, ?Conn) {
+			return (Step.Wait, none) unless queue.len() > 0 && queue[0] == waiter
+			let now = time.monoNs()
+			for available.len() > 0 {
+				let conn = available.pop()
+				if perished(conn, now) {
+					total--
+					doomed.push(conn)
+					continue
+				}
+				queue.remove(0)
+				queue[0].signal() when queue.len() > 0
+				inUse.push(conn)
+				return (Step.Take, conn)
+			}
+			if (maxSize == 0 || total < maxSize) && pending < maxConnecting {
+				total++
+				pending++
+				queue.remove(0)
+				queue[0].signal() when queue.len() > 0
+				return (Step.Create, none)
+			}
+			return (Step.Wait, none)
+		}
+
+		internal def create() !Conn {
+			let opened = currentGeneration()
+			let conn = dial(plan, unlimited(plan.settings.connectTimeout)) onerror (err error) {
+				created(none)
+				fail err
+			}
+			conn.generation = opened
+			conn.generation = serviceGeneration(conn.serviceId) when conn.serviceId != ""
+			created(conn)
+			return conn
+		}
+
+		internal atomic def currentGeneration() int {
+			return generation
+		}
+
+		// The pool's generation now.
+		atomic def generationNow() int {
+			return generation
+		}
+
+		internal atomic def serviceGeneration(serviceId string) int {
+			let g = services.get(serviceId)
+			let count = serviceCounts.get(serviceId)
+			serviceCounts[serviceId] = (count is none ?? (0, count)) + 1
+			return g is none ?? (0, g)
+		}
+
+		internal atomic def created(conn ?Conn) {
+			pending--
+			if conn is none {
+				total--
+			} else {
+				inUse.push(conn)
+			}
+			queue[0].signal() when queue.len() > 0
+		}
+
+		internal def perished(conn Conn, now int64) bool {
+			return true when conn.broken
+			if conn.serviceId != "" {
+				let g = services.get(conn.serviceId)
+				return true when !(g is none) && conn.generation < g
+			} else {
+				return true when conn.generation < generation
+			}
+			return maxIdle > 0s && conn.lastUsed > 0 && now - conn.lastUsed > maxIdle.nanoseconds()
+		}
+
+		// Gives a connection back: kept for reuse unless it perished or the
+		// pool closed.
+		def checkIn(conn Conn) {
+			returned(conn)
+			closeDoomed()
+		}
+
+		internal atomic def returned(conn Conn) {
+			let index = inUse.indexOf(conn)
+			inUse.remove(index) when index >= 0
+			conn.lastUsed = time.monoNs()
+			if closed || conn.streaming || perished(conn, conn.lastUsed) {
+				forget(conn)
+				doomed.push(conn)
+			} else {
+				available.push(conn)
+			}
+			queue[0].signal() when queue.len() > 0
+		}
+
+		internal def forget(conn Conn) {
+			total--
+			if conn.serviceId != "" {
+				let count = serviceCounts.get(conn.serviceId)
+				let left = (count is none ?? (1, count)) - 1
+				if left <= 0 {
+					serviceCounts.delete(conn.serviceId)
+					services.delete(conn.serviceId)
+				} else {
+					serviceCounts[conn.serviceId] = left
+				}
+			}
+		}
+
+		internal def closeDoomed() {
+			for let conn in takeDoomed() {
+				conn.close()
+			}
+		}
+
+		internal atomic def takeDoomed() Conn[] {
+			let out = doomed
+			doomed = []
+			return out
+		}
+
+		// Lets connections be checked out (after a successful server check).
+		atomic def markReady() {
+			ready = true unless closed
+		}
+
+		// Clears the pool (CMAP): every existing connection perishes, the
+		// pool pauses until the next successful check, and waiting tasks
+		// are turned away. `interrupt` also closes the connections in use.
+		// Behind a load balancer only the service's connections perish.
+		def clear(interrupt bool, serviceId string = "") {
+			cleared(interrupt, serviceId)
+			closeDoomed()
+		}
+
+		internal atomic def cleared(interrupt bool, serviceId string) {
+			if serviceId != "" {
+				let g = services.get(serviceId)
+				services[serviceId] = (g is none ?? (0, g)) + 1
+				return
+			}
+			let before = generation
+			generation++
+			ready = false unless plan.settings.loadBalanced
+			for let waiter in queue {
+				waiter.failure = "the pool for {address} was cleared while waiting"
+				waiter.signal()
+			}
+			queue = []
+			if interrupt {
+				for let conn in inUse {
+					conn.broken = true when conn.generation <= before
+				}
+				for let conn in inUse {
+					if conn.broken {
+						conn.stream.close() onerror recover none
+					}
+				}
+			}
+		}
+
+		// Opens connections in the background until `minSize` exist.
+		def populate() {
+			for {
+				return unless wantsMore()
+				let conn = create() onerror (err error) {
+					return
+				}
+				checkIn(conn)
+			}
+		}
+
+		internal atomic def wantsMore() bool {
+			return false when closed || !ready || total >= minSize || pending >= maxConnecting || (maxSize > 0 && total >= maxSize)
+			total++
+			pending++
+			return true
+		}
+
+		// Closes every available connection and refuses new checkouts.
+		def close() {
+			closing()
+			closeDoomed()
+		}
+
+		internal atomic def closing() {
+			closed = true
+			for let conn in available {
+				doomed.push(conn)
+			}
+			available = []
+			for let waiter in queue {
+				waiter.failure = "the pool for {address} was closed"
+				waiter.signal()
+			}
+			queue = []
+		}
+	}
+}

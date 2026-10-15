@@ -1,0 +1,511 @@
+partial module adm.database.mongodb {
+	use (
+		std.crypto.hash
+		std.crypto.hash::(Hash)
+		std.crypto.x509
+		std.crypto.x509::(CertPool)
+		std.data.encoding::(BSONValue, BSONKind, ObjectId)
+		std.net
+		std.net.proxy
+		std.net.sasl
+		std.net.tls
+		std.net.url
+		std.os
+	)
+
+	// The oldest server this driver speaks to: MongoDB 4.2 (wire version 8).
+	internal const minWireVersion = 8
+	internal const maxWireVersion = 25
+	internal const driverName = "adm.database.mongodb"
+	internal const driverVersion = "0.0.1"
+
+	internal let connectionCounter int = 0
+
+	internal atomic def nextConnectionID() int {
+		connectionCounter++
+		return connectionCounter
+	}
+
+	// How a connection is made: the address, TLS, credentials, what the
+	// handshake offers.
+	internal struct DialPlan {
+		address    string
+		settings   Settings
+		// Monitoring connections skip authentication and the client
+		// metadata stays the same.
+		monitoring bool
+		// What the handshake asks: hello when the server is known to take
+		// it (helloOk) or the API version / load balancer need it.
+		useHello   bool
+		// Credentials the SCRAM caches keep between connections.
+		cache      ?ScramCache
+	}
+
+	// dial opens a connection, under TLS and through a SOCKS5 proxy when
+	// the settings ask, and runs the handshake (and authentication for a
+	// general-use connection).
+	// Fails with ErrorKind.Connection when the server cannot be reached or
+	// TLS fails, ErrorKind.Authentication when credentials are refused.
+	internal def dial(plan DialPlan, wait duration) !Conn {
+		let s = plan.settings
+		let stream = try openStream(s, plan.address, wait)
+		let conn = new Conn(stream, plan.address, nextConnectionID())
+		conn.zlibLevel = s.zlibCompressionLevel
+		handshake(conn, plan, wait) onerror (err error) {
+			conn.close()
+			fail err
+		}
+		return conn
+	}
+
+	internal def openStream(s Settings, address string, wait duration) !net.Stream {
+		let connectWait = s.connectTimeout == 0s ?? (wait, s.connectTimeout)
+		connectWait = wait when wait > 0s && (connectWait <= 0s || wait < connectWait)
+		connectWait = unlimited(connectWait) when connectWait == 0s
+		let (host, port) = splitAddress(address)
+		let socket = try openSocket(s, address, host, port, connectWait)
+		let secure = s.tls
+		return socket unless !(secure is none) && secure
+		let config = try tlsConfigOf(s, host)
+		let secured = tls.client(socket, config)
+		secured.handshake(connectWait) onerror (err error) {
+			socket.close() onerror recover none
+			fail networkError(mongoErrorCaused(ErrorKind.Connection, "TLS with {address}", err))
+		}
+		if s.tlsAllowInvalidHostnames && !s.tlsAllowInvalidCertificates {
+			// The chain is still checked, against no host name.
+			verifyChainOnly(secured, config) onerror (err error) {
+				secured.close() onerror recover none
+				fail mongoErrorCaused(ErrorKind.Connection, "TLS with {address}", err)
+			}
+		}
+		return secured
+	}
+
+	// The plain socket: a Unix socket, TCP through a SOCKS5 proxy, or TCP.
+	internal def openSocket(s Settings, address string, host string, port int, wait duration) !net.Stream {
+		if isSocketPath(host) {
+			return net.dialStream(host, wait) onerror (err error) {
+				fail networkError(mongoErrorCaused(ErrorKind.Connection, "connecting to {host}", err))
+			}
+		}
+		if s.proxyHost != "" {
+			let auth = s.proxyUsername == "" ?? ("", url.queryEscape(s.proxyUsername) + ":" + url.queryEscape(s.proxyPassword) + "@")
+			let proxyURL = url.parse("socks5://{auth}{s.proxyHost}:{s.proxyPort}") onerror (err error) {
+				fail mongoErrorCaused(ErrorKind.Argument, "the proxy address", err)
+			}
+			let dialer = new proxy.Dialer(proxyURL)
+			return dialer.dial(address, wait) onerror (err error) {
+				fail networkError(mongoErrorCaused(ErrorKind.Connection, "connecting to {address} through the proxy", err))
+			}
+		}
+		return net.dialStream(host.contains(":") ?? ("[{host}]:{port}", "{host}:{port}"), wait) onerror (err error) {
+			fail networkError(mongoErrorCaused(ErrorKind.Connection, "connecting to {address}", err))
+		}
+	}
+
+	internal def networkError(err MongoError) MongoError {
+		err.labels.push("NetworkError") unless err.labels.includes("NetworkError")
+		return err
+	}
+
+	// The TLS settings of a connection to a host.
+	internal def tlsConfigOf(s Settings, host string) !tls.Config {
+		let config = tls.Config{}
+		let given = s.tlsConfig
+		config = given unless given is none
+		config.serverName = host when config.serverName == "" && !isSocketPath(host)
+		if s.tlsCAFile != "" {
+			let pem = os.readFile(s.tlsCAFile) onerror (err error) {
+				fail mongoErrorCaused(ErrorKind.Argument, "tlsCAFile {s.tlsCAFile}", err)
+			}
+			let pool = new CertPool()
+			fail mongoError(ErrorKind.Argument, "tlsCAFile {s.tlsCAFile} holds no certificate") unless pool.appendCertsFromPEM(string(pem))
+			config.rootCAs = pool
+		}
+		if s.tlsCertificateKeyFile != "" {
+			let pem = os.readFile(s.tlsCertificateKeyFile) onerror (err error) {
+				fail mongoErrorCaused(ErrorKind.Argument, "tlsCertificateKeyFile {s.tlsCertificateKeyFile}", err)
+			}
+			let pair = keyPairOf(string(pem), s.tlsCertificateKeyFilePassword) onerror (err error) {
+				fail mongoErrorCaused(ErrorKind.Argument, "tlsCertificateKeyFile {s.tlsCertificateKeyFile}", err)
+			}
+			config.certificates = [pair]
+		}
+		config.insecureSkipVerify = true when s.tlsAllowInvalidCertificates || s.tlsAllowInvalidHostnames
+		return config
+	}
+
+	internal def keyPairOf(pem string, password string) !tls.KeyPair {
+		return try tls.parseKeyPair(pem, pem) when password == ""
+		let secret Secret<string> = password
+		return try tls.parseKeyPair(pem, pem, secret)
+	}
+
+	// Checks the server's chain against the roots without its host name.
+	internal def verifyChainOnly(conn tls.Conn, config tls.Config) !none {
+		let certs = conn.connectionState().peerCertificates
+		fail mongoError(ErrorKind.Connection, "the server presented no certificate") when certs.len() == 0
+		let roots = config.rootCAs
+		let pool = roots is none ?? (try x509.systemCertPool(), roots)
+		let intermediates = new CertPool()
+		for let i = 1; i < certs.len(); i++ {
+			intermediates.addCert(certs[i])
+		}
+		try certs[0].verify(x509.VerifyOptions{roots: pool, intermediates: intermediates})
+		return none
+	}
+
+	// Host and port of an address `host:port` (or `[v6]:port`, or a socket
+	// path).
+	internal def splitAddress(address string) (string, int) {
+		return (address, 0) when isSocketPath(address)
+		if address.startsWith("[") {
+			let close = address.indexOf("]")
+			let port = close + 2 < address.len() ?? (address.slice(close + 2, address.len()).toInt<int>(), 27017)
+			return (address.slice(1, close), port)
+		}
+		let colon = address.lastIndexOf(":")
+		return (address, 27017) when colon < 0
+		return (address.slice(0, colon), address.slice(colon + 1, address.len()).toInt<int>())
+	}
+
+	// The address form SDAM keys servers by: lower-case host and port.
+	internal def addressOf(h HostAddress) string {
+		return h.host when isSocketPath(h.host)
+		let port = h.port == 0 ?? (27017, h.port)
+		return h.host.contains(":") ?? ("[{h.host.lower()}]:{port}", "{h.host.lower()}:{port}")
+	}
+
+	// The client metadata of the handshake (MongoDB Handshake spec).
+	internal def clientMetadata(appName string) BSONValue {
+		let client = new BSONValue(BSONKind.Document)
+		if appName != "" {
+			let app = new BSONValue(BSONKind.Document)
+			app.set("name", new BSONValue(appName))
+			client.set("application", app)
+		}
+		let driver = new BSONValue(BSONKind.Document)
+		driver.set("name", new BSONValue(driverName))
+		driver.set("version", new BSONValue(driverVersion))
+		client.set("driver", driver)
+		let osDoc = new BSONValue(BSONKind.Document)
+		let osType = __os__ == "linux" ?? ("Linux", __os__ == "macos" ?? ("Darwin", __os__ == "windows" ?? ("Windows", __os__)))
+		osDoc.set("type", new BSONValue(osType))
+		osDoc.set("name", new BSONValue(__os__))
+		osDoc.set("architecture", new BSONValue(__arch__))
+		client.set("os", osDoc)
+		client.set("platform", new BSONValue("ADM " + __compiler_version__))
+		return client
+	}
+
+	// Runs the handshake on a new connection: hello (or legacy hello)
+	// with the metadata, compressors and the credential negotiation, then
+	// authentication.
+	internal def handshake(conn Conn, plan DialPlan, wait duration) !none {
+		let s = plan.settings
+		let command = new BSONValue(BSONKind.Document)
+		let useHello = plan.useHello || !(s.serverApi is none) || s.loadBalanced
+		command.set(useHello ?? ("hello", "isMaster"), new BSONValue(int32(1)))
+		command.set("helloOk", new BSONValue(true)) unless useHello
+		command.set("backpressure", new BSONValue("2"))
+		command.set("client", clientMetadata(s.appName))
+		if s.compressors.len() > 0 {
+			let list = new BSONValue(BSONKind.Array)
+			for let name in s.compressors {
+				list.push(new BSONValue(name))
+			}
+			command.set("compression", list)
+		}
+		command.set("loadBalanced", new BSONValue(true)) when s.loadBalanced
+		let speculative ?Authenticator = none
+		if s.auth && !plan.monitoring {
+			let source = credentialSource(s)
+			command.set("saslSupportedMechs", new BSONValue(source + "." + s.username)) when s.authMechanism == ""
+			let auth = try authenticatorFor(s, s.authMechanism == "" ?? ("SCRAM-SHA-256", s.authMechanism), plan.cache)
+			let first = try auth.speculative()
+			if !(first is none) {
+				command.set("speculativeAuthenticate", first)
+				speculative = auth
+			}
+		}
+		addServerApi(command, s.serverApi)
+		command.set("$db", new BSONValue("admin"))
+		let reply = conn.roundTrip(command, [], wait) onerror (err error) {
+			fail err
+		}
+		if !okOf(reply) {
+			let failure = commandError(reply)
+			failure.kind = ErrorKind.Connection
+			failure.code = ErrorKind.Connection.value
+			fail failure
+		}
+		conn.hello = reply
+		conn.maxWireVersion = intOf(reply, "maxWireVersion", 0)
+		conn.maxBsonObjectSize = intOf(reply, "maxBsonObjectSize", 16777216)
+		conn.maxMessageSize = intOf(reply, "maxMessageSizeBytes", 48000000)
+		conn.maxWriteBatchSize = intOf(reply, "maxWriteBatchSize", 100000)
+		conn.serverConnectionId = intOf(reply, "connectionId", 0)
+		if reply.has("serviceId") {
+			conn.serviceId = (reply.get("serviceId").asObjectId() onerror recover new ObjectId()).str()
+		} else if s.loadBalanced {
+			fail mongoError(ErrorKind.Connection, "the server behind the load balancer gave no serviceId: it is not in load-balanced mode")
+		}
+		if reply.has("compression") {
+			for let item in reply.get("compression").elements() {
+				let name = item.asString() onerror recover ""
+				if s.compressors.includes(name) && name != "noop" {
+					conn.compressor = name
+					break
+				}
+			}
+		}
+		fail mongoError(ErrorKind.Connection, "the server at {conn.address} speaks wire version {conn.maxWireVersion}; this driver needs MongoDB 4.2 or later") when conn.maxWireVersion < minWireVersion
+		return none when plan.monitoring || !s.auth
+		return none when isArbiter(reply)
+		let mechanism = s.authMechanism
+		if mechanism == "" {
+			mechanism = "SCRAM-SHA-1"
+			if reply.has("saslSupportedMechs") {
+				for let item in reply.get("saslSupportedMechs").elements() {
+					mechanism = "SCRAM-SHA-256" when (item.asString() onerror recover "") == "SCRAM-SHA-256"
+				}
+			}
+		}
+		let authenticator = try authenticatorFor(s, mechanism, plan.cache)
+		let conversation ?BSONValue = none
+		let spec = speculative
+		if !(spec is none) && spec.mechanism == mechanism && reply.has("speculativeAuthenticate") {
+			authenticator = spec
+			conversation = reply.get("speculativeAuthenticate")
+		}
+		authenticator.run(conn, wait, conversation) onerror (err error) {
+			fail err when err is MongoError && err.kind == ErrorKind.Authentication
+			fail mongoErrorCaused(ErrorKind.Authentication, "authenticating to {conn.address}", err)
+		}
+		conn.authenticated = true
+		return none
+	}
+
+	internal def isArbiter(hello BSONValue) bool {
+		return hello.has("arbiterOnly") && (hello.get("arbiterOnly").asBool() onerror recover false)
+	}
+
+	internal def addServerApi(command BSONValue, api ?ServerApi) {
+		return when api is none
+		command.set("apiVersion", new BSONValue(api.version))
+		let strict = api.strict
+		command.set("apiStrict", new BSONValue(strict)) unless strict is none
+		let deprecation = api.deprecationErrors
+		command.set("apiDeprecationErrors", new BSONValue(deprecation)) unless deprecation is none
+	}
+
+	internal def okOf(reply BSONValue) bool {
+		return false unless reply.has("ok")
+		let ok = reply.get("ok").asFloat() onerror recover 0.0
+		return ok == 1.0
+	}
+
+	internal def intOf(doc BSONValue, name string, fallback int) int {
+		return fallback unless doc.has(name)
+		return doc.get(name).asInt() onerror recover fallback
+	}
+
+	internal def stringOf(doc BSONValue, name string) string {
+		return "" unless doc.has(name)
+		return doc.get(name).asString() onerror recover ""
+	}
+
+	internal def boolOf(doc BSONValue, name string) bool {
+		return false unless doc.has(name)
+		return doc.get(name).asBool() onerror recover false
+	}
+
+	// What SCRAM computes from a password, kept so new connections skip
+	// the PBKDF2 rounds (auth spec, "Caching credentials in SCRAM").
+	internal type ScramCache {
+		entries map<string, byte[]>
+		// MONGODB-AWS temporary credentials fetched from a metadata
+		// endpoint or STS.
+		aws     ?AWSCredentials     = none
+
+		def new() {
+			entries = map<string, byte[]>{}
+		}
+	}
+
+	// One authentication mechanism, run on a connection after its
+	// handshake (or continuing the speculative start it put in hello).
+	internal type Authenticator {
+		mechanism   string
+		source      string
+		username    string
+		password    string
+		properties  map<string, string>
+		cache       ?ScramCache
+		awsProvider ?def () !AWSCredentials = none
+		// SCRAM state.
+		scram       ?sasl.ScramClient       = none
+		first       string                  = ""
+
+		def new(mechanism string, source string, username string, password string, properties map<string, string>, cache ?ScramCache) {
+			self.mechanism = mechanism
+			self.source = source
+			self.username = username
+			self.password = password
+			self.properties = properties
+			self.cache = cache
+		}
+
+		// The `speculativeAuthenticate` document of hello, none for a
+		// mechanism that has none.
+		def speculative() !?BSONValue {
+			switch mechanism {
+				case "SCRAM-SHA-1", "SCRAM-SHA-256":
+					let start = try saslStart()
+					start.set("db", new BSONValue(source))
+					return start
+				case "MONGODB-X509":
+					let doc = x509Command()
+					doc.set("db", new BSONValue("$external"))
+					return doc
+				default:
+					return none
+			}
+		}
+
+		internal def saslStart() !BSONValue {
+			let secret Secret<string> = try scramPassword()
+			let client = new sasl.ScramClient(username, secret, mechanism == "SCRAM-SHA-1" ?? (sasl.ScramMechanism.Sha1, sasl.ScramMechanism.Sha256))
+			scram = client
+			first = try client.first()
+			let doc = new BSONValue(BSONKind.Document)
+			doc.set("saslStart", new BSONValue(int32(1)))
+			doc.set("mechanism", new BSONValue(mechanism))
+			doc.set("payload", new BSONValue(first.bytes(), 0))
+			let options = new BSONValue(BSONKind.Document)
+			options.set("skipEmptyExchange", new BSONValue(true))
+			doc.set("options", options)
+			return doc
+		}
+
+		// The password SCRAM hashes: for SHA-1 the hex MD5 of
+		// "user:mongo:password", for SHA-256 the password after SASLprep.
+		internal def scramPassword() !string {
+			return hash.digest(Hash.MD5, (username + ":mongo:" + password).bytes()).hex().lower() when mechanism == "SCRAM-SHA-1"
+			return sasl.saslprep(password) onerror (err error) {
+				fail mongoErrorCaused(ErrorKind.Authentication, "the password", err)
+			}
+		}
+
+		internal def x509Command() BSONValue {
+			let doc = new BSONValue(BSONKind.Document)
+			doc.set("authenticate", new BSONValue(int32(1)))
+			doc.set("mechanism", new BSONValue("MONGODB-X509"))
+			doc.set("user", new BSONValue(username)) unless username == ""
+			return doc
+		}
+
+		// Runs (or finishes) the conversation. `started` is the server's
+		// answer to the speculative start, none to begin from scratch.
+		def run(conn Conn, wait duration, started ?BSONValue) !none {
+			switch mechanism {
+				case "SCRAM-SHA-1", "SCRAM-SHA-256":
+					return try runScram(conn, wait, started)
+				case "PLAIN":
+					let start = new BSONValue(BSONKind.Document)
+					start.set("saslStart", new BSONValue(int32(1)))
+					start.set("mechanism", new BSONValue("PLAIN"))
+					let payload byte[] = [byte(0)]
+					payload += username.bytes()
+					payload.push(byte(0))
+					payload += password.bytes()
+					start.set("payload", new BSONValue(payload, 0))
+					start.set("$db", new BSONValue(source))
+					try authCommand(conn, start, wait)
+					return none
+				case "MONGODB-X509":
+					return none unless started is none
+					let doc = x509Command()
+					doc.set("$db", new BSONValue("$external"))
+					try authCommand(conn, doc, wait)
+					return none
+				case "MONGODB-AWS":
+					return try runAWS(self, conn, wait)
+				default:
+					fail mongoError(ErrorKind.Authentication, "the mechanism {mechanism} is not supported")
+			}
+		}
+
+		internal def runScram(conn Conn, wait duration, started ?BSONValue) !none {
+			let current = new BSONValue(BSONKind.Document)
+			if started is none {
+				let start = try saslStart()
+				start.set("$db", new BSONValue(source))
+				current = try authCommand(conn, start, wait)
+			} else {
+				current = started
+			}
+			let client = scram
+			fail mongoError(ErrorKind.Authentication, "SCRAM was not started") when client is none
+			let serverFirst = string(try payloadOf(current))
+			let iterations = sasl.scramAttrs(serverFirst).get("i")
+			fail mongoError(ErrorKind.Authentication, "the server asks for fewer than 4096 SCRAM iterations") when !(iterations is none) && iterations.toInt<int>() < 4096
+			let finalMessage = client.final(serverFirst) onerror (err error) {
+				fail mongoErrorCaused(ErrorKind.Authentication, "SCRAM", err)
+			}
+			let conversationId = current.get("conversationId")
+			let next = try authCommand(conn, continueCommand(conversationId, finalMessage.bytes(), source), wait)
+			client.verify(string(try payloadOf(next))) onerror (err error) {
+				fail mongoErrorCaused(ErrorKind.Authentication, "the server's SCRAM proof", err)
+			}
+			// A server that did not skip the empty exchange wants one more
+			// round.
+			let last = next
+			for !boolOf(last, "done") {
+				last = try authCommand(conn, continueCommand(conversationId, [], source), wait)
+			}
+			return none
+		}
+	}
+
+	internal def continueCommand(conversationId BSONValue, payload byte[], source string) BSONValue {
+		let doc = new BSONValue(BSONKind.Document)
+		doc.set("saslContinue", new BSONValue(int32(1)))
+		doc.set("conversationId", conversationId)
+		doc.set("payload", new BSONValue(payload, 0))
+		doc.set("$db", new BSONValue(source))
+		return doc
+	}
+
+	internal def payloadOf(reply BSONValue) !byte[] {
+		fail mongoError(ErrorKind.Authentication, "the server's SASL reply has no payload") unless reply.has("payload")
+		let p = reply.get("payload")
+		return p.asBytes() onerror (err error) {
+			let text = p.asString() onerror (e error) {
+				fail mongoError(ErrorKind.Authentication, "the server's SASL payload is neither bytes nor text")
+			}
+			recover text.bytes()
+		}
+	}
+
+	// Sends an authentication command; a refusal is ErrorKind.Authentication.
+	internal def authCommand(conn Conn, command BSONValue, wait duration) !BSONValue {
+		let reply = try conn.roundTrip(command, [], wait)
+		if !okOf(reply) {
+			let failure = commandError(reply)
+			failure.kind = ErrorKind.Authentication
+			failure.code = ErrorKind.Authentication.value
+			fail failure
+		}
+		return reply
+	}
+
+	internal def authenticatorFor(s Settings, mechanism string, cache ?ScramCache) !Authenticator {
+		let password = s.password
+		let text = password is none ?? ("", password.reveal())
+		let auth = new Authenticator(mechanism, sourceFor(s, mechanism), s.username, text, s.authProperties, cache)
+		auth.awsProvider = s.awsCredentialProvider
+		return auth
+	}
+}

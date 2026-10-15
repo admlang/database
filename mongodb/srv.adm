@@ -1,0 +1,167 @@
+partial module adm.database.mongodb {
+	use (
+		std.crypto::(randRange)
+		std.net.dns
+		std.text.idna
+		std.time
+	)
+
+	// The single labels srvAllowedHostsSuffix may be (Initial DNS
+	// Seedlist Discovery spec).
+	internal const allowedSingleSuffixes = ["test", "localhost", "invalid", "example", "local", "internal", "corp", "home", "mail"]
+
+	// A host name as SRV checks compare it: no trailing dot, A-labels,
+	// ASCII lower case.
+	internal def normalizeHost(host string) string {
+		let name = host.endsWith(".") ?? (host.slice(0, host.len() - 1), host)
+		let ascii = idna.toASCII(name, idna.IDNAOptions{}) onerror (err error) {
+			recover name
+		}
+		return ascii.lower()
+	}
+
+	// The normalized srvAllowedHostsSuffix, with its leading dot.
+	// Fails when it is empty, or a single label that is not a reserved
+	// name.
+	internal def allowedSuffixOf(value string) !string {
+		let trimmed = value.trim(".")
+		fail uriError("srvAllowedHostsSuffix is empty") when trimmed == ""
+		let normal = normalizeHost(trimmed)
+		fail uriError("srvAllowedHostsSuffix \"{value}\" needs two labels") unless normal.contains(".") || allowedSingleSuffixes.includes(normal)
+		return "." + normal
+	}
+
+	// The parent domain SRV results must belong to, with its leading dot.
+	internal def srvDomainOf(s Settings, host string) !string {
+		return try allowedSuffixOf(s.srvAllowedHostsSuffix) when s.srvAllowedHostsSuffix != ""
+		let normal = normalizeHost(host)
+		let parts = normal.split(".")
+		return parts.len() >= 3 ?? ("." + parts[1:].join("."), "." + normal)
+	}
+
+	// Whether an SRV result may be used.
+	internal def srvHostAllowed(s Settings, srvHost string, domain string, result string) bool {
+		let validator = s.srvHostValidator
+		return validator(result) unless (validator is none)
+		return false unless result.endsWith(domain)
+		return result.split(".").len() > normalizeHost(srvHost).split(".").len() when s.srvAllowedHostsSuffix == "" && normalizeHost(srvHost).split(".").len() < 3
+		return true
+	}
+
+	// The verified hosts of the SRV records, and the smallest TTL.
+	internal def srvHosts(s Settings, srvHost string, strict bool) !(HostAddress[], int) {
+		let records = dns.lookupSRV(s.srvServiceName, "tcp", srvHost) onerror (err error) {
+			fail mongoErrorCaused(ErrorKind.Connection, "the SRV records of {srvHost} cannot be read", err)
+		}
+		fail mongoError(ErrorKind.Connection, "{srvHost} has no SRV records for {s.srvServiceName}") when records.len() == 0
+		let domain = try srvDomainOf(s, srvHost)
+		let out HostAddress[] = []
+		let ttl = 0
+		for let record in records {
+			let host = normalizeHost(record.target)
+			if !srvHostAllowed(s, srvHost, domain, host) {
+				fail mongoError(ErrorKind.Connection, "the SRV record {host} is not in the domain of {srvHost}") when strict
+				continue
+			}
+			out.push(HostAddress{host: host, port: record.port})
+			ttl = record.ttl when ttl == 0 || (record.ttl > 0 && record.ttl < ttl)
+		}
+		return (out, ttl)
+	}
+
+	// Up to `count` hosts picked at random (Fisher-Yates).
+	internal def pickHosts(hosts HostAddress[], count int) HostAddress[] {
+		return hosts when count <= 0 || count >= hosts.len()
+		let shuffled = hosts.clone()
+		for let i = shuffled.len() - 1; i > 0; i-- {
+			let j = randRange(0, i + 1)
+			let swap = shuffled[i]
+			shuffled[i] = shuffled[j]
+			shuffled[j] = swap
+		}
+		return shuffled[0:count]
+	}
+
+	// Replaces the one host of a `mongodb+srv` string with what DNS says
+	// (Initial DNS Seedlist Discovery spec): the SRV records' hosts, and
+	// the TXT record's authSource, replicaSet and loadBalanced unless the
+	// string or the code gave them. TLS is on unless turned off.
+	// Fails when the SRV records cannot be read or a host is outside the
+	// domain, there is more than one TXT record, or it holds another
+	// option.
+	internal def resolveSeedList(s Settings) !none {
+		let srvHost = s.hosts[0].host
+		let (hosts, _) = try srvHosts(s, srvHost, true)
+		s.hosts = pickHosts(hosts, s.srvMaxHosts)
+		s.tls = true when s.tls is none
+		let txt = dns.lookup(srvHost, dns.RecordType.TXT) onerror (err error) {
+			recover []
+		}
+		fail mongoError(ErrorKind.Argument, "{srvHost} has more than one TXT record") when txt.len() > 1
+		if txt.len() == 1 {
+			let text = txt[0].text.join("")
+			for let pair in text.split("&") {
+				continue when pair == ""
+				let eq = pair.indexOf("=")
+				fail mongoError(ErrorKind.Argument, "the TXT record option \"{pair}\" has no \"=\"") when eq < 0
+				let key = pair.slice(0, eq).lower()
+				let value = pair.slice(eq + 1, pair.len())
+				switch key {
+					case "authsource":
+						s.authSource = value unless s.given.includes(key)
+					case "replicaset":
+						s.replicaSet = value unless s.given.includes(key)
+					case "loadbalanced":
+						s.loadBalanced = value == "true" unless s.given.includes(key)
+					default:
+						fail mongoError(ErrorKind.Argument, "a TXT record may set only authSource, replicaSet and loadBalanced, not {key}")
+				}
+			}
+		}
+		try validateSettings(s, s.given)
+		return none
+	}
+
+	// Rescans the SRV records of a `mongodb+srv` client while the
+	// deployment is sharded (Polling SRV Records spec): new mongos hosts
+	// join, gone ones leave.
+	internal type SrvPoller {
+		weak client      ?Client
+		internal stopped bool    = false
+
+		def new(client Client) {
+			self.client = client
+		}
+
+		def start() {
+			let _ = async self.run()
+		}
+
+		atomic def stop() {
+			stopped = true
+		}
+
+		atomic def isStopped() bool {
+			return stopped
+		}
+
+		def run() {
+			let interval = 60s
+			for !isStopped() {
+				time.sleep(interval)
+				let owner = client
+				return when owner is none || isStopped()
+				let s = owner.settings
+				interval = s.heartbeatFrequency
+				let kind = owner.cluster.description().kind
+				continue unless kind := TopologyType.Sharded || TopologyType.Unknown
+				let (hosts, ttl) = srvHosts(s, s.hosts.len() > 0 ?? (s.srvName, ""), false) onerror (err error) {
+					recover ([], 0)
+				}
+				continue when hosts.len() == 0
+				interval = ttl > 60 ?? (duration(int64(ttl) * 1000000000), 60s)
+				owner.cluster.replaceSeeds(hosts.mapElem(h => addressOf(h)), s.srvMaxHosts)
+			}
+		}
+	}
+}
