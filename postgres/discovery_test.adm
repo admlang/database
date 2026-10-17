@@ -1,0 +1,29 @@
+partial module adm.database.postgres {
+	use (
+		std.services.ipc::(Discovery)
+		std.testing
+		std.time
+	)
+
+	check "IPC discovery" {
+		@test()
+		def TestNodesAnnounceWithdrawAndExpire() !none {
+			return none when testServer == ""
+			let conn = try open(serverURL())
+			try conn.exec("DROP TABLE IF EXISTS adm_ipc_nodes")
+			let nodes = new IPCNodes(conn, "shop", ttl = 1s)
+			let discovery Discovery = nodes
+			assert (try discovery.nodes()).len() == 0
+			try discovery.announce("10.0.0.2:7400")
+			try discovery.announce("10.0.0.1:7400")
+			try discovery.announce("10.0.0.1:7400")
+			assert (try discovery.nodes()).equals(["10.0.0.1:7400", "10.0.0.2:7400"])
+			assert (try new IPCNodes(conn, "other").nodes()).len() == 0
+			try discovery.withdraw("10.0.0.1:7400")
+			assert (try discovery.nodes()).equals(["10.0.0.2:7400"])
+			time.sleep(1500ms)
+			assert (try discovery.nodes()).len() == 0
+			try conn.close()
+		}
+	}
+}

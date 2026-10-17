@@ -1,0 +1,60 @@
+partial module adm.database.postgres {
+	use std.data.db
+
+	// The nodes of an IPC cluster recorded in PostgreSQL (std.services.ipc's
+	// `Discovery`): a row per node in table `adm_ipc_nodes`, made on the
+	// first announcement, with the time the node last renewed it. Readers
+	// skip rows older than `ttl`, so a node that stops without a word drops
+	// out by itself; rows older than ten `ttl`s are deleted by the next
+	// announcement. Hand it to `Cluster.discovery`.
+	//
+	// Example:
+	// ```example
+	// let store = try postgres.open("postgres://app:secret@db.internal/shop")
+	// try IPC.join(Cluster{name: "orders", advertise: address, discovery: new postgres.IPCNodes(store, "orders")})
+	// ```
+	type IPCNodes {
+		conn    db.Queryable
+		cluster string
+		ttl     duration     = 30s
+
+		internal ready bool = false
+
+		def new(conn db.Queryable, cluster string, ttl duration = 30s) {
+			self.conn = conn
+			self.cluster = cluster
+			self.ttl = ttl
+		}
+
+		// Records the node at `address`, now. Fails as the statements do.
+		def announce(address string) !none {
+			if !ready {
+				try conn.exec("CREATE TABLE IF NOT EXISTS adm_ipc_nodes (cluster text NOT NULL, address text NOT NULL, seen timestamptz NOT NULL, PRIMARY KEY (cluster, address))")
+				ready = true
+			}
+			try conn.exec("INSERT INTO adm_ipc_nodes (cluster, address, seen) VALUES ($1, $2, now()) ON CONFLICT (cluster, address) DO UPDATE SET seen = now()", cluster, address)
+			try conn.exec("DELETE FROM adm_ipc_nodes WHERE cluster = $1 AND seen < now() - make_interval(secs => $2)", cluster, ttl.seconds() * 10.0)
+			return none
+		}
+
+		// The addresses of the nodes renewed within `ttl`. A store with no
+		// table yet records none. Fails as the query does.
+		def nodes() !string[] {
+			let rows = conn.query("SELECT address FROM adm_ipc_nodes WHERE cluster = $1 AND seen >= now() - make_interval(secs => $2) ORDER BY address", cluster, ttl.seconds()) onerror (err error) {
+				return [] when err is db.DbError && err.sqlState == "42P01"
+				fail err
+			}
+			let found string[] = []
+			for try rows.next() {
+				found.push(try rows.string(0))
+			}
+			return found
+		}
+
+		// Takes the node at `address` out. Fails as the statement does.
+		def withdraw(address string) !none {
+			try conn.exec("DELETE FROM adm_ipc_nodes WHERE cluster = $1 AND address = $2", cluster, address)
+			return none
+		}
+	}
+}

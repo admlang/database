@@ -89,6 +89,18 @@ server's text; `bytes` decodes `bytea` and gives the text bytes of anything else
 `Column.typeName` is the type's name for the builtin types above and `oid N` otherwise;
 `Column.nullable` is always true (a result does not say).
 
+## IPC cluster discovery
+
+`IPCNodes(conn, cluster, ttl = 30s)` records the nodes of an IPC cluster (`std.services.ipc`'s
+`Discovery`) in table `adm_ipc_nodes` (made on the first announcement): a row per node with the
+time it last announced itself. Readers skip rows older than `ttl`; rows older than ten `ttl`s are
+deleted by the next announcement.
+
+```adm
+let store = try postgres.open("postgres://app:secret@db.internal/shop")
+try IPC.join(Cluster{name: "orders", advertise: address, discovery: new postgres.IPCNodes(store, "orders")})
+```
+
 ## Errors
 
 `DbError.sqlState` is the server's SQLSTATE; `native` is 0.
