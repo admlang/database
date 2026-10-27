@@ -1,0 +1,393 @@
+partial module adm.database.elasticsearch {
+	use (
+		std.data.encoding
+		std.net.http
+		std.net.url
+		std.reflection
+		adm.database.elasticsearch.wire::*
+	)
+
+	// field sets how a field of a struct is mapped by `Indices.createFor`
+	// and `Indices.mappingFor`, instead of what its type says.
+	//
+	//     kind        the mapping type: `keyword`, `text`, `date`,
+	//                 `dense_vector`, `geo_point`, ...
+	//     analyzer    the analyzer of a text field
+	//     index       false keeps the field out of the index: stored, not
+	//                 searchable
+	//     dims        the dimensions of a `dense_vector` (a float[] with dims
+	//                 is one)
+	//     similarity  a dense vector's: `cosine`, `dot_product`, `l2_norm`
+	//     nested      map an array of objects as `nested`, each object
+	//                 searched on its own
+	//     format      the date formats of a date field
+	meta def field(ctx reflection.FieldMetaContext, kind string = "", analyzer string = "", index bool = true, dims int = 0, similarity string = "", nested bool = false, format string = "") {}
+
+	// RolloverResult is what `Indices.rollover` did.
+	struct RolloverResult {
+		@json("old_index")
+		oldIndex string
+		@json("new_index")
+		newIndex string
+		@json("rolled_over")
+		rolledOver bool
+		@json("dry_run")
+		dryRun bool
+		// Which conditions were met, by condition (`[max_docs: 1000]`).
+		conditions map<string, bool>
+	}
+
+	// ReindexResult is what `Indices.reindex` did.
+	struct ReindexResult {
+		took     int
+		total    int
+		created  int
+		updated  int
+		deleted  int
+		// Items that failed; `failures` holds them as the server reports them.
+		failures map<string, any>[]
+	}
+
+	// Indices manages the indices, aliases and templates of a cluster
+	// (`client.indices`).
+	//
+	// Calls fail as the Client's do: ErrorKind.NotFound for an index, alias
+	// or template that is not there, ErrorKind.Conflict for one that
+	// already is.
+	type Indices {
+		internal shared Shared
+
+		def new(shared Shared) {
+			self.shared = shared
+		}
+
+		// create makes an index with its settings (`{"number_of_shards": 1}`),
+		// mappings (`{"properties": {...}}`) and aliases.
+		// Fails as the type says.
+		def create(name string, settings map<string, any> = {}, mappings map<string, any> = {}, aliases map<string, any> = {}) !none {
+			let body = new map<string, any>()
+			body.set("settings", settings) when settings.len() > 0
+			body.set("mappings", mappings) when mappings.len() > 0
+			body.set("aliases", aliases) when aliases.len() > 0
+			try (try shared.wire()).json(http.Method.PUT, "/{url.pathEscape(name)}", body = body)
+			return none
+		}
+
+		// createFor makes an index whose mappings come from T's fields (see
+		// `mappingFor`).
+		// Fails as `create` does.
+		def createFor<T>(name string, settings map<string, any> = {}, aliases map<string, any> = {}) !none {
+			let mappings = mappingFor<T>()
+			let properties = mappings.get("properties")
+			let asked = settings
+			if shared.openSearch() && properties is map<string, any> && needsKnn(properties) && !settings.hasKey("index.knn") {
+				asked = new map<string, any>()
+				for let (key, value) in settings {
+					asked.set(key, value)
+				}
+				asked.set("index.knn", true)
+			}
+			return try create(name, asked, mappings, aliases)
+		}
+
+		// mappingFor returns the mappings T's fields make: a string is text
+		// with a `keyword` sub-field, an integer a long, a float a double, a
+		// bool a boolean, an enum a keyword, a `time.Time` a date, a struct an
+		// object of its own fields, an array its elements' mapping, a map an
+		// object; `@json` names them, `@elasticsearch.field` sets the rest.
+		// A vector field is OpenSearch's `knn_vector` once the client is
+		// connected to OpenSearch, else `dense_vector`.
+		def mappingFor<T>() map<string, any> {
+			return map<string, any>{"properties": propertiesOf(new T(), 0, shared.openSearch())}
+		}
+
+		// exists says whether an index (or alias) is there.
+		// Fails as the type says.
+		def exists(name string) !bool {
+			let link = try shared.wire()
+			let missing = false
+			let res = link.send(http.Method.HEAD, "/{url.pathEscape(name)}", none, none, "") onerror (err error) {
+				fail err unless err is ElasticError && err.status == 404
+				missing = true
+				recover new http.Response()
+			}
+			res.close() onerror recover none
+			return !missing
+		}
+
+		// get returns an index's settings, mappings and aliases as the server
+		// writes them, by index.
+		// Fails as the type says.
+		def get(name string) !map<string, any> {
+			return try parsed(http.Method.GET, "/{url.pathEscape(name)}")
+		}
+
+		// delete removes indices (a pattern names several).
+		// Fails as the type says.
+		def delete(name string) !none {
+			try (try shared.wire()).json(http.Method.DELETE, "/{url.pathEscape(name)}")
+			return none
+		}
+
+		// open opens a closed index.
+		// Fails as the type says.
+		def open(name string) !none {
+			try (try shared.wire()).json(http.Method.POST, "/{url.pathEscape(name)}/_open")
+			return none
+		}
+
+		// close closes an index: it keeps its data and takes no reads or
+		// writes.
+		// Fails as the type says.
+		def close(name string) !none {
+			try (try shared.wire()).json(http.Method.POST, "/{url.pathEscape(name)}/_close")
+			return none
+		}
+
+		// refresh makes every write so far visible to searches, in an index
+		// or all of them.
+		// Fails as the type says.
+		def refresh(name string = "") !none {
+			try (try shared.wire()).json(http.Method.POST, name == "" ?? ("/_refresh", "/{url.pathEscape(name)}/_refresh"))
+			return none
+		}
+
+		// putMapping adds fields to an index's mappings.
+		// Fails as the type says, with ErrorKind.Argument for a change of a
+		// field's type.
+		def putMapping(name string, mappings map<string, any>) !none {
+			try (try shared.wire()).json(http.Method.PUT, "/{url.pathEscape(name)}/_mapping", body = mappings)
+			return none
+		}
+
+		// mapping returns an index's mappings, by index.
+		// Fails as the type says.
+		def mapping(name string) !map<string, any> {
+			return try parsed(http.Method.GET, "/{url.pathEscape(name)}/_mapping")
+		}
+
+		// putSettings changes settings of an index that may change while it is
+		// open (`{"index": {"number_of_replicas": 2}}`).
+		// Fails as the type says.
+		def putSettings(name string, settings map<string, any>) !none {
+			try (try shared.wire()).json(http.Method.PUT, "/{url.pathEscape(name)}/_settings", body = settings)
+			return none
+		}
+
+		// settings returns an index's settings, by index.
+		// Fails as the type says.
+		def settings(name string) !map<string, any> {
+			return try parsed(http.Method.GET, "/{url.pathEscape(name)}/_settings")
+		}
+
+		// addAlias names an index by an alias too, the documents `filter`
+		// matches only when given; `isWriteIndex` makes it the index writes
+		// to the alias go to.
+		// Fails as the type says.
+		def addAlias(index string, alias string, filter ?Query = none, isWriteIndex bool = false) !none {
+			let action = new map<string, any>()
+			action.set("index", index)
+			action.set("alias", alias)
+			action.set("filter", filter.dsl(shared.openSearch())) unless filter is none
+			action.set("is_write_index", true) when isWriteIndex
+			try (try shared.wire()).json(http.Method.POST, "/_aliases", body = {"actions": [{"add": action}]})
+			return none
+		}
+
+		// removeAlias stops naming an index by an alias.
+		// Fails as the type says.
+		def removeAlias(index string, alias string) !none {
+			try (try shared.wire()).json(http.Method.POST, "/_aliases", body = {"actions": [{"remove": {"index": index, "alias": alias}}]})
+			return none
+		}
+
+		// aliases returns the aliases of each index (those of `index`, or of
+		// all).
+		// Fails as the type says.
+		def aliases(index string = "") !map<string, string[]> {
+			let all = try parsed(http.Method.GET, index == "" ?? ("/_alias", "/{url.pathEscape(index)}/_alias"))
+			let out = new map<string, string[]>()
+			for let (name, entry) in all {
+				let names string[] = []
+				if entry is map<string, any> {
+					let held = entry.get("aliases")
+					names = held.keys() when held is map<string, any>
+				}
+				out.set(name, names)
+			}
+			return out
+		}
+
+		// rollover points an alias's writes at a new index when the current
+		// one is older than `maxAge` (`7d`), holds more than `maxDocs`, or is
+		// larger than `maxSize` (`50gb`); without conditions it rolls over at
+		// once. The new index is named after the old (`logs-000002`) unless
+		// `newIndex` names it.
+		// Fails as the type says.
+		def rollover(alias string, maxAge string = "", maxDocs int = 0, maxSize string = "", newIndex string = "", dryRun bool = false) !RolloverResult {
+			let conditions = new map<string, any>()
+			conditions.set("max_age", maxAge) unless maxAge == ""
+			conditions.set("max_docs", maxDocs) when maxDocs > 0
+			conditions.set("max_size", maxSize) unless maxSize == ""
+			let body = new map<string, any>()
+			body.set("conditions", conditions) when conditions.len() > 0
+			let query = new url.Values()
+			query.set("dry_run", "true") when dryRun
+			let target = newIndex == "" ?? ("/{url.pathEscape(alias)}/_rollover", "/{url.pathEscape(alias)}/_rollover/{url.pathEscape(newIndex)}")
+			let out = RolloverResult{}
+			try (try shared.wire()).json(http.Method.POST, target, query, body = body, target = out)
+			return out
+		}
+
+		// putTemplate makes an index template: indices whose names match
+		// `patterns` start with its settings, mappings and aliases, after
+		// those of the component templates it is `composedOf`; the template
+		// of the highest `priority` applies. `dataStream` makes matching names
+		// data streams.
+		// Fails as the type says.
+		def putTemplate(name string, patterns string[], settings map<string, any> = {}, mappings map<string, any> = {}, aliases map<string, any> = {}, composedOf string[] = [], priority int = 0, dataStream bool = false) !none {
+			let body = new map<string, any>()
+			body.set("index_patterns", patterns)
+			body.set("template", templateBody(settings, mappings, aliases))
+			body.set("composed_of", composedOf) when composedOf.len() > 0
+			body.set("priority", priority) when priority > 0
+			body.set("data_stream", new map<string, any>()) when dataStream
+			try (try shared.wire()).json(http.Method.PUT, "/_index_template/{url.pathEscape(name)}", body = body)
+			return none
+		}
+
+		// template returns an index template as the server writes it.
+		// Fails as the type says.
+		def template(name string) !map<string, any> {
+			return try parsed(http.Method.GET, "/_index_template/{url.pathEscape(name)}")
+		}
+
+		// deleteTemplate removes an index template.
+		// Fails as the type says.
+		def deleteTemplate(name string) !none {
+			try (try shared.wire()).json(http.Method.DELETE, "/_index_template/{url.pathEscape(name)}")
+			return none
+		}
+
+		// putComponentTemplate makes a component template, settings, mappings
+		// and aliases index templates are composed of.
+		// Fails as the type says.
+		def putComponentTemplate(name string, settings map<string, any> = {}, mappings map<string, any> = {}, aliases map<string, any> = {}) !none {
+			try (try shared.wire()).json(http.Method.PUT, "/_component_template/{url.pathEscape(name)}", body = {"template": templateBody(settings, mappings, aliases)})
+			return none
+		}
+
+		// deleteComponentTemplate removes a component template.
+		// Fails as the type says.
+		def deleteComponentTemplate(name string) !none {
+			try (try shared.wire()).json(http.Method.DELETE, "/_component_template/{url.pathEscape(name)}")
+			return none
+		}
+
+		// reindex copies the documents of `source` (those `query` matches
+		// when given) into `dest`, and returns what it did once done.
+		// Fails as the type says.
+		def reindex(source string, dest string, query ?Query = none, refresh bool = false) !ReindexResult {
+			let from = new map<string, any>()
+			from.set("index", source)
+			from.set("query", query.dsl(shared.openSearch())) unless query is none
+			let params = new url.Values()
+			params.set("refresh", "true") when refresh
+			let out = ReindexResult{}
+			try (try shared.wire()).json(http.Method.POST, "/_reindex", params, body = {"source": from, "dest": {"index": dest}}, target = out)
+			return out
+		}
+
+		// putSearchTemplate stores a search template (Mustache) under an id,
+		// for `Index.searchTemplate`.
+		// Fails as the type says, with ErrorKind.Argument for a template that
+		// does not compile.
+		def putSearchTemplate(id string, source string) !none {
+			try (try shared.wire()).json(http.Method.PUT, "/_scripts/{url.pathEscape(id)}", body = {"script": {"lang": "mustache", "source": source}})
+			return none
+		}
+
+		// deleteSearchTemplate removes a stored search template.
+		// Fails as the type says.
+		def deleteSearchTemplate(id string) !none {
+			try (try shared.wire()).json(http.Method.DELETE, "/_scripts/{url.pathEscape(id)}")
+			return none
+		}
+
+		// ---- internals ----
+
+		internal def parsed(method http.Method, path string) !map<string, any> {
+			let data = try (try shared.wire()).call(method, path)
+			let value = new encoding.JSON().parse(data) onerror (err error) {
+				fail errorOf(ErrorKind.Protocol, "elasticsearch: {method} {path}: the answer does not read: {err.message}")
+			}
+			return value when value is map<string, any>
+			fail errorOf(ErrorKind.Protocol, "elasticsearch: {method} {path}: the answer is not an object")
+		}
+	}
+
+	// Ingest manages the ingest pipelines of a cluster (`client.ingest`):
+	// processors documents go through before they are indexed.
+	//
+	// Calls fail as the Client's do.
+	type Ingest {
+		internal shared Shared
+
+		def new(shared Shared) {
+			self.shared = shared
+		}
+
+		// putPipeline makes a pipeline of processors as the API writes them:
+		// `{"set": {"field": "seen", "value": "{{_ingest.timestamp}}"}}`.
+		// Fails as the type says, with ErrorKind.Argument for a processor the
+		// cluster does not have.
+		def putPipeline(id string, processors map<string, any>[], description string = "") !none {
+			let body = new map<string, any>()
+			body.set("description", description) unless description == ""
+			body.set("processors", processors)
+			try (try shared.wire()).json(http.Method.PUT, "/_ingest/pipeline/{url.pathEscape(id)}", body = body)
+			return none
+		}
+
+		// pipeline returns a pipeline as the server writes it.
+		// Fails as the type says.
+		def pipeline(id string) !map<string, any> {
+			let data = try (try shared.wire()).call(http.Method.GET, "/_ingest/pipeline/{url.pathEscape(id)}")
+			let value = new encoding.JSON().parse(data) onerror (err error) {
+				fail errorOf(ErrorKind.Protocol, "elasticsearch: the pipeline does not read: {err.message}")
+			}
+			if value is map<string, any> {
+				let one = value.get(id)
+				return one when one is map<string, any>
+			}
+			fail errorOf(ErrorKind.NotFound, "elasticsearch: no pipeline {id}")
+		}
+
+		// deletePipeline removes a pipeline.
+		// Fails as the type says.
+		def deletePipeline(id string) !none {
+			try (try shared.wire()).json(http.Method.DELETE, "/_ingest/pipeline/{url.pathEscape(id)}")
+			return none
+		}
+
+		// simulate runs documents through a pipeline without indexing them
+		// and returns them as the pipeline left them.
+		// Fails as the type says, with ErrorKind.Argument when a processor
+		// fails on a document.
+		def simulate(id string, docs map<string, any>[]) !map<string, any>[] {
+			let wrapped any[] = []
+			for let doc in docs {
+				wrapped.push({"_source": doc})
+			}
+			let reply = SimulateReply{}
+			try (try shared.wire()).json(http.Method.POST, "/_ingest/pipeline/{url.pathEscape(id)}/_simulate", body = {"docs": wrapped}, target = reply)
+			let out map<string, any>[] = []
+			for let each in reply.docs {
+				let problem = each.error
+				fail errorOf(ErrorKind.Argument, "elasticsearch: the pipeline {id} failed on a document: {problem.kind}: {problem.reason}", 400, problem.kind) unless problem is none
+				out.push(each.doc.source)
+			}
+			return out
+		}
+	}
+}

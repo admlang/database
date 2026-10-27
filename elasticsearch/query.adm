@@ -1,0 +1,451 @@
+partial module adm.database.elasticsearch {
+	use (
+		std.data.encoding
+		adm.database.elasticsearch.wire::*
+	)
+
+	// Query is a query of the query DSL. The functions of this module make
+	// one; `and`, `or`, `not` and `filter` combine them.
+	//
+	// ```
+	// let query = elasticsearch.matches("name", "kettle")
+	//     .and(elasticsearch.term("tags", "kitchen"))
+	//     .filter(elasticsearch.range("price", lte = 50))
+	// ```
+	//
+	// `rawQuery` takes any query the functions do not make, as JSON.
+	type Query {
+		// `clause` for a leaf, `bool` for a combination, `knn` for a vector
+		// search.
+		internal kind       string           = "clause"
+		internal clause     map<string, any> = {}
+		internal must       Query[]          = []
+		internal should     Query[]          = []
+		internal mustNot    Query[]          = []
+		internal filters    Query[]          = []
+		internal minimum    int              = 0
+		internal weight     float            = 0.0
+		internal field      string           = ""
+		internal vector     float[]          = []
+		internal k          int              = 0
+		internal candidates int              = 0
+		internal similarity float            = 0.0
+		internal knnFilter  ?Query           = none
+		internal functions  ScoreFunction[]  = []
+		internal scoreMode  string           = ""
+		internal boostMode  string           = ""
+
+		def new() {}
+
+		// and is a query that matches what this one and every other matches;
+		// each adds to the score.
+		def and(others ...Query) Query {
+			let out = plainBool(true) ?? (self, boolOf([self], [], [], [], 0))
+			out.must.push(...others)
+			return out
+		}
+
+		// or is a query that matches what this one or any other matches.
+		def or(others ...Query) Query {
+			if kind == "bool" && must.len() == 0 && mustNot.len() == 0 && filters.len() == 0 && weight == 0.0 && should.len() > 0 {
+				should.push(...others)
+				return self
+			}
+			let out = boolOf([], [self], [], [], 1)
+			out.should.push(...others)
+			return out
+		}
+
+		// not is a query that matches what this one does not.
+		def not() Query {
+			return boolOf([], [], [self], [], 0)
+		}
+
+		// filter keeps what this query matches only when the others match
+		// too, without the others adding to the score; cached by the cluster.
+		def filter(others ...Query) Query {
+			let out = plainBool(false) ?? (self, boolOf([self], [], [], [], 0))
+			out.filters.push(...others)
+			return out
+		}
+
+		// boost multiplies the query's score by `factor`.
+		def boost(factor float) Query {
+			let out = boolOf([self], [], [], [], 0)
+			out.weight = factor
+			return out
+		}
+
+		// The query as Elasticsearch's JSON.
+		def str() string {
+			return string(new encoding.JSON().encode(dsl(false)))
+		}
+
+		// ---- internals ----
+
+		// Whether this is a bool query the combinators may add to: no boost,
+		// and for `and` only `must` clauses so far.
+		internal def plainBool(forAnd bool) bool {
+			return false unless kind == "bool" && weight == 0.0 && should.len() == 0
+			return !forAnd || (mustNot.len() == 0 && filters.len() == 0)
+		}
+
+		// dsl returns the query as the query DSL's JSON: Elasticsearch's, or
+		// OpenSearch's where the two differ (`knn`).
+		def dsl(openSearch bool = false) map<string, any> {
+			match kind {
+				case "bool":
+					let body = new map<string, any>()
+					body.set("must", dslAll(must, openSearch)) when must.len() > 0
+					body.set("should", dslAll(should, openSearch)) when should.len() > 0
+					body.set("must_not", dslAll(mustNot, openSearch)) when mustNot.len() > 0
+					body.set("filter", dslAll(filters, openSearch)) when filters.len() > 0
+					body.set("minimum_should_match", minimum) when minimum > 0
+					body.set("boost", weight) when weight != 0.0
+					return {"bool": body}
+				case "knn":
+					let body = new map<string, any>()
+					let restrict = knnFilter
+					if openSearch {
+						body.set("vector", vector)
+						body.set("k", k)
+						body.set("filter", restrict.dsl(true)) unless restrict is none
+						return {"knn": map<string, any>{field: body}}
+					}
+					body.set("field", field)
+					body.set("query_vector", vector)
+					body.set("k", k)
+					body.set("num_candidates", candidates > 0 ?? (candidates, (k * 10).max(100)))
+					body.set("similarity", similarity) when similarity != 0.0
+					body.set("filter", restrict.dsl(false)) unless restrict is none
+					return {"knn": body}
+				case "nested":
+					let body = new map<string, any>()
+					body.set("path", field)
+					body.set("query", must[0].dsl(openSearch))
+					body.set("score_mode", scoreMode) unless scoreMode == ""
+					return {"nested": body}
+				case "function_score":
+					let body = new map<string, any>()
+					body.set("query", must[0].dsl(openSearch))
+					let bodies any[] = []
+					for let scorer in functions {
+						bodies.push(scorer.dsl(openSearch))
+					}
+					body.set("functions", bodies)
+					body.set("score_mode", scoreMode) unless scoreMode == ""
+					body.set("boost_mode", boostMode) unless boostMode == ""
+					return {"function_score": body}
+				default:
+					return clause
+			}
+		}
+	}
+
+	// The DSL of each query.
+	internal def dslAll(queries Query[], openSearch bool) any[] {
+		let out any[] = []
+		for let query in queries {
+			out.push(query.dsl(openSearch))
+		}
+		return out
+	}
+
+	internal def boolOf(must Query[], should Query[], mustNot Query[], filters Query[], minimum int) Query {
+		let out = new Query()
+		out.kind = "bool"
+		out.must = must
+		out.should = should
+		out.mustNot = mustNot
+		out.filters = filters
+		out.minimum = minimum
+		return out
+	}
+
+	internal def leaf(name string, body any) Query {
+		let out = new Query()
+		out.clause = {name: body}
+		return out
+	}
+
+	// A field's settings: `{field: settings}`.
+	internal def onField(field string, settings map<string, any>) map<string, any> {
+		return {field: settings}
+	}
+
+	// matchAll matches every document, each with the same score.
+	def matchAll() Query {
+		return leaf("match_all", new map<string, any>())
+	}
+
+	// matchNone matches no document.
+	def matchNone() Query {
+		return leaf("match_none", new map<string, any>())
+	}
+
+	// matches finds documents whose analysed text field holds the words of
+	// `text` (any of them; all with `operator = "and"`), scored by how well
+	// they match: the `match` query. `fuzziness` (`AUTO`, `1`) forgives
+	// typing errors; `minimumShouldMatch` (`2`, `75%`) asks for that many
+	// words.
+	def matches(field string, text string, operator string = "", fuzziness string = "", minimumShouldMatch string = "", analyzer string = "") Query {
+		let settings = new map<string, any>()
+		settings.set("query", text)
+		settings.set("operator", operator) unless operator == ""
+		settings.set("fuzziness", fuzziness) unless fuzziness == ""
+		settings.set("minimum_should_match", minimumShouldMatch) unless minimumShouldMatch == ""
+		settings.set("analyzer", analyzer) unless analyzer == ""
+		return leaf("match", onField(field, settings))
+	}
+
+	// matchPhrase finds the words of `text` in that order, up to `slop`
+	// positions apart.
+	def matchPhrase(field string, text string, slop int = 0) Query {
+		let settings = new map<string, any>()
+		settings.set("query", text)
+		settings.set("slop", slop) when slop > 0
+		return leaf("match_phrase", onField(field, settings))
+	}
+
+	// matchPhrasePrefix finds the words of `text` in that order, the last
+	// one as the start of a word: what a search box finds as the user types.
+	def matchPhrasePrefix(field string, text string) Query {
+		return leaf("match_phrase_prefix", onField(field, {"query": text}))
+	}
+
+	// multiMatch finds the words of `text` in several fields (`title^3`
+	// counts title three times). `kind` is `best_fields` (the default),
+	// `most_fields`, `cross_fields`, `phrase`, `phrase_prefix` or
+	// `bool_prefix`.
+	def multiMatch(text string, fields string[], kind string = "", operator string = "") Query {
+		let settings = new map<string, any>()
+		settings.set("query", text)
+		settings.set("fields", fields)
+		settings.set("type", kind) unless kind == ""
+		settings.set("operator", operator) unless operator == ""
+		return leaf("multi_match", settings)
+	}
+
+	// queryString finds documents by Lucene's query syntax: `name:kettle
+	// AND price:[* TO 50]`.
+	def queryString(text string, fields string[] = [], defaultOperator string = "") Query {
+		let settings = new map<string, any>()
+		settings.set("query", text)
+		settings.set("fields", fields) when fields.len() > 0
+		settings.set("default_operator", defaultOperator) unless defaultOperator == ""
+		return leaf("query_string", settings)
+	}
+
+	// simpleQueryString is queryString for what users type: `+kettle
+	// -electric "steel kettle"`, never failing on a syntax error.
+	def simpleQueryString(text string, fields string[] = []) Query {
+		let settings = new map<string, any>()
+		settings.set("query", text)
+		settings.set("fields", fields) when fields.len() > 0
+		return leaf("simple_query_string", settings)
+	}
+
+	// term finds documents whose field holds exactly `value`: for keyword,
+	// number, date and boolean fields, not analysed text.
+	def term(field string, value any) Query {
+		return leaf("term", onField(field, {"value": value}))
+	}
+
+	// terms finds documents whose field holds any of `values` exactly.
+	def terms(field string, values any[]) Query {
+		return leaf("terms", map<string, any>{field: values})
+	}
+
+	// range finds documents whose field lies between bounds: numbers,
+	// dates (`now-7d/d`) or strings. `format` reads date bounds.
+	def range(field string, gte ?any = none, gt ?any = none, lte ?any = none, lt ?any = none, format string = "") Query {
+		let settings = new map<string, any>()
+		settings.set("gte", gte) unless gte is none
+		settings.set("gt", gt) unless gt is none
+		settings.set("lte", lte) unless lte is none
+		settings.set("lt", lt) unless lt is none
+		settings.set("format", format) unless format == ""
+		return leaf("range", onField(field, settings))
+	}
+
+	// exists finds documents that hold a value in the field.
+	def exists(field string) Query {
+		return leaf("exists", {"field": field})
+	}
+
+	// prefix finds documents whose keyword field starts with `value`.
+	def prefix(field string, value string) Query {
+		return leaf("prefix", onField(field, {"value": value}))
+	}
+
+	// wildcard finds documents whose keyword field fits a pattern: `*` any
+	// run, `?` one character.
+	def wildcard(field string, pattern string, caseInsensitive bool = false) Query {
+		let settings = new map<string, any>()
+		settings.set("value", pattern)
+		settings.set("case_insensitive", true) when caseInsensitive
+		return leaf("wildcard", onField(field, settings))
+	}
+
+	// regexp finds documents whose keyword field fits a regular expression
+	// of Lucene's syntax.
+	def regexp(field string, pattern string) Query {
+		return leaf("regexp", onField(field, {"value": pattern}))
+	}
+
+	// fuzzy finds documents whose field holds a term within `fuzziness`
+	// edits of `value`.
+	def fuzzy(field string, value string, fuzziness string = "AUTO") Query {
+		return leaf("fuzzy", onField(field, {"value": value, "fuzziness": fuzziness}))
+	}
+
+	// ids finds the documents with these ids.
+	def ids(values string[]) Query {
+		return leaf("ids", {"values": values})
+	}
+
+	// nested finds documents with an object of the nested field `path`
+	// that matches `query` on its own. `scoreMode` is `avg` (the default),
+	// `max`, `min`, `sum` or `none`.
+	def nested(path string, query Query, scoreMode string = "") Query {
+		let out = new Query()
+		out.kind = "nested"
+		out.must = [query]
+		out.field = path
+		out.scoreMode = scoreMode
+		return out
+	}
+
+	// ScoreFunction changes the scores of a functionScore query.
+	type ScoreFunction {
+		internal body     map<string, any>
+		// The filter's DSL in each family's form; empty for none.
+		internal filterEs map<string, any> = {}
+		internal filterOs map<string, any> = {}
+
+		def new(body map<string, any>) {
+			self.body = body
+		}
+
+		// dsl returns the function as the query DSL's JSON, its filter in
+		// the family's form.
+		def dsl(openSearch bool = false) map<string, any> {
+			let out = new map<string, any>()
+			for let (key, value) in body {
+				out.set(key, value)
+			}
+			let restrict = openSearch ?? (filterOs, filterEs)
+			out.set("filter", restrict) when restrict.len() > 0
+			return out
+		}
+	}
+
+	// fieldValueFactor scores by a numeric field: `factor` times its value
+	// through `modifier` (`log1p`, `sqrt`, ...), `missing` for documents
+	// without one.
+	def fieldValueFactor(field string, factor float = 1.0, modifier string = "", missing ?float = none) ScoreFunction {
+		let settings = new map<string, any>()
+		settings.set("field", field)
+		settings.set("factor", factor)
+		settings.set("modifier", modifier) unless modifier == ""
+		settings.set("missing", missing) unless missing is none
+		return new ScoreFunction(map<string, any>{"field_value_factor": settings})
+	}
+
+	// weightBy multiplies the score of the documents `filter` matches (all
+	// when none) by `weight`.
+	def weightBy(weight float, filter ?Query = none) ScoreFunction {
+		let out = new ScoreFunction(map<string, any>{"weight": weight})
+		if !(filter is none) {
+			out.filterEs = filter.dsl(false)
+			out.filterOs = filter.dsl(true)
+		}
+		return out
+	}
+
+	// randomScore scores documents at random, the same for the same `seed`
+	// and `field`.
+	def randomScore(seed int = 0, field string = "_seq_no") ScoreFunction {
+		let settings = new map<string, any>()
+		if seed != 0 {
+			settings.set("seed", seed)
+			settings.set("field", field)
+		}
+		return new ScoreFunction(map<string, any>{"random_score": settings})
+	}
+
+	// decay scores by how far a field (a number, date or geo point) lies
+	// from `origin`: `gauss`, `exp` or `linear` falling to `decayTo` at
+	// `scale` beyond `offset`.
+	def decay(shape string, field string, origin any, scale string, offset string = "", decayTo float = 0.5) ScoreFunction {
+		let settings = new map<string, any>()
+		settings.set("origin", origin)
+		settings.set("scale", scale)
+		settings.set("offset", offset) unless offset == ""
+		settings.set("decay", decayTo)
+		return new ScoreFunction(map<string, any>{shape: map<string, any>{field: settings}})
+	}
+
+	// scriptScore scores by a Painless script: `_score * doc['likes'].value`.
+	def scriptScore(source string, params map<string, any> = {}) ScoreFunction {
+		let script = new map<string, any>()
+		script.set("source", source)
+		script.set("params", params) when params.len() > 0
+		return new ScoreFunction(map<string, any>{"script_score": map<string, any>{"script": script}})
+	}
+
+	// functionScore scores what `query` finds by functions: `scoreMode`
+	// joins theirs (`multiply`, `sum`, `avg`, `first`, `max`, `min`),
+	// `boostMode` joins the result with the query's (`multiply`, `replace`,
+	// `sum`, ...).
+	def functionScore(query Query, functions ScoreFunction[], scoreMode string = "", boostMode string = "") Query {
+		let out = new Query()
+		out.kind = "function_score"
+		out.must = [query]
+		out.functions = functions
+		out.scoreMode = scoreMode
+		out.boostMode = boostMode
+		return out
+	}
+
+	// knn finds the `k` documents whose dense vector field is nearest
+	// `vector`, among `numCandidates` per shard (0: ten times `k`, at least
+	// 100), those `filter` matches only when given. Elasticsearch writes
+	// it as its `knn` query, OpenSearch as the k-NN plugin's.
+	def knn(field string, vector float[], k int, numCandidates int = 0, filter ?Query = none, similarity float = 0.0) Query {
+		let out = new Query()
+		out.kind = "knn"
+		out.field = field
+		out.vector = vector
+		out.k = k
+		out.candidates = numCandidates
+		out.knnFilter = filter
+		out.similarity = similarity
+		return out
+	}
+
+	// rawQuery is a query written as JSON, for one the functions do not
+	// make: `{"geo_distance": {"distance": "10km", "pin": [13.4, 52.5]}}`.
+	// Fails with ErrorKind.Argument when the text is not a JSON object.
+	def rawQuery(json string) !Query {
+		let parsed = new encoding.JSON().parse(json) onerror (err error) {
+			fail errorOf(ErrorKind.Argument, "elasticsearch: the raw query is not JSON: {err.message}")
+		}
+		let out = new Query()
+		match parsed {
+			case map<string, any>:
+				out.clause = parsed
+			default:
+				fail errorOf(ErrorKind.Argument, "elasticsearch: the raw query is not a JSON object")
+		}
+		return out
+	}
+
+	// boolQuery combines queries as the `bool` query does: every `must`
+	// matches and scores, at least `minimumShouldMatch` of `should` match
+	// (none needed when there are `must` or `filter` clauses), no `mustNot`
+	// matches, every `filter` matches without scoring.
+	def boolQuery(must Query[] = [], should Query[] = [], mustNot Query[] = [], filter Query[] = [], minimumShouldMatch int = 0) Query {
+		return boolOf(must, should, mustNot, filter, minimumShouldMatch)
+	}
+}

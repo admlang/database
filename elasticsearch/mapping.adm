@@ -1,0 +1,152 @@
+// Mappings made from a struct's fields, and the small bodies index
+// management sends.
+internal partial module adm.database.elasticsearch.wire {
+	use (
+		std.data.encoding
+		adm.database.elasticsearch.aggs::(Bucket)
+		std.reflection
+		std.reflection::(FieldKind)
+		adm.database.elasticsearch::*
+	)
+
+	const fieldAttr = "adm.database.elasticsearch.field"
+
+	// Whether mappings hold an OpenSearch vector field, which needs the
+	// index's `index.knn` setting.
+	def needsKnn(properties map<string, any>) bool {
+		for let (_, value) in properties {
+			if value is map<string, any> {
+				let kind = value.get("type")
+				return true when kind is string && kind == "knn_vector"
+				let inner = value.get("properties")
+				return true when inner is map<string, any> && needsKnn(inner)
+			}
+		}
+		return false
+	}
+	const jsonAttr = "std.data.encoding.json"
+
+	// The `properties` of a value's fields; `depth` stops a type that holds
+	// itself.
+	def propertiesOf(sample any, depth int, openSearch bool) map<string, any> {
+		let out = new map<string, any>()
+		return out when depth > 16
+		for let f in reflection.fields(sample) {
+			continue when f.attr(jsonAttr, "ignore") == "true"
+			let name = f.attr(jsonAttr, "name")
+			name = f.name when name == ""
+			out.set(name, fieldMapping(f, depth, openSearch))
+		}
+		return out
+	}
+
+	// One field's mapping.
+	def fieldMapping(f reflection.Field, depth int, openSearch bool) map<string, any> {
+		let out = new map<string, any>()
+		let kind = f.attr(fieldAttr, "kind")
+		let dims = f.attr(fieldAttr, "dims")
+		let nested = f.attr(fieldAttr, "nested") == "true"
+		let held = f.kind
+		held = f.elemKind when held := FieldKind.Optional || FieldKind.Array
+		let typeName = f.typeName
+		if kind == "" {
+			if dims != "" && dims != "0" {
+				kind = "dense_vector"
+			} else if typeName.contains("std.time.Time") {
+				kind = "date"
+			} else {
+				match held {
+					case FieldKind.String:
+						kind = "text"
+					case FieldKind.Int, FieldKind.Uint:
+						kind = "long"
+					case FieldKind.Float:
+						kind = "double"
+					case FieldKind.Bool:
+						kind = "boolean"
+					case FieldKind.Enum:
+						kind = "keyword"
+					case FieldKind.Struct:
+						kind = nested ?? ("nested", "object")
+					default:
+						kind = "object"
+				}
+			}
+		}
+		// OpenSearch's k-NN plugin names a dense vector its own way.
+		let vector = kind := "dense_vector" || "knn_vector"
+		kind = openSearch ?? ("knn_vector", "dense_vector") when vector
+		out.set("type", kind)
+		out.set("fields", {"keyword": {"type": "keyword", "ignore_above": 256}}) when kind == "text" && f.attr(fieldAttr, "kind") == ""
+		let analyzer = f.attr(fieldAttr, "analyzer")
+		out.set("analyzer", analyzer) unless analyzer == ""
+		out.set("index", false) when f.attr(fieldAttr, "index") == "false"
+		out.set(openSearch ?? ("dimension", "dims"), dims.toInt<int>(10)) when vector && /^[0-9]{1,6}$/.test(dims)
+		let similarity = f.attr(fieldAttr, "similarity")
+		if similarity != "" {
+			if openSearch && vector {
+				// The k-NN plugin's space types for the same measures.
+				let space = similarity
+				space = "cosinesimil" when similarity == "cosine"
+				space = "innerproduct" when similarity == "dot_product"
+				space = "l2" when similarity == "l2_norm"
+				out.set("method", map<string, any>{"name": "hnsw", "engine": "lucene", "space_type": space})
+			} else {
+				out.set("similarity", similarity)
+			}
+		}
+		let format = f.attr(fieldAttr, "format")
+		out.set("format", format) unless format == ""
+		if (kind == "object" || kind == "nested") && held == FieldKind.Struct {
+			let sample = structSample(f)
+			out.set("properties", propertiesOf(sample, depth + 1, openSearch)) unless sample is none
+		}
+		return out
+	}
+
+	// A value of a struct field's type (or its elements'), to read its
+	// fields from.
+	def structSample(f reflection.Field) ?any {
+		if f.kind == FieldKind.Array {
+			return none unless f.setLen(1)
+			return f.at(0).ensureValue()
+		}
+		return f.ensureValue()
+	}
+
+	def templateBody(settings map<string, any>, mappings map<string, any>, aliases map<string, any>) map<string, any> {
+		let out = new map<string, any>()
+		out.set("settings", settings) when settings.len() > 0
+		out.set("mappings", mappings) when mappings.len() > 0
+		out.set("aliases", aliases) when aliases.len() > 0
+		return out
+	}
+
+	struct SimulateReply {
+		docs SimulatedDoc[]
+	}
+
+	struct SimulatedDoc {
+		doc   SimulatedSource
+		error ?ErrorBody
+	}
+
+	struct SimulatedSource {
+		@json("_source")
+		source map<string, any>
+	}
+
+	// The ranges of a `range` or `dateRange` aggregation as the API takes
+	// them.
+	def rangesOf(ranges Bucket[]) any[] {
+		let out any[] = []
+		for let each in ranges {
+			let item = new map<string, any>()
+			item.set("from", each.from) unless each.from is none
+			item.set("to", each.to) unless each.to is none
+			item.set("key", each.key) unless each.key == ""
+			out.push(item)
+		}
+		return out
+	}
+}

@@ -1,0 +1,166 @@
+partial module adm.database.elasticsearch {
+	use (
+		adm.database.elasticsearch.wire::*
+	)
+
+	// SearchOptions is everything a search takes besides its query.
+	struct SearchOptions {
+		query            ?Query                   = none
+		// How many hits to return, and how many to skip first.
+		size             int                      = 10
+		from             int                      = 0
+		sort             Sort[]                   = []
+		// The source fields to return (all when empty) and to leave out;
+		// `noSource` returns none.
+		includes         string[]                 = []
+		excludes         string[]                 = []
+		noSource         bool                     = false
+		highlight        ?Highlight               = none
+		aggregations     map<string, Aggregation> = {}
+		// A query applied after the aggregations: what a facet's selection
+		// narrows to without narrowing the facets.
+		postFilter       ?Query                   = none
+		// The sort values of the last hit of the page before, from `Hit.sort`.
+		searchAfter      any[]                    = []
+		// Search a point in time instead of the indices as they are now.
+		pointInTime      ?PointInTime             = none
+		// Count every hit (the server stops at 10 000 otherwise).
+		exactTotal       bool                     = false
+		minScore         ?float                   = none
+		// Return what the shards found within this time.
+		timeout          ?duration                = none
+		routing          string                   = ""
+		// One hit per value of this field: the best of each.
+		collapse         string                   = ""
+		suggest          map<string, Suggester>   = {}
+		// Return each hit's sequence number and primary term, for a write
+		// conditioned on them.
+		seqNoPrimaryTerm bool                     = false
+	}
+
+	// Sort is one sort key: a field, or `_score`, `_doc`; `desc` for
+	// descending; `missing` puts documents without a value `_first` or
+	// `_last`.
+	struct Sort {
+		field   string
+		desc    bool   = false
+		missing string = ""
+	}
+
+	// Highlight asks for the passages of fields that matched, the matches
+	// between `preTag` and `postTag` (`<em>` and `</em>` by default).
+	struct Highlight {
+		fields            string[]
+		preTag            string   = ""
+		postTag           string   = ""
+		fragmentSize      int      = 0
+		numberOfFragments int      = 0
+	}
+
+	// SuggesterKind is what a Suggester proposes.
+	enum SuggesterKind {
+		// Each word's nearest terms.
+		Term       = "term",
+		// Whole phrases.
+		Phrase     = "phrase",
+		// Completions of a prefix, from a `completion` field.
+		Completion = "completion",
+	}
+
+	// Suggester proposes corrections or completions of `text` from a field.
+	struct Suggester {
+		kind  SuggesterKind = SuggesterKind.Term
+		field string
+		text  string
+		size  int           = 5
+	}
+
+	// Suggestion is what a suggester proposed for one word (one phrase, one
+	// prefix) of its text.
+	struct Suggestion {
+		text    string
+		offset  int
+		length  int
+		options SuggestionOption[]
+	}
+
+	// SuggestionOption is one proposal: its text, score and how often the
+	// term occurs.
+	struct SuggestionOption {
+		text  string
+		score float
+		freq  int
+	}
+
+	// Hit is one document a search found.
+	type Hit<T> {
+		id          string
+		index       string
+		// None when the search sorted by something else than the score.
+		score       ?float
+		source      T
+		// The hit's sort values, for `SearchOptions.searchAfter`.
+		sort        any[]
+		// The passages that matched, by field.
+		highlight   map<string, string[]>
+		seqNo       int
+		primaryTerm int
+
+		def new() {
+			source = new T()
+		}
+	}
+
+	// SearchResult is what a search found. Iterating it goes through its
+	// hits.
+	//
+	// ```
+	// for let hit in try products.search(query, size = 20) {
+	//     print("{hit.source.name} {hit.score}")
+	// }
+	// ```
+	type SearchResult<T> {
+		took              int
+		timedOut          bool
+		// How many documents match; a lower bound when `totalIsLowerBound`.
+		total             int
+		totalIsLowerBound bool
+		maxScore          ?float
+		hits              Hit<T>[]
+		aggregations      map<string, AggregationResult>
+		suggestions       map<string, Suggestion[]>
+		// The id to page on with: a scroll's, or the point in time's after
+		// the search.
+		scrollId          string
+		pointInTimeId     string
+		internal at       int
+
+		def new() {}
+
+		// The result of an aggregation by name; an empty one when there is
+		// none.
+		def aggregation(name string) AggregationResult {
+			let found = aggregations.get(name)
+			return found is none ?? (new AggregationResult(), found)
+		}
+
+		// The sources of the hits.
+		def sources() T[] {
+			let out T[] = []
+			for let hit in hits {
+				out.push(hit.source)
+			}
+			return out
+		}
+
+		// Implements Iterator<Hit<T>>.
+		def iterate() ?Hit<T> {
+			if at >= hits.len() {
+				at = 0
+				return none
+			}
+			at++
+			return hits[at - 1]
+		}
+	}
+}

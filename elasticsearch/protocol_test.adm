@@ -1,0 +1,380 @@
+// The protocol suite: the query DSL, aggregations and their results,
+// request bodies, addresses and credentials, mappings, bulk lines, and a
+// loopback server that answers as a cluster does. No cluster needed.
+partial module adm.database.elasticsearch {
+	use (
+		std.data.encoding
+		std.data.encoding::(base64encode)
+		std.net.http
+		std.net.http.httptest
+		std.testing
+		std.time
+		adm.database.elasticsearch.aggs
+		adm.database.elasticsearch.wire::*
+	)
+
+	internal struct Shelf {
+		name string
+		@field(kind = "keyword")
+		code string
+		count int
+		price float
+		open bool
+		added time.Time
+		@json("tag_list")
+		tags string[]
+		@field(dims = 3, similarity = "cosine")
+		vector float[]
+		place Place
+		@field(nested = true)
+		items Place[]
+		@json(ignore = true)
+		secret string
+	}
+
+	internal struct Place {
+		city string
+		zip  int
+	}
+
+	internal def text(value any) string {
+		return string(new encoding.JSON().encode(value))
+	}
+
+	// The number, or -1 when there is none.
+	internal def num(value ?float) float {
+		return -1.0 when value is none
+		return value
+	}
+
+	internal def kindOf(err error) ErrorKind {
+		return err.kind when err is ElasticError
+		return ErrorKind.Server
+	}
+
+	check "Query DSL" {
+		@test()
+		def TestLeaves() {
+			assert matches("name", "kettle").str() == `{"match":{"name":{"query":"kettle"}}}`
+			assert matches("name", "steel kettle", operator = "and", fuzziness = "AUTO").str() == `{"match":{"name":{"query":"steel kettle","operator":"and","fuzziness":"AUTO"}}}`
+			assert term("tags", "kitchen").str() == `{"term":{"tags":{"value":"kitchen"}}}`
+			assert terms("tags", ["a", "b"]).str() == `{"terms":{"tags":["a","b"]}}`
+			assert range("price", gte = 10, lt = 50.5).str() == `{"range":{"price":{"gte":10,"lt":50.5}}}`
+			assert exists("name").str() == `{"exists":{"field":"name"}}`
+			assert matchAll().str() == `{"match_all":{}}`
+			assert multiMatch("kettle", ["name^3", "notes"], kind = "most_fields").str() == `{"multi_match":{"query":"kettle","fields":["name^3","notes"],"type":"most_fields"}}`
+			assert wildcard("code", "K*", caseInsensitive = true).str() == `{"wildcard":{"code":{"value":"K*","case_insensitive":true}}}`
+			assert ids(["1", "2"]).str() == `{"ids":{"values":["1","2"]}}`
+			assert matchPhrase("name", "steel kettle", slop = 2).str() == `{"match_phrase":{"name":{"query":"steel kettle","slop":2}}}`
+			assert matchPhrasePrefix("name", "steel ke").str() == `{"match_phrase_prefix":{"name":{"query":"steel ke"}}}`
+			assert simpleQueryString("+kettle -glass", ["name"]).str() == `{"simple_query_string":{"query":"+kettle -glass","fields":["name"]}}`
+			assert regexp("code", "C-[0-9]+").str() == `{"regexp":{"code":{"value":"C-[0-9]+"}}}`
+			assert boolQuery(must = [term("a", 1)], mustNot = [term("b", 2)], minimumShouldMatch = 1).str() == `{"bool":{"must":[{"term":{"a":{"value":1}}}],"must_not":[{"term":{"b":{"value":2}}}],"minimum_should_match":1}}`
+		}
+
+		@test()
+		def TestCombinations() !none {
+			let both = matches("name", "kettle").and(term("tags", "kitchen"))
+			assert both.str() == `{"bool":{"must":[{"match":{"name":{"query":"kettle"}}},{"term":{"tags":{"value":"kitchen"}}}]}}`
+			// A third `and` joins the same list.
+			assert both.and(exists("price")).str().contains(`{"exists":{"field":"price"}}]}}`)
+			let either = term("a", 1).or(term("b", 2)).or(term("c", 3))
+			assert either.str() == `{"bool":{"should":[{"term":{"a":{"value":1}}},{"term":{"b":{"value":2}}},{"term":{"c":{"value":3}}}],"minimum_should_match":1}}`
+			assert term("a", 1).not().str() == `{"bool":{"must_not":[{"term":{"a":{"value":1}}}]}}`
+			assert matches("name", "kettle").filter(range("price", lte = 50)).str() == `{"bool":{"must":[{"match":{"name":{"query":"kettle"}}}],"filter":[{"range":{"price":{"lte":50}}}]}}`
+			assert term("a", 1).boost(2.0).str() == `{"bool":{"must":[{"term":{"a":{"value":1}}}],"boost":2}}`
+			let nestedQuery = nested("items", term("items.city", "Cluj"), scoreMode = "max")
+			assert nestedQuery.str() == `{"nested":{"path":"items","query":{"term":{"items.city":{"value":"Cluj"}}},"score_mode":"max"}}`
+			let scored = functionScore(matchAll(), [fieldValueFactor("count", factor = 1.2, modifier = "log1p"), weightBy(3.0, filter = term("open", true))], scoreMode = "sum")
+			assert scored.str() == `{"function_score":{"query":{"match_all":{}},"functions":[{"field_value_factor":{"field":"count","factor":1.2,"modifier":"log1p"}},{"weight":3,"filter":{"term":{"open":{"value":true}}}}],"score_mode":"sum"}}`
+			let more = functionScore(matchAll(), [randomScore(seed = 7), decay("gauss", "added", "now", "10d"), scriptScore("_score * 2", params = {"k": 1})])
+			assert more.str() == `{"function_score":{"query":{"match_all":{}},"functions":[{"random_score":{"seed":7,"field":"_seq_no"}},{"gauss":{"added":{"origin":"now","scale":"10d","decay":0.5}}},{"script_score":{"script":{"source":"_score * 2","params":{"k":1}}}}]}}`
+			let raw = try rawQuery(`{"geo_distance": {"distance": "10km", "pin": [13.4, 52.5]}}`)
+			assert raw.str() == `{"geo_distance":{"distance":"10km","pin":[13.4,52.5]}}`
+			let kind = ErrorKind.Server
+			rawQuery("[1, 2]") onerror (err error) {
+				kind = kindOf(err)
+				recover matchNone()
+			}
+			assert kind == ErrorKind.Argument
+			return none
+		}
+
+		@test()
+		def TestKnnInEachFamily() {
+			let near = knn("vector", [0.1, 0.2, 0.3], 5, filter = term("open", true))
+			assert text(near.dsl(false)) == `{"knn":{"field":"vector","query_vector":[0.1,0.2,0.3],"k":5,"num_candidates":100,"filter":{"term":{"open":{"value":true}}}}}`
+			assert text(near.dsl(true)) == `{"knn":{"vector":{"vector":[0.1,0.2,0.3],"k":5,"filter":{"term":{"open":{"value":true}}}}}}`
+		}
+	}
+
+	check "Aggregations" {
+		@test()
+		def TestAggregationDsl() {
+			let byTag = aggs.terms("tags", size = 5).sub("price", aggs.stats("price"))
+			assert text(byTag.dsl()) == `{"terms":{"field":"tags","size":5},"aggs":{"price":{"stats":{"field":"price"}}}}`
+			let ranges = aggs.range("price", [aggs.Bucket{to: 10}, aggs.Bucket{from: 10, key: "mid"}])
+			assert text(ranges.dsl()) == `{"range":{"field":"price","ranges":[{"to":10},{"from":10,"key":"mid"}]}}`
+			assert text(aggs.dateRange("added", [aggs.Bucket{from: "now-1M/M"}], format = "yyyy-MM").dsl()) == `{"date_range":{"field":"added","ranges":[{"from":"now-1M/M"}],"format":"yyyy-MM"}}`
+			assert text(aggs.extendedStats("price").dsl()) == `{"extended_stats":{"field":"price"}}`
+			assert text(aggs.valueCount("price").dsl()) == `{"value_count":{"field":"price"}}`
+			assert text(aggs.missing("price").dsl()) == `{"missing":{"field":"price"}}`
+			assert text(aggs.nested("sizes").sub("back", aggs.reverseNested()).dsl()) == `{"nested":{"path":"sizes"},"aggs":{"back":{"reverse_nested":{}}}}`
+			assert text(aggs.global().sub("all", aggs.avg("price")).dsl()) == `{"global":{},"aggs":{"all":{"avg":{"field":"price"}}}}`
+			let named = aggs.filters({"open": term("open", true)})
+			assert text(named.dsl()) == `{"filters":{"filters":{"open":{"term":{"open":{"value":true}}}}}}`
+			let pages = aggs.composite([aggs.Source{name: "tag", aggregation: aggs.terms("tags")}], size = 2, after = {"tag": "b"})
+			assert text(pages.dsl()) == `{"composite":{"sources":[{"tag":{"terms":{"field":"tags"}}}],"size":2,"after":{"tag":"b"}}}`
+		}
+
+		@test()
+		def TestReadingResults() !none {
+			let byTag = aggs.terms("tags").sub("price", aggs.stats("price")).sub("p", aggs.percentiles("price"))
+			let answer = try new encoding.JSON().parse(`{"buckets":[{"key":"kitchen","doc_count":3,"price":{"count":3,"min":10,"max":40.5,"avg":20,"sum":60},"p":{"values":{"50.0":20,"95.0":40}}},{"key":7,"key_as_string":"seven","doc_count":1}]}`)
+			let result = byTag.read(answer is map<string, any> ?? (answer, new map<string, any>()))
+			assert result.buckets.len() == 2
+			let kitchen = result.buckets[0]
+			assert kitchen.keyText == "kitchen" && kitchen.docCount == 3
+			assert kitchen.sub("price").count == 3 && num(kitchen.sub("price").max) == 40.5 && num(kitchen.sub("price").avg) == 20.0
+			assert kitchen.sub("p").values["95.0"] == 40.0
+			assert result.buckets[1].keyText == "seven"
+			assert result.bucket("kitchen").docCount == 3 && result.bucket("none").docCount == 0
+			assert result.sub("missing").buckets.len() == 0
+			let keyed = aggs.filters({"open": term("open", true)})
+			let keyedAnswer = try new encoding.JSON().parse(`{"buckets":{"open":{"doc_count":2}}}`)
+			let read = keyed.read(keyedAnswer is map<string, any> ?? (keyedAnswer, new map<string, any>()))
+			assert read.buckets.len() == 1 && read.buckets[0].keyText == "open" && read.buckets[0].docCount == 2
+			let metric = aggs.cardinality("tags").read({"value": 12})
+			assert num(metric.value) == 12.0
+			return none
+		}
+	}
+
+	check "Bodies" {
+		@test()
+		def TestSearchBody() {
+			let options = SearchOptions{query: matches("name", "kettle"), size: 20, from: 40, sort: sortsOf("price:desc,name"), includes: ["name"], highlight: Highlight{fields: ["name"], preTag: "[", postTag: "]"}, aggregations: {"tags": aggs.terms("tags")}, searchAfter: [10, "x"], exactTotal: true, minScore: 0.5, timeout: 2s, collapse: "code", suggest: {"fix": Suggester{field: "name", text: "ketle"}}, seqNoPrimaryTerm: true}
+			let body = text(searchBody(options, false))
+			assert body.contains(`"query":{"match":{"name":{"query":"kettle"}}}`)
+			assert body.contains(`"size":20,"from":40`)
+			assert body.contains(`"sort":[{"price":{"order":"desc"}},{"name":{"order":"asc"}}]`)
+			assert body.contains(`"_source":{"includes":["name"],"excludes":[]}`)
+			assert body.contains(`"highlight":{"fields":{"name":{}},"pre_tags":["["],"post_tags":["]"]}`)
+			assert body.contains(`"aggs":{"tags":{"terms":{"field":"tags","size":10}}}`)
+			assert body.contains(`"search_after":[10,"x"]`) && body.contains(`"track_total_hits":true`) && body.contains(`"min_score":0.5`)
+			assert body.contains(`"timeout":"2s"`) && body.contains(`"collapse":{"field":"code"}`)
+			assert body.contains(`"suggest":{"fix":{"text":"ketle","term":{"field":"name","size":5}}}`)
+			assert body.contains(`"seq_no_primary_term":true`)
+			let pit = text(searchBody(SearchOptions{noSource: true, pointInTime: PointInTime{id: "abc", keepAlive: 90s}}, false))
+			assert pit.contains(`"_source":false`) && pit.contains(`"pit":{"id":"abc","keep_alive":"90s"}`)
+			assert sortsOf("").len() == 0 && sortsOf("a , b:DESC")[1].desc
+		}
+
+		@test()
+		def TestBulkLines() {
+			let item = bulkItem("index", "products", "7", [map<string, any>{"name": "Kettle"}])
+			assert string(item.lines) == "\{\"index\":\{\"_index\":\"products\",\"_id\":\"7\"}}\n\{\"name\":\"Kettle\"}\n"
+			let auto = bulkItem("create", "logs", "", [map<string, any>{"m": 1}])
+			assert string(auto.lines).startsWith("\{\"create\":\{\"_index\":\"logs\"}}\n")
+			assert string(bulkItem("delete", "p", "9", []).lines) == "\{\"delete\":\{\"_index\":\"p\",\"_id\":\"9\"}}\n"
+		}
+
+		@test()
+		def TestMappingFromStruct() {
+			let properties = propertiesOf(Shelf{}, 0, false)
+			assert text(properties["name"]) == `{"type":"text","fields":{"keyword":{"type":"keyword","ignore_above":256}}}`
+			assert text(properties["code"]) == `{"type":"keyword"}`
+			assert text(properties["count"]) == `{"type":"long"}` && text(properties["price"]) == `{"type":"double"}` && text(properties["open"]) == `{"type":"boolean"}`
+			assert text(properties["added"]) == `{"type":"date"}`
+			assert properties.hasKey("tag_list") && !properties.hasKey("tags") && !properties.hasKey("secret")
+			assert text(properties["vector"]) == `{"type":"dense_vector","dims":3,"similarity":"cosine"}`
+			assert text(properties["place"]) == `{"type":"object","properties":{"city":{"type":"text","fields":{"keyword":{"type":"keyword","ignore_above":256}}},"zip":{"type":"long"}}}`
+			assert text(properties["items"]).startsWith(`{"type":"nested","properties":{"city"`)
+			let os = propertiesOf(Shelf{}, 0, true)
+			assert text(os["vector"]) == `{"type":"knn_vector","dimension":3,"method":{"name":"hnsw","engine":"lucene","space_type":"cosinesimil"}}`
+			assert needsKnn(os) && !needsKnn(properties)
+		}
+	}
+
+	check "Addresses" {
+		@test()
+		def TestAddressesAndCloudIds() !none {
+			assert (try baseOf("https://search.internal:9200")) == "https://search.internal:9200"
+			assert (try baseOf("http://localhost")) == "http://localhost:80"
+			assert (try baseOf("https://[::1]:9243/")) == "https://[::1]:9243"
+			let kind = ErrorKind.Server
+			baseOf("ftp://x") onerror (err error) {
+				kind = kindOf(err)
+				recover ""
+			}
+			assert kind == ErrorKind.Argument
+			let id = "staging:" + base64encode("us-east-1.aws.found.io$abc123$kib456".bytes())
+			assert (try cloudAddress(id)) == "https://abc123.us-east-1.aws.found.io:443"
+			let ported = base64encode("eu.cloud.es.io:9243$es1$kb1".bytes())
+			assert (try cloudAddress(ported)) == "https://es1.eu.cloud.es.io:9243"
+			kind = ErrorKind.Server
+			cloudAddress("name:" + base64encode("only-host".bytes())) onerror (err error) {
+				kind = kindOf(err)
+				recover ""
+			}
+			assert kind == ErrorKind.Argument
+			assert spanText(90s) == "90s" && spanText(1500ms) == "1500ms"
+			// A cloud id names its host; one that does not answer fails to connect.
+			let cloud = new Client()
+			cloud.timeout = 2s
+			kind = ErrorKind.Server
+			cloud.connectCloud("x:" + base64encode("127.0.0.1:1$es1$kb1".bytes())) onerror (err error) {
+				kind = kindOf(err)
+				recover none
+			}
+			assert kind == ErrorKind.Connection
+			return none
+		}
+
+		@test()
+		def TestAuthorization() {
+			let pw ?Secret<string> = new Secret<string>("pw")
+			assert authorizationOf(none, none, "", none) == ""
+			assert authorizationOf(none, none, "elastic", pw) == "Basic {base64encode("elastic:pw".bytes())}"
+			assert authorizationOf(none, new Secret<string>("tok"), "elastic", pw) == "Bearer tok"
+			assert authorizationOf(new Secret<string>("id1:key1"), none, "", none) == "ApiKey {base64encode("id1:key1".bytes())}"
+			assert authorizationOf(new Secret<string>("ZW5jb2RlZA=="), none, "", none) == "ApiKey ZW5jb2RlZA=="
+		}
+	}
+
+	// A loopback node that answers as a cluster of `family` does, records
+	// the requests and their headers.
+	internal def fakeNode(family string, seen string[]) !httptest.Server {
+		let mux = new http.ServeMux()
+		try mux.handle("/", def (ctx http.Context) !none {
+			let target = ctx.path()
+			seen.push("{ctx.method().value} {target} accept={ctx.header("Accept")} auth={ctx.header("Authorization")}")
+			ctx.setHeader("Content-Type", "application/json")
+			match target {
+				case "/":
+					let distribution = family == "opensearch" ?? (`"distribution":"opensearch",`, "")
+					return ctx.text(`{"name":"n1","cluster_name":"c","version":{` + distribution + `"number":"` + (family == "opensearch" ?? ("2.19.0", "8.19.0")) + `"}}`)
+				case "/missing/_doc/1":
+					return ctx.text(404, `{"_index":"missing","_id":"1","found":false}`)
+				case "/gone/_doc/1":
+					return ctx.text(404, `{"error":{"type":"index_not_found_exception","reason":"no such index [gone]"},"status":404}`)
+				case "/busy/_doc/1":
+					return ctx.text(503, `{"error":"unavailable"}`)
+				case "/_bulk":
+					let body = try ctx.text()
+					// The first item is pushed back once.
+					let retried = seen.join("\n").split("POST /_bulk").len() > 2
+					let first = retried ?? (`{"index":{"_index":"p","_id":"1","status":201,"result":"created"}}`, `{"index":{"_index":"p","_id":"1","status":429,"error":{"type":"es_rejected_execution_exception","reason":"queue full"}}}`)
+					let items = body.split("\n").len() > 3 ?? (first + `,{"create":{"_index":"p","_id":"2","status":409,"error":{"type":"version_conflict_engine_exception","reason":"exists"}}}`, first)
+					return ctx.text(`{"took":1,"errors":true,"items":[` + items + `]}`)
+				default:
+					return ctx.text(400, `{"error":{"type":"parsing_exception","reason":"unknown {target}"},"status":400}`)
+			}
+		})
+		let server = new httptest.Server(mux)
+		try server.start()
+		return server
+	}
+
+	check "Loopback cluster" {
+		@test()
+		def TestFamiliesAndErrors() !none {
+			let seen string[] = []
+			let node = try fakeNode("elasticsearch", seen)
+			let es = new Client()
+			es.username = "elastic"
+			es.password = new Secret<string>("pw")
+			try es.connect("http://{node.address().str()}")
+			assert es.family == "elasticsearch" && es.version == "8.19.0"
+			// Discovery asks in plain JSON; once the family is known, Elasticsearch
+			// 8 is asked for its compatible media type.
+			assert seen[0].contains("accept=application/json") && seen[0].contains("auth=Basic ")
+			assert seen[1].contains("accept=application/vnd.elasticsearch+json; compatible-with=8")
+			let docs = es.index<Place>("missing")
+			assert (try docs.get("1")) is none
+			let kind = ErrorKind.Server
+			let errorType = ""
+			es.index<Place>("gone").get("1") onerror (err error) {
+				kind = kindOf(err)
+				errorType = err.errorType when err is ElasticError
+				recover none
+			}
+			assert kind == ErrorKind.NotFound && errorType == "index_not_found_exception"
+			try es.close()
+			try node.close()
+
+			let osSeen string[] = []
+			let osNode = try fakeNode("opensearch", osSeen)
+			let os = try connect("http://{osNode.address().str()}")
+			assert os.family == "opensearch" && osSeen[0].contains("accept=application/json")
+			try os.close()
+			try osNode.close()
+			return none
+		}
+
+		@test()
+		def TestFailoverToTheNextNode() !none {
+			let seen string[] = []
+			let node = try fakeNode("elasticsearch", seen)
+			let client = new Client()
+			client.maxRetries = 2
+			client.retireFor = 1min
+			// The first node refuses connections: the request goes to the second,
+			// and the first is passed over afterwards.
+			try client.connect("http://127.0.0.1:1", "http://{node.address().str()}")
+			assert (try client.info()).name == "n1"
+			assert (try client.info()).name == "n1"
+			// A 503 sets a node aside too; with every node down the error comes
+			// back.
+			let kind = ErrorKind.Closed
+			client.index<Place>("busy").get("1") onerror (err error) {
+				kind = kindOf(err)
+				recover none
+			}
+			assert kind == ErrorKind.Server
+			try client.close()
+			try node.close()
+			return none
+		}
+
+		@test()
+		def TestBulkRetriesAndFailures() !none {
+			let seen string[] = []
+			let node = try fakeNode("elasticsearch", seen)
+			let client = try connect("http://{node.address().str()}")
+			let writer = client.bulk(flushInterval = 0s)
+			try writer.index("p", "1", map<string, any>{"a": 1})
+			try writer.create("p", "2", map<string, any>{"a": 2})
+			let report = try writer.close()
+			assert report.created == 1 && report.failed == 1
+			assert report.failures[0].id == "2" && report.failures[0].errorType == "version_conflict_engine_exception"
+			// The 429 item went again on its own.
+			assert seen.join("\n").split("POST /_bulk").len() == 3
+			let kind = ErrorKind.Server
+			writer.index("p", "3", map<string, any>{}) onerror (err error) {
+				kind = kindOf(err)
+				recover none
+			}
+			assert kind == ErrorKind.Closed
+			try client.close()
+			try node.close()
+			return none
+		}
+
+		@test()
+		def TestNotConnected() {
+			let kind = ErrorKind.Server
+			new Client().info() onerror (err error) {
+				kind = kindOf(err)
+				recover ClusterInfo{}
+			}
+			assert kind == ErrorKind.Closed
+			kind = ErrorKind.Server
+			connect("http://127.0.0.1:1") onerror (err error) {
+				kind = kindOf(err)
+				recover new Client()
+			}
+			assert kind == ErrorKind.Connection
+		}
+	}
+}

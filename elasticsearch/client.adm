@@ -1,0 +1,380 @@
+// An Elasticsearch and OpenSearch client: documents as typed structs,
+// bulk writes, search with a query builder and aggregations, and index
+// management, over std.net.http.
+partial module adm.database.elasticsearch {
+	use (
+		std.data.encoding
+		std.net
+		std.net.http
+		std.net.tls
+		std.net.url
+		adm.database.elasticsearch.wire::*
+	)
+
+	// Client talks to one cluster through any of its nodes, in turn. A node
+	// that cannot be reached is set aside for `retireFor` (longer each time
+	// in a row) and the request goes to the next. Any number of tasks may
+	// share a client.
+	//
+	// ```
+	// let es = try elasticsearch.connect("https://search.internal:9200", apiKey = key)
+	// let products = es.index<Product>("products")
+	// ```
+	//
+	// Calls fail with an ElasticError: ErrorKind.Connection when no node
+	// answers, ErrorKind.TimedOut after `timeout`, ErrorKind.Closed after
+	// `close`, and the server's answer otherwise (Argument, Denied,
+	// NotFound, Conflict, Busy, Server) with its error type and reason.
+	partial type Client {
+		// An API key: the encoded form Elasticsearch hands out, or `id:key`.
+		apiKey          ?Secret<string> = none
+		username        string          = ""
+		password        ?Secret<string> = none
+		// A bearer token (an OAuth or service token).
+		bearerToken     ?Secret<string> = none
+		// TLS settings for `https:` nodes; none checks against the system's
+		// authorities.
+		tls             ?tls.Config     = none
+		// The SHA-256 fingerprint of the cluster's CA (or a node's own)
+		// certificate, as Elasticsearch prints it when it sets up security,
+		// in hex with or without colons: that certificate is trusted, and no
+		// other.
+		caFingerprint   string          = ""
+		// How long a request may take.
+		timeout         duration        = 30s
+		// How many more nodes a request that finds one down tries.
+		maxRetries      int             = 3
+		// How long a node that failed is passed over at first.
+		retireFor       duration        = 30s
+		// Replace the nodes given by those the cluster lists, when
+		// connecting.
+		sniff           bool            = false
+		// The cluster's family and version, once connected: `elasticsearch`
+		// or `opensearch`, `8.19.0`.
+		family          string          = ""
+		version         string          = ""
+		// Index management, and the ingest pipelines.
+		indices         Indices
+		ingest          Ingest
+		internal shared Shared
+
+		def new() {
+			shared = new Shared()
+			indices = new Indices(shared)
+			ingest = new Ingest(shared)
+		}
+
+		// connect names the cluster's nodes, `https://host:9200`, and asks
+		// the first that answers what it is.
+		// Fails with an ElasticError: ErrorKind.Argument for no node, an
+		// address the client does not take, an unreadable CA fingerprint, or
+		// a client already connected; ErrorKind.Connection when no node
+		// answers; ErrorKind.Denied when the credentials are refused.
+		def connect(urls ...string) !none {
+			fail errorOf(ErrorKind.Argument, "elasticsearch: the client is already connected") unless shared.transport is none
+			fail errorOf(ErrorKind.Argument, "elasticsearch: connect needs the address of a node") when urls.len() == 0
+			let bases string[] = []
+			for let address in urls {
+				bases.push(try baseOf(address))
+			}
+			let config = tls
+			config = try pinnedConfig(bases, caFingerprint, tls, timeout) when caFingerprint != ""
+			let made = new Transport(bases, Settings{authorization: authorizationOf(apiKey, bearerToken, username, password), tlsConfig: config, timeout: timeout, maxRetries: maxRetries, retireFor: retireFor})
+			made.discover() onerror (err error) {
+				made.close()
+				fail err
+			}
+			if sniff {
+				made.sniff() onerror (err error) {
+					made.close()
+					fail err
+				}
+			}
+			family = made.family
+			let about = ClusterInfo{}
+			made.json(http.Method.GET, "/", target = about) onerror recover none
+			version = about.version.number
+			shared.transport = made
+			return none
+		}
+
+		// connectCloud connects to an Elastic Cloud deployment by the id the
+		// console shows (`name:base64`).
+		// Fails as `connect` does, and with ErrorKind.Argument for an id that
+		// does not read.
+		def connectCloud(cloudId string) !none {
+			return try connect(try cloudAddress(cloudId))
+		}
+
+		// index returns a view of the index (or alias, or data stream) of
+		// that name that reads and writes documents as T. T needs a
+		// constructor without arguments; its fields map to the document's by
+		// name, `@json` renaming them.
+		def index<T>(name string) Index<T> {
+			return new Index<T>(shared, name)
+		}
+
+		// bulk returns a writer that sends documents in batches: when
+		// `flushActions` are waiting, or `flushBytes` of them, or every
+		// `flushInterval` (0s: only then and on `flush`).
+		def bulk(flushActions int = 1000, flushBytes int = 5 * 1024 * 1024, flushInterval duration = 1s, refresh Refresh = Refresh.None) Bulk {
+			return new Bulk(shared, flushActions, flushBytes, flushInterval, refresh)
+		}
+
+		// info returns what the cluster says about itself.
+		// Fails as the type says.
+		def info() !ClusterInfo {
+			let out = ClusterInfo{}
+			try (try shared.wire()).json(http.Method.GET, "/", target = out)
+			return out
+		}
+
+		// health returns the cluster's health, or an index's; with
+		// `waitForStatus` (`yellow`, `green`) it waits up to `wait` for it.
+		// Fails as the type says, with ErrorKind.TimedOut when the wait
+		// ends first.
+		def health(index string = "", waitForStatus string = "", wait duration = 30s) !ClusterHealth {
+			let query = new url.Values()
+			if waitForStatus != "" {
+				query.set("wait_for_status", waitForStatus)
+				query.set("timeout", "{wholeSeconds(wait)}s")
+			}
+			let out = ClusterHealth{}
+			try (try shared.wire()).json(http.Method.GET, index == "" ?? ("/_cluster/health", "/_cluster/health/{url.pathEscape(index)}"), query, target = out)
+			fail errorOf(ErrorKind.TimedOut, "elasticsearch: the cluster did not turn {waitForStatus} within {wait}") when out.timedOut
+			return out
+		}
+
+		// cat returns the rows of a cat API (`indices`, `nodes`, `shards`,
+		// `aliases`, `allocation`, `thread_pool`, ...) by column, as the
+		// server prints them.
+		// Fails as the type says.
+		def cat(api string, params map<string, string> = {}) !map<string, string>[] {
+			let query = new url.Values()
+			query.set("format", "json")
+			for let (key, value) in params {
+				query.set(key, value)
+			}
+			let data = try (try shared.wire()).call(http.Method.GET, "/_cat/{api}", query)
+			let parsed = new encoding.JSON().parse(data) onerror (err error) {
+				fail errorOf(ErrorKind.Protocol, "elasticsearch: GET /_cat/{api}: the answer does not read: {err.message}")
+			}
+			let out map<string, string>[] = []
+			if parsed is any[] {
+				for let item in parsed {
+					if item is map<string, any> {
+						let row = new map<string, string>()
+						for let (key, value) in item {
+							row.set(key, textOf(value))
+						}
+						out.push(row)
+					}
+				}
+			}
+			return out
+		}
+
+		// catIndices returns a row for each index `pattern` names (all of
+		// them when empty).
+		// Fails as the type says.
+		def catIndices(pattern string = "") !CatIndex[] {
+			let out CatIndex[] = []
+			for let row in try cat(pattern == "" ?? ("indices", "indices/{url.pathEscape(pattern)}"), {"bytes": "b"}) {
+				out.push(CatIndex{health: cell(row, "health"), status: cell(row, "status"), index: cell(row, "index"), uuid: cell(row, "uuid"), primaries: number(row, "pri"), replicas: number(row, "rep"), docsCount: number(row, "docs.count"), docsDeleted: number(row, "docs.deleted"), storeSize: number(row, "store.size"), primaryStoreSize: number(row, "pri.store.size")})
+			}
+			return out
+		}
+
+		// catNodes returns a row for each node.
+		// Fails as the type says.
+		def catNodes() !CatNode[] {
+			let out CatNode[] = []
+			for let row in try cat("nodes", {"bytes": "b", "h": "name,ip,heap.percent,ram.percent,cpu,load_1m,node.role,master,cluster_manager"}) {
+				let leader = cell(row, "master")
+				leader = cell(row, "cluster_manager") when leader == ""
+				out.push(CatNode{name: cell(row, "name"), ip: cell(row, "ip"), heapPercent: number(row, "heap.percent"), ramPercent: number(row, "ram.percent"), cpu: number(row, "cpu"), load: fraction(row, "load_1m"), roles: cell(row, "node.role"), leader: leader == "*"})
+			}
+			return out
+		}
+
+		// catShards returns a row for each shard of the indices `pattern`
+		// names (all when empty).
+		// Fails as the type says.
+		def catShards(pattern string = "") !CatShard[] {
+			let out CatShard[] = []
+			for let row in try cat(pattern == "" ?? ("shards", "shards/{url.pathEscape(pattern)}"), {"bytes": "b"}) {
+				out.push(CatShard{index: cell(row, "index"), shard: number(row, "shard"), primary: cell(row, "prirep") == "p", state: cell(row, "state"), docs: number(row, "docs"), store: number(row, "store"), node: cell(row, "node")})
+			}
+			return out
+		}
+
+		// catAliases returns a row for each alias.
+		// Fails as the type says.
+		def catAliases() !CatAlias[] {
+			let out CatAlias[] = []
+			for let row in try cat("aliases") {
+				out.push(CatAlias{alias: cell(row, "alias"), index: cell(row, "index"), filter: cell(row, "filter"), isWriteIndex: cell(row, "is_write_index") == "true"})
+			}
+			return out
+		}
+
+		// count returns how many documents the indices `pattern` names hold
+		// (all when empty).
+		// Fails as the type says.
+		def count(pattern string = "") !int {
+			let reply = CountReply{}
+			try (try shared.wire()).json(http.Method.GET, pattern == "" ?? ("/_count", "/{url.pathEscape(pattern)}/_count"), target = reply)
+			return reply.count
+		}
+
+		// openPointInTime keeps a view of the indices as they are now for
+		// `keepAlive` (renewed by each search through it), for paging
+		// through them with `searchAfter` while they change.
+		// Fails as the type says.
+		def openPointInTime(index string, keepAlive duration = 1min) !PointInTime {
+			return try openPit(shared, index, keepAlive)
+		}
+
+		// closePointInTime lets the cluster drop a point in time.
+		// Fails as the type says.
+		def closePointInTime(pit PointInTime) !none {
+			return try closePit(shared, pit.id)
+		}
+
+		// close drops the idle connections. Calls made later fail with
+		// ErrorKind.Closed. Never fails.
+		def close() !none {
+			let current = shared.transport
+			current.close() unless current is none
+			return none
+		}
+
+		def dispose() {
+			close() onerror recover none
+		}
+
+		// Names the client by its family and version.
+		def str() string {
+			return "elasticsearch.Client(not connected)" when shared.transport is none
+			return "elasticsearch.Client({family} {version})"
+		}
+	}
+
+	// connect opens a client for a cluster through one node; see
+	// `Client.connect`. `apiKey` signs in with an API key.
+	//
+	// ```
+	// let es = try elasticsearch.connect("https://search.internal:9200", apiKey = key)
+	// ```
+	//
+	// Fails with an ElasticError as `Client.connect` does.
+	def connect(address string, apiKey ?Secret<string> = none) !Client {
+		let client = new Client()
+		client.apiKey = apiKey
+		try client.connect(address)
+		return client
+	}
+
+	// ClusterInfo is what `Client.info` returns.
+	struct ClusterInfo {
+		name string
+		@json("cluster_name")
+		clusterName string
+		@json("cluster_uuid")
+		clusterUuid string
+		version ClusterVersion
+		tagline string
+	}
+
+	// ClusterVersion is a cluster's version: its number, `opensearch` as
+	// the distribution of OpenSearch, and Lucene's.
+	struct ClusterVersion {
+		number string
+		distribution string
+		@json("lucene_version")
+		luceneVersion string
+		@json("build_flavor")
+		buildFlavor string
+	}
+
+	// ClusterHealth is what `Client.health` returns.
+	struct ClusterHealth {
+		@json("cluster_name")
+		clusterName string
+		// `green`, `yellow` or `red`.
+		status string
+		@json("timed_out")
+		timedOut bool
+		@json("number_of_nodes")
+		nodes int
+		@json("number_of_data_nodes")
+		dataNodes int
+		@json("active_primary_shards")
+		activePrimaryShards int
+		@json("active_shards")
+		activeShards int
+		@json("relocating_shards")
+		relocatingShards int
+		@json("initializing_shards")
+		initializingShards int
+		@json("unassigned_shards")
+		unassignedShards int
+		@json("number_of_pending_tasks")
+		pendingTasks int
+	}
+
+	// CatIndex is a row of `Client.catIndices`; sizes in bytes.
+	struct CatIndex {
+		health           string
+		status           string
+		index            string
+		uuid             string
+		primaries        int
+		replicas         int
+		docsCount        int
+		docsDeleted      int
+		storeSize        int
+		primaryStoreSize int
+	}
+
+	// CatNode is a row of `Client.catNodes`: percents of heap, memory and
+	// CPU, the load of the last minute, the role letters, and whether it is
+	// the elected master (cluster manager).
+	struct CatNode {
+		name        string
+		ip          string
+		heapPercent int
+		ramPercent  int
+		cpu         int
+		load        float
+		roles       string
+		leader      bool
+	}
+
+	// CatShard is a row of `Client.catShards`; `store` in bytes.
+	struct CatShard {
+		index   string
+		shard   int
+		primary bool
+		// `STARTED`, `RELOCATING`, `INITIALIZING`, `UNASSIGNED`.
+		state   string
+		docs    int
+		store   int
+		node    string
+	}
+
+	// CatAlias is a row of `Client.catAliases`.
+	struct CatAlias {
+		alias        string
+		index        string
+		filter       string
+		isWriteIndex bool
+	}
+
+	// PointInTime is a view of indices kept as they were, from
+	// `Client.openPointInTime`.
+	struct PointInTime {
+		id        string
+		keepAlive duration
+	}
+}

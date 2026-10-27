@@ -1,0 +1,495 @@
+partial module adm.database.elasticsearch {
+	use (
+		std.data.encoding
+		std.net.http
+		std.net.url
+		adm.database.elasticsearch.wire::*
+	)
+
+	// Refresh is when a write becomes visible to searches.
+	enum Refresh {
+		// At the next periodic refresh (about a second).
+		None         = "",
+		// The write returns once a refresh made it visible.
+		WaitFor      = "wait_for",
+		// The write refreshes the shards it touched at once: for tests, not
+		// for load.
+		Immediately  = "true",
+	}
+
+	// WriteResult is what a write did: `result` is `created`, `updated`,
+	// `deleted`, `noop` or `not_found`; the sequence number and primary
+	// term condition the next write on this version.
+	struct WriteResult {
+		@json("_id")
+		id string
+		@json("_index")
+		index string
+		@json("_version")
+		version int
+		@json("_seq_no")
+		seqNo int
+		@json("_primary_term")
+		primaryTerm int
+		result string
+	}
+
+	// Document is a document with its version, from `Index.document`.
+	type Document<T> {
+		id          string
+		version     int
+		seqNo       int
+		primaryTerm int
+		source      T
+
+		def new() {
+			source = new T()
+		}
+	}
+
+	// Script is a script an update runs: Painless by default, `ctx._source`
+	// the document, `params` its parameters.
+	struct Script {
+		source string
+		params map<string, any> = {}
+		lang   string           = "painless"
+	}
+
+	// Explanation is how a document's score came about, as a tree.
+	struct Explanation {
+		value       float
+		description string
+		details     Explanation[]
+	}
+
+	// Index is an index (or alias, or data stream) whose documents read and
+	// write as T; `Client.index` makes one.
+	//
+	// ```
+	// let products = es.index<Product>("products")
+	// try products.put("7", Product{id: "7", name: "Kettle", price: 39.9, tags: ["kitchen"]})
+	// let kettle = try products.get("7")                  // ?Product
+	// ```
+	//
+	// Writes condition on a version with `ifSeqNo` and `ifPrimaryTerm` (from
+	// `document` or a hit with `seqNoPrimaryTerm`), failing with
+	// ErrorKind.Conflict when the document changed since.
+	type Index<T> {
+		name            string
+		// When the writes made through this view become visible to searches.
+		refresh         Refresh = Refresh.None
+		internal shared Shared
+
+		def new(shared Shared, name string) {
+			self.shared = shared
+			self.name = name
+		}
+
+		// put stores a document under an id, replacing the one there.
+		// Fails as the Client's calls do.
+		def put(id string, doc T, ifSeqNo ?int = none, ifPrimaryTerm ?int = none) !WriteResult {
+			let out = WriteResult{}
+			try (try shared.wire()).json(http.Method.PUT, "{path()}/_doc/{url.pathEscape(id)}", writeQuery(ifSeqNo, ifPrimaryTerm), body = doc, target = out)
+			return out
+		}
+
+		// create stores a document under an id that holds none.
+		// Fails as the Client's calls do, with ErrorKind.Conflict when the id
+		// is taken.
+		def create(id string, doc T) !WriteResult {
+			let out = WriteResult{}
+			try (try shared.wire()).json(http.Method.PUT, "{path()}/_create/{url.pathEscape(id)}", writeQuery(none, none), body = doc, target = out)
+			return out
+		}
+
+		// add stores a document under an id the cluster makes up, which the
+		// result holds.
+		// Fails as the Client's calls do.
+		def add(doc T) !WriteResult {
+			let out = WriteResult{}
+			try (try shared.wire()).json(http.Method.POST, "{path()}/_doc", writeQuery(none, none), body = doc, target = out)
+			return out
+		}
+
+		// get returns the document under an id; none when there is none.
+		// Fails as the Client's calls do, with ErrorKind.NotFound when the
+		// index is not there.
+		def get(id string) !?T {
+			let found = try document(id)
+			return none when found is none
+			return found.source
+		}
+
+		// document returns the document under an id with its version; none
+		// when there is none.
+		// Fails as `get` does.
+		def document(id string) !?Document<T> {
+			let wire = new DocumentWire<T>()
+			let missing = false
+			(try shared.wire()).json(http.Method.GET, "{path()}/_doc/{url.pathEscape(id)}", target = wire) onerror (err error) {
+				fail err unless absent(err)
+				missing = true
+				recover none
+			}
+			return none when missing || !wire.found
+			let out = new Document<T>()
+			out.id = wire.id
+			out.version = wire.version
+			out.seqNo = wire.seqNo
+			out.primaryTerm = wire.primaryTerm
+			out.source = wire.source
+			return out
+		}
+
+		// exists says whether a document is stored under an id.
+		// Fails as `get` does.
+		def exists(id string) !bool {
+			let link = try shared.wire()
+			let missing = false
+			let res = link.send(http.Method.HEAD, "{path()}/_doc/{url.pathEscape(id)}", none, none, "") onerror (err error) {
+				fail err unless absent(err)
+				missing = true
+				recover new http.Response()
+			}
+			res.close() onerror recover none
+			return !missing
+		}
+
+		// update changes some fields of a document: `changes` holds the
+		// fields to set, by name. `upsert` is stored when the
+		// document is missing; `retryOnConflict` retries that many times when
+		// another write wins meanwhile.
+		// Fails as the Client's calls do, with ErrorKind.NotFound when the
+		// document is missing and no `upsert` is given.
+		def update(id string, changes map<string, any>, upsert ?T = none, retryOnConflict int = 0, ifSeqNo ?int = none, ifPrimaryTerm ?int = none) !WriteResult {
+			let body = new map<string, any>()
+			body.set("doc", changes)
+			body.set("upsert", upsert) unless upsert is none
+			return try updateWith(id, body, retryOnConflict, ifSeqNo, ifPrimaryTerm)
+		}
+
+		// update runs a script on a document: `ctx._source.stock -=
+		// params.n`.
+		// Fails as the other overload does, and with ErrorKind.Argument for
+		// a script that does not compile or run.
+		def update(id string, script Script, upsert ?T = none, retryOnConflict int = 0) !WriteResult {
+			let body = new map<string, any>()
+			body.set("script", scriptBody(script))
+			body.set("upsert", upsert) unless upsert is none
+			return try updateWith(id, body, retryOnConflict, none, none)
+		}
+
+		// delete removes the document under an id and says whether there was
+		// one.
+		// Fails as `put` does.
+		def delete(id string, ifSeqNo ?int = none, ifPrimaryTerm ?int = none) !bool {
+			let out = WriteResult{}
+			let missing = false
+			(try shared.wire()).json(http.Method.DELETE, "{path()}/_doc/{url.pathEscape(id)}", writeQuery(ifSeqNo, ifPrimaryTerm), target = out) onerror (err error) {
+				fail err unless absent(err)
+				missing = true
+				recover none
+			}
+			return !missing && out.result == "deleted"
+		}
+
+		// getMany returns the documents under the ids, by id; those without
+		// one are left out.
+		// Fails as `get` does.
+		def getMany(ids string[]) !map<string, T> {
+			let reply = new ManyWire<T>()
+			try (try shared.wire()).json(http.Method.POST, "{path()}/_mget", body = {"ids": ids}, target = reply)
+			let out = new map<string, T>()
+			for let doc in reply.docs {
+				out.set(doc.id, doc.source) when doc.found
+			}
+			return out
+		}
+
+		// putMany stores documents by id in one bulk request.
+		// Fails as the Client's calls do, and with ErrorKind.Server, listing
+		// them in `failures`, when some documents were refused.
+		def putMany(docs map<string, T>) !BulkReport {
+			let batch = new Bulk(shared, docs.len() + 1, 1 << 40, 0s, refresh)
+			for let (id, doc) in docs {
+				try batch.index(name, id, doc)
+			}
+			let report = try batch.close()
+			fail failureOf(report) when report.failed > 0
+			return report
+		}
+
+		// search returns the documents a query matches, the best first (or
+		// by `sort`: `price`, `price:desc,name`).
+		//
+		// ```
+		// let hits = try products.search(elasticsearch.matches("name", "kettle"), size = 20, sort = "price")
+		// ```
+		//
+		// Fails as the Client's calls do, with ErrorKind.Argument for a
+		// query the cluster does not take.
+		def search(query ?Query = none, size int = 10, from int = 0, sort string = "") !SearchResult<T> {
+			return try search(SearchOptions{query: query, size: size, from: from, sort: sortsOf(sort)})
+		}
+
+		// search runs a search with every option; see SearchOptions.
+		// Fails as the other overload does.
+		def search(options SearchOptions) !SearchResult<T> {
+			let pit = options.pointInTime
+			let target = pit is none ?? ("{path()}/_search", "/_search")
+			let query = new url.Values()
+			query.set("routing", options.routing) unless options.routing == ""
+			let wire = new SearchWire<T>()
+			try (try shared.wire()).json(http.Method.POST, target, query, body = searchBody(options, shared.openSearch()), target = wire)
+			return resultOf(wire, options)
+		}
+
+		// count returns how many documents a query matches (all when none).
+		// Fails as `search` does.
+		def count(query ?Query = none) !int {
+			let body = new map<string, any>()
+			body.set("query", query.dsl(shared.openSearch())) unless query is none
+			let reply = CountReply{}
+			try (try shared.wire()).json(http.Method.POST, "{path()}/_count", body = body, target = reply)
+			return reply.count
+		}
+
+		// explain says why a query matches a document or does not, and how
+		// its score came about.
+		// Fails as `search` does, with ErrorKind.NotFound when the document
+		// is missing.
+		def explain(id string, query Query) !Explanation {
+			let reply = ExplainWire{}
+			try (try shared.wire()).json(http.Method.POST, "{path()}/_explain/{url.pathEscape(id)}", body = {"query": query.dsl(shared.openSearch())}, target = reply)
+			return reply.explanation
+		}
+
+		// multiSearch runs several searches in one request and returns their
+		// results in order.
+		// Fails as `search` does, with the first search that failed.
+		def multiSearch(searches SearchOptions[]) !SearchResult<T>[] {
+			let lines byte[] = []
+			let codec = new encoding.JSON()
+			for let options in searches {
+				let header = new map<string, any>()
+				header.set("index", name) when options.pointInTime is none
+				header.set("routing", options.routing) unless options.routing == ""
+				lines.push(...codec.encode(header))
+				lines.push(byte('\n'))
+				lines.push(...codec.encode(searchBody(options, shared.openSearch())))
+				lines.push(byte('\n'))
+			}
+			let link = try shared.wire()
+			let data = try link.call(http.Method.POST, "/_msearch", none, lines, link.mediaType(true))
+			let reply = new MultiWire<T>()
+			new encoding.JSON().decode(data, reply) onerror (err error) {
+				fail errorOf(ErrorKind.Protocol, "elasticsearch: POST /_msearch: the answer does not read: {err.message}")
+			}
+			let out SearchResult<T>[] = []
+			for let (i, each) in reply.responses {
+				let failure = each.error
+				fail errorOf(kindOfStatus(each.status, failure.kind), "elasticsearch: search {i + 1} of the multi-search: {failure.kind}: {failure.reason}", each.status, failure.kind) unless failure is none
+				out.push(resultOf(each, i < searches.len() ?? (searches[i], SearchOptions{})))
+			}
+			return out
+		}
+
+		// searchTemplate runs a search template, a stored one by `id` or
+		// `source` given here (Mustache), with its parameters.
+		// Fails as `search` does, with ErrorKind.NotFound for a stored
+		// template that is not there.
+		def searchTemplate(id string = "", source string = "", params map<string, any> = {}) !SearchResult<T> {
+			let body = new map<string, any>()
+			body.set("id", id) unless id == ""
+			body.set("source", source) unless source == ""
+			body.set("params", params)
+			let wire = new SearchWire<T>()
+			try (try shared.wire()).json(http.Method.POST, "{path()}/_search/template", body = body, target = wire)
+			return resultOf(wire, SearchOptions{})
+		}
+
+		// scan returns every document a search matches, a page of
+		// `pageSize` at a time as the iteration needs them, through a point
+		// in time kept for `keepAlive` between pages: the index as it was when
+		// the scan began, however it changes meanwhile. `options` gives the
+		// query and the sort (by `_doc` when none).
+		//
+		// ```
+		// for let hit in try products.scan(elasticsearch.SearchOptions{query: elasticsearch.term("tags", "kitchen")}) {
+		//     print(hit.id)
+		// }
+		// ```
+		//
+		// Fails as `search` does.
+		def scan(options SearchOptions = SearchOptions{}, pageSize int = 1000, keepAlive duration = 1min) !HitStream<T> {
+			let pit = try openPit(shared, name, keepAlive)
+			return new HitStream<T>(shared, name, options, pageSize, keepAlive, pit.id, false)
+		}
+
+		// scroll returns every document a search matches through a scroll
+		// context, for clusters without points in time; see `scan`.
+		// Fails as `search` does.
+		def scroll(options SearchOptions = SearchOptions{}, pageSize int = 1000, keepAlive duration = 1min) !HitStream<T> {
+			return new HitStream<T>(shared, name, options, pageSize, keepAlive, "", true)
+		}
+
+		// refreshNow makes every write so far visible to searches.
+		// Fails as the Client's calls do.
+		def refreshNow() !none {
+			try (try shared.wire()).json(http.Method.POST, "{path()}/_refresh")
+			return none
+		}
+
+		// ---- internals ----
+
+		internal def path() string {
+			return "/{url.pathEscape(name)}"
+		}
+
+		internal def writeQuery(ifSeqNo ?int, ifPrimaryTerm ?int) url.Values {
+			let query = new url.Values()
+			query.set("refresh", refresh.value) unless refresh == Refresh.None
+			query.set("if_seq_no", ifSeqNo.str()) unless (ifSeqNo is none)
+			query.set("if_primary_term", ifPrimaryTerm.str()) unless (ifPrimaryTerm is none)
+			return query
+		}
+
+		internal def updateWith(id string, body map<string, any>, retryOnConflict int, ifSeqNo ?int, ifPrimaryTerm ?int) !WriteResult {
+			let query = writeQuery(ifSeqNo, ifPrimaryTerm)
+			query.set("retry_on_conflict", retryOnConflict.str()) when retryOnConflict > 0
+			let out = WriteResult{}
+			try (try shared.wire()).json(http.Method.POST, "{path()}/_update/{url.pathEscape(id)}", query, body = body, target = out)
+			return out
+		}
+	}
+
+	// HitStream is every hit of a search, fetched a page at a time as the
+	// iteration needs it; `Index.scan` and `Index.scroll` make one. Closing
+	// it, or reading it to the end, lets the cluster drop what it keeps for
+	// it.
+	type HitStream<T> {
+		// The failure that ended the stream; none while it runs or when it
+		// ended or was closed cleanly.
+		failure            ?error        = none
+		internal shared    Shared
+		internal index     string
+		internal options   SearchOptions
+		internal pageSize  int
+		internal keepAlive duration
+		// The point in time's id, or the scroll's.
+		internal cursor    string
+		internal scrolling bool
+		internal page      Hit<T>[]      = []
+		internal taken     int           = 0
+		internal started   bool          = false
+		internal ended     bool          = false
+		// Set by `close`: no more hits, whatever is left of the page.
+		internal shut      bool          = false
+
+		def new(shared Shared, index string, options SearchOptions, pageSize int, keepAlive duration, cursor string, scrolling bool) {
+			self.shared = shared
+			self.index = index
+			self.options = options
+			self.pageSize = pageSize
+			self.keepAlive = keepAlive
+			self.cursor = cursor
+			self.scrolling = scrolling
+		}
+
+		// Implements Iterator<Hit<T>>: the next hit; none at the end or when
+		// a page fails (`failure` says why).
+		def iterate() ?Hit<T> {
+			return next() onerror (err error) {
+				failure = err
+				close() onerror recover none
+				return none
+			}
+		}
+
+		// The next hit, fetching the next page when this one is read; none at
+		// the end.
+		// Fails as `Index.search` does.
+		def next() !?Hit<T> {
+			return none when shut
+			if taken >= page.len() {
+				if ended {
+					try close()
+					return none
+				}
+				try fetch()
+				if page.len() == 0 {
+					try close()
+					return none
+				}
+			}
+			taken++
+			return page[taken - 1]
+		}
+
+		// close lets the cluster drop the point in time or the scroll.
+		// Fails as the Client's calls do.
+		def close() !none {
+			shut = true
+			return none when ended && cursor == ""
+			ended = true
+			let id = cursor
+			cursor = ""
+			return none when id == ""
+			if scrolling {
+				try (try shared.wire()).json(http.Method.DELETE, "/_search/scroll", body = {"scroll_id": [id]})
+			} else {
+				try closePit(shared, id)
+			}
+			return none
+		}
+
+		def dispose() {
+			close() onerror recover none
+		}
+
+		internal def fetch() !none {
+			let link = try shared.wire()
+			let wire = new SearchWire<T>()
+			if scrolling && started {
+				try link.json(http.Method.POST, "/_search/scroll", body = {"scroll": spanText(keepAlive), "scroll_id": cursor}, target = wire)
+			} else {
+				let asked = SearchOptions{...options}
+				asked.size = pageSize
+				asked.from = 0
+				if !scrolling {
+					asked.pointInTime = PointInTime{id: cursor, keepAlive: keepAlive}
+					asked.sort = [Sort{field: "_doc"}] when asked.sort.len() == 0
+					asked.searchAfter = page[page.len() - 1].sort when page.len() > 0
+				}
+				let query = new url.Values()
+				query.set("scroll", spanText(keepAlive)) when scrolling
+				let target = scrolling ?? ("/{url.pathEscape(index)}/_search", "/_search")
+				try link.json(http.Method.POST, target, query, body = searchBody(asked, shared.openSearch()), target = wire)
+			}
+			started = true
+			let result = resultOf(wire, options)
+			page = result.hits
+			taken = 0
+			cursor = result.scrollId when scrolling && result.scrollId != ""
+			cursor = result.pointInTimeId when !scrolling && result.pointInTimeId != ""
+			ended = page.len() < pageSize && !scrolling
+			return none
+		}
+	}
+
+	// Sort keys from text: `price`, `price:desc`, `price:desc,name`.
+	def sortsOf(text string) Sort[] {
+		let out Sort[] = []
+		for let part in text.split(",") {
+			let key = part.trim()
+			continue when key == ""
+			let colon = key.indexOf(":")
+			if colon > 0 {
+				out.push(Sort{field: key.slice(0, colon), desc: key.slice(colon + 1).lower() == "desc"})
+			} else {
+				out.push(Sort{field: key})
+			}
+		}
+		return out
+	}
+}

@@ -1,0 +1,387 @@
+// Requests to a cluster: the nodes in turn, a node that does not answer
+// set aside for a while, the credentials and the headers the server family
+// wants, and the server's errors read into ElasticErrors.
+internal partial module adm.database.elasticsearch.wire {
+	use (
+		std.bytes
+		std.data.encoding
+		std.io
+		std.net
+		std.net.http
+		std.net.tls
+		std.net.url
+		std.time
+		adm.database.elasticsearch::*
+	)
+
+	def errorOf(kind ErrorKind, message string, status int = 0, errorType string = "", cause ?error = none) ElasticError {
+		return ElasticError{message: message, code: kind.value, kind: kind, status: status, errorType: errorType, cause: cause}
+	}
+
+	// The ElasticError a failure of std.net or std.net.http stands for.
+	def transportError(err error, about string) ElasticError {
+		let late = err.code := "timeout" || "ETIMEDOUT"
+		late = true when err is net.NetError && err.kind == net.ErrorCode.TimedOut
+		return errorOf(late ?? (ErrorKind.TimedOut, ErrorKind.Connection), "elasticsearch: {about}: {err.message}", 0, "", err)
+	}
+
+	// Node is one node requests may go to.
+	type Node {
+		// `https://host:9200`, without a trailing slash.
+		base                string
+		atomic failures     int
+		// Until when (Unix nanoseconds) the node is passed over; 0 when it is
+		// not.
+		atomic retiredUntil int64
+
+		def new(base string) {
+			self.base = base
+		}
+
+		// failed sets the node aside: for `retireFor`, doubling with each
+		// failure in a row up to 32 times that.
+		atomic def failed(retireFor duration, now int64) {
+			failures++
+			let rounds = failures.min(6) - 1
+			retiredUntil = now + (retireFor.nanoseconds() << rounds)
+		}
+
+		atomic def answered() {
+			failures = 0
+			retiredUntil = 0
+		}
+	}
+
+	// Settings is how a Transport reaches the cluster.
+	struct Settings {
+		// The value of the `Authorization` header; "" for none.
+		authorization string
+		tlsConfig     ?tls.Config
+		timeout       duration
+		maxRetries    int
+		retireFor     duration
+	}
+
+	// Transport sends requests to the nodes of one cluster.
+	type Transport {
+		settings      Settings
+		atomic nodes  Node[]
+		atomic turn   int
+		pool          http.Transport
+		client        http.Client
+		// `elasticsearch` or `opensearch`, and the major version; known after
+		// `discover`.
+		family        string         = ""
+		major         int            = 0
+		atomic closed bool
+
+		def new(urls string[], settings Settings) {
+			self.settings = settings
+			for let address in urls {
+				nodes.push(new Node(address))
+			}
+			pool = new http.Transport()
+			pool.tls = settings.tlsConfig
+			pool.maxIdlePerHost = 16
+			client = new http.Client()
+			client.transport = pool
+			client.userAgent = "adm.database.elasticsearch"
+		}
+
+		// discover asks the cluster what it is (`GET /`): Elasticsearch or
+		// OpenSearch, and which version.
+		// Fails as `send` does, and with ErrorKind.Protocol when the answer
+		// is not a cluster's.
+		def discover() !none {
+			let res = try send(http.Method.GET, "/", none, none, "")
+			let about = ClusterAbout{}
+			let data = res.bytes() onerror (err error) {
+				fail transportError(err, "GET /")
+			}
+			new encoding.JSON().decode(data, about) onerror (err error) {
+				fail errorOf(ErrorKind.Protocol, "elasticsearch: GET / did not answer as a cluster does: {err.message}")
+			}
+			fail errorOf(ErrorKind.Protocol, "elasticsearch: GET / names no version") when about.version.number == ""
+			family = about.version.distribution == "opensearch" ?? ("opensearch", "elasticsearch")
+			let dot = about.version.number.indexOf(".")
+			let leading = dot > 0 ?? (about.version.number.slice(0, dot), about.version.number)
+			major = /^[0-9]{1,3}$/.test(leading) ?? (leading.toInt<int>(10), 0)
+			return none
+		}
+
+		// sniff replaces the nodes by those the cluster lists with an HTTP
+		// address (`GET /_nodes/http`), reached the way the first node is.
+		// Fails as `send` does.
+		def sniff() !none {
+			let res = try send(http.Method.GET, "/_nodes/http", none, none, "")
+			let listed = NodesReply{}
+			let data = res.bytes() onerror (err error) {
+				fail transportError(err, "GET /_nodes/http")
+			}
+			new encoding.JSON().decode(data, listed) onerror (err error) {
+				fail errorOf(ErrorKind.Protocol, "elasticsearch: GET /_nodes/http: {err.message}")
+			}
+			let scheme = nodes.len() > 0 && nodes[0].base.startsWith("https:") ?? ("https", "http")
+			let found Node[] = []
+			for let (_, node) in listed.nodes {
+				let published = node.http.publishAddress
+				continue when published == ""
+				// `hostname/ip:port` names the host the certificate is for.
+				let slash = published.indexOf("/")
+				let address = published
+				if slash > 0 {
+					let colon = published.lastIndexOf(":")
+					address = published.slice(0, slash) + published.slice(colon)
+				}
+				found.push(new Node("{scheme}://{address}"))
+			}
+			adopt(found) when found.len() > 0
+			return none
+		}
+
+		atomic def adopt(found Node[]) {
+			nodes = found
+		}
+
+		// The node the next request goes to: the nodes in turn, those set
+		// aside passed over while any other is there.
+		atomic def pick() Node {
+			let now = time.now().unixNs()
+			let count = nodes.len()
+			for let step = 0; step < count; step++ {
+				let node = nodes[(turn + step) % count]
+				if node.retiredUntil <= now {
+					turn = (turn + step + 1) % count
+					return node
+				}
+			}
+			// Every node is set aside: the one whose time is up first.
+			let soonest = nodes[0]
+			for let node in nodes {
+				soonest = node when node.retiredUntil < soonest.retiredUntil
+			}
+			return soonest
+		}
+
+		// The value of `Content-Type` and `Accept` for JSON (`ndjson` for the
+		// bulk body): Elasticsearch 8 and later is asked for its own media
+		// type, which keeps the answers of this major version.
+		def mediaType(ndjson bool) string {
+			return "application/vnd.elasticsearch+{ndjson ?? ("x-ndjson", "json")}; compatible-with={major}" when family == "elasticsearch" && major >= 8
+			return ndjson ?? ("application/x-ndjson", "application/json")
+		}
+
+		// send makes a request and returns the response with its body unread.
+		// A node that cannot be reached, or answers 502, 503 or 504, is set
+		// aside and the request goes to the next, up to `maxRetries` more
+		// times.
+		// Fails with an ElasticError: ErrorKind.Closed after `close`,
+		// ErrorKind.Connection or TimedOut when no node answers, and the
+		// server's error for a status of 400 and above.
+		def send(method http.Method, path string, query ?url.Values, body ?byte[], contentType string, stream bool = false) !http.Response {
+			fail errorOf(ErrorKind.Closed, "elasticsearch: the client is closed") when closed
+			let about = "{method} {path}"
+			let attempts = settings.maxRetries + 1
+			let last ?ElasticError = none
+			for let round = 0; round < attempts; round++ {
+				let node = pick()
+				let target = try requestFor(node, method, path, query, body, contentType, stream)
+				let (res, failure) = attempt(target, about)
+				if failure is none && !(res.status := 502 || 503 || 504) {
+					node.answered() when node.failures != 0
+					return try checked(res, about)
+				}
+				last = failure is none ?? (try errorFrom(res, about), failure)
+				node.failed(settings.retireFor, time.now().unixNs())
+				// A body already sent may have been applied: only a request
+				// that failed to connect goes again unless it reads.
+				break unless failure is none || (method := http.Method.GET || http.Method.HEAD)
+			}
+			fail last unless last is none
+			fail errorOf(ErrorKind.Connection, "elasticsearch: {about}: no node to send to")
+		}
+
+		// Sends a request once: the response, or the failure that stopped it.
+		def attempt(target http.Request, about string) (http.Response, ?ElasticError) {
+			let failure ?ElasticError = none
+			let res = client.do(target) onerror (err error) {
+				failure = transportError(err, about)
+				recover new http.Response()
+			}
+			return (res, failure)
+		}
+
+		def requestFor(node Node, method http.Method, path string, query ?url.Values, body ?byte[], contentType string, stream bool) !http.Request {
+			let full = "{node.base}{path}"
+			full = "{full}?{query.encode()}" when !(query is none) && query.len() > 0
+			let payload ?io.Reader = none
+			payload = new bytes.Reader(body) unless body is none
+			let target = http.newRequest(method, full, payload) onerror (err error) {
+				fail errorOf(ErrorKind.Argument, "elasticsearch: {method} {path}: {err.message}")
+			}
+			let media = mediaType(false)
+			target.headers.set("Accept", media)
+			target.headers.set("Content-Type", contentType == "" ?? (media, contentType)) unless body is none
+			target.headers.set("Authorization", settings.authorization) unless settings.authorization == ""
+			target.deadline = time.now() + settings.timeout when !stream && settings.timeout > 0s
+			return target
+		}
+
+		// call sends a request with an optional JSON body and returns the
+		// answer's bytes.
+		// Fails as `send` does.
+		def call(method http.Method, path string, query ?url.Values = none, body ?byte[] = none, contentType string = "") !byte[] {
+			let res = try send(method, path, query, body, contentType)
+			return res.bytes() onerror (err error) {
+				fail transportError(err, "{method} {path}")
+			}
+		}
+
+		// json sends a request whose body is `body` as JSON, and decodes the
+		// answer onto `target` (none: dropped).
+		// Fails as `send` does, and with ErrorKind.Protocol when the answer
+		// does not decode.
+		def json(method http.Method, path string, query ?url.Values = none, body ?any = none, target ?any = none) !none {
+			let payload ?byte[] = none
+			payload = encodeJSON(body) unless body is none
+			let data = try call(method, path, query, payload)
+			if !(target is none) {
+				new encoding.JSON().decode(data, target) onerror (err error) {
+					fail errorOf(ErrorKind.Protocol, "elasticsearch: {method} {path}: the answer does not read as the API says: {err.message}")
+				}
+			}
+			return none
+		}
+
+		def close() {
+			closed = true
+			pool.closeIdle()
+		}
+	}
+
+	// A body as JSON: a byte[] as it is (JSON already), a string as its
+	// text, anything else through the JSON codec.
+	def encodeJSON(body any) byte[] {
+		match body {
+			case byte[]:
+				return body
+			case string:
+				return body.bytes()
+			default:
+				return new encoding.JSON().encode(body)
+		}
+	}
+
+	// The response when its status is below 400; else the server's error.
+	def checked(res http.Response, about string) !http.Response {
+		return res when res.status < 400
+		fail try errorFrom(res, about)
+	}
+
+	// The ElasticError a failed response stands for: its `error.type` and
+	// `error.reason` (or a plain `error` text), its status.
+	def errorFrom(res http.Response, about string) !ElasticError {
+		let data = res.bytes() onerror recover byte[]
+		let reply = ErrorReply{}
+		new encoding.JSON().decode(data, reply) onerror recover none
+		let failure = reply.error
+		let kind = ""
+		let reason = string(data).trim()
+		if !(failure is none) {
+			kind = failure.kind
+			reason = failure.reason unless failure.reason == ""
+		}
+		reason = "{res.status} {res.reason}" when reason == ""
+		return errorOf(kindOfStatus(res.status, kind), "elasticsearch: {about}: {kind == "" ?? (reason, "{kind}: {reason}")}", res.status, kind)
+	}
+
+	// The kind of failure a status and an error type stand for.
+	def kindOfStatus(status int, errorType string) ErrorKind {
+		return ErrorKind.Conflict when status == 409 || (errorType := "resource_already_exists_exception" || "version_conflict_engine_exception")
+		match status {
+			case 400:
+				return ErrorKind.Argument
+			case 401, 403:
+				return ErrorKind.Denied
+			case 404:
+				return ErrorKind.NotFound
+			case 429:
+				return ErrorKind.Busy
+			case 408, 504:
+				return ErrorKind.TimedOut
+			default:
+				return ErrorKind.Server
+		}
+	}
+
+	struct ErrorReply {
+		error  ?ErrorBody
+		status int
+	}
+
+	// The `error` of a failed response. The server sends a plain string
+	// for some failures; that reads as its reason. A failure of every shard
+	// says only that, so the first shard's cause is added to the reason.
+	type ErrorBody {
+		@json("type")
+		kind string
+		reason string
+
+		def new() {}
+
+		// Implements JSONDecoder: an object, or a string.
+		// Fails when it is neither.
+		def json(data byte[]) !none {
+			let text = string(data).trim()
+			if text.startsWith("\"") {
+				reason = text.slice(1, text.len() - 1)
+				return none
+			}
+			let wire = ErrorWire{}
+			try new encoding.JSON().decode(data, wire)
+			kind = wire.kind
+			reason = wire.reason
+			if wire.rootCause.len() > 0 && wire.rootCause[0].reason != wire.reason {
+				let root = wire.rootCause[0]
+				reason = "{reason}: {root.kind}: {root.reason}"
+			}
+			return none
+		}
+	}
+
+	struct ErrorWire {
+		@json("type")
+		kind string
+		reason string
+		@json("root_cause")
+		rootCause CauseWire[]
+	}
+
+	struct CauseWire {
+		@json("type")
+		kind string
+		reason string
+	}
+
+	struct ClusterAbout {
+		version VersionAbout
+	}
+
+	struct VersionAbout {
+		number       string
+		distribution string
+	}
+
+	struct NodesReply {
+		nodes map<string, NodeAbout>
+	}
+
+	struct NodeAbout {
+		http NodeHttp
+	}
+
+	struct NodeHttp {
+		@json("publish_address")
+		publishAddress string
+	}
+}

@@ -1,0 +1,63 @@
+partial module adm.database.elasticsearch {
+	use std.errors
+
+	// ErrorKind says what went wrong, for a handler that narrowed the error
+	// with `err is ElasticError`.
+	enum ErrorKind {
+		// No node can be reached, or the connection broke.
+		Connection = "connection",
+		// Nothing arrived within the timeout.
+		TimedOut   = "timeout",
+		// The client was closed.
+		Closed     = "closed",
+		// A request the server or the client does not take (400): a query
+		// that does not parse, a mapping that does not fit.
+		Argument   = "argument",
+		// The credentials were refused, or the user may not do this (401,
+		// 403).
+		Denied     = "denied",
+		// No such index, document, alias, template or pipeline (404).
+		NotFound   = "notfound",
+		// A write lost to another: the document changed since its sequence
+		// number was read, it exists already, or the index does (409, 400
+		// `resource_already_exists_exception`).
+		Conflict   = "conflict",
+		// Too many requests: the cluster pushes back (429).
+		Busy       = "busy",
+		// What the server sent is not what the API says it sends.
+		Protocol   = "protocol",
+		// The server failed (500 and the rest), or a bulk write failed for
+		// some of its items (`failures` lists them).
+		Server     = "server",
+	}
+
+	// ElasticError is the payload every failure of this library carries.
+	// `code` repeats `kind.value`.
+	struct ElasticError {
+		message   string
+		code      string
+		cause     ?error
+		stack     errors.StackTrace
+		kind      ErrorKind
+		// The HTTP status the server answered with; 0 when the failure is
+		// not an answer.
+		status    int
+		// The server's error type, `index_not_found_exception`; "" when it
+		// sent none.
+		errorType string
+		// The items of a bulk write that failed, in the order they were
+		// written.
+		failures  BulkFailure[]
+	}
+
+	// BulkFailure is one item a bulk write could not apply.
+	struct BulkFailure {
+		// `index`, `create`, `update` or `delete`.
+		action    string
+		index     string
+		id        string
+		status    int
+		errorType string
+		reason    string
+	}
+}

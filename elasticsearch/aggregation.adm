@@ -1,0 +1,220 @@
+partial module adm.database.elasticsearch {
+	use adm.database.elasticsearch.wire::*
+
+	// Aggregation is one aggregation of a search: `aggs.terms("tags")`,
+	// `aggs.dateHistogram("sold", calendarInterval = "month")`, with
+	// aggregations under it by name. `new Aggregation(kind, settings)` makes
+	// any the `aggs` module does not, from its JSON.
+	//
+	// ```
+	// let byTag = aggs.terms("tags", size = 20).sub("price", aggs.stats("price"))
+	// let found = try products.search(options = elasticsearch.SearchOptions{size: 0, aggregations: {"by_tag": byTag}})
+	// for let bucket in found.aggregation("by_tag").buckets {
+	//     print("{bucket.keyText} {bucket.docCount} {bucket.sub("price").avg}")
+	// }
+	// ```
+	type Aggregation {
+		// The aggregation's type, `terms`; and its settings.
+		kind             string
+		settings         map<string, any>
+		internal subs    map<string, Aggregation> = {}
+		internal query   ?Query                   = none
+		internal queries map<string, Query>       = {}
+
+		def new(kind string, settings map<string, any>) {
+			self.kind = kind
+			self.settings = settings
+		}
+
+		// A `filter` aggregation: the documents a query matches, as one
+		// bucket.
+		def new(query Query) {
+			kind = "filter"
+			settings = {}
+			self.query = query
+		}
+
+		// A `filters` aggregation: the documents of each query, a bucket by
+		// name.
+		def new(queries map<string, Query>) {
+			kind = "filters"
+			settings = {}
+			self.queries = queries
+		}
+
+		// sub adds an aggregation under this one, computed for each of its
+		// buckets, and returns this one.
+		def sub(name string, aggregation Aggregation) Aggregation {
+			subs.set(name, aggregation)
+			return self
+		}
+
+		// dsl returns the aggregation as the query DSL's JSON, its queries in
+		// the family's form.
+		def dsl(openSearch bool = false) map<string, any> {
+			let body = new map<string, any>()
+			for let (key, value) in settings {
+				body.set(key, value)
+			}
+			let single = query
+			let out = new map<string, any>()
+			if !(single is none) {
+				out.set(kind, single.dsl(openSearch))
+			} else if queries.len() > 0 {
+				let named = new map<string, any>()
+				for let (name, each) in queries {
+					named.set(name, each.dsl(openSearch))
+				}
+				body.set("filters", named)
+				out.set(kind, body)
+			} else {
+				out.set(kind, body)
+			}
+			if subs.len() > 0 {
+				let nested = new map<string, any>()
+				for let (name, child) in subs {
+					nested.set(name, child.dsl(openSearch))
+				}
+				out.set("aggs", nested)
+			}
+			return out
+		}
+
+		// read returns what the server answered for this aggregation, from
+		// the answer's JSON.
+		def read(node map<string, any>) AggregationResult {
+			let out = new AggregationResult()
+			out.value = numberIn(node, "value")
+			let shown = node.get("value_as_string")
+			out.valueText = shown is string ?? (shown, "")
+			let counted = numberIn(node, "count")
+			out.count = int(counted) unless counted is none
+			out.min = numberIn(node, "min")
+			out.max = numberIn(node, "max")
+			out.avg = numberIn(node, "avg")
+			out.sum = numberIn(node, "sum")
+			let docs = numberIn(node, "doc_count")
+			out.docCount = int(docs) unless docs is none
+			let values = node.get("values")
+			if values is map<string, any> {
+				for let (key, value) in values {
+					let n = numberOf(value)
+					out.values.set(key, n) unless n is none
+				}
+			}
+			let after = node.get("after_key")
+			out.afterKey = after when after is map<string, any>
+			let hits = node.get("hits")
+			if hits is map<string, any> {
+				let inner = hits.get("hits")
+				if inner is any[] {
+					for let hit in inner {
+						if hit is map<string, any> {
+							let source = hit.get("_source")
+							out.hits.push(source) when source is map<string, any>
+						}
+					}
+				}
+			}
+			let buckets = node.get("buckets")
+			if buckets is any[] {
+				for let item in buckets {
+					out.buckets.push(readBucket(item, "")) when item is map<string, any>
+				}
+			} else if buckets is map<string, any> {
+				for let (key, item) in buckets {
+					out.buckets.push(readBucket(item, key)) when item is map<string, any>
+				}
+			}
+			for let (name, child) in subs {
+				let part = node.get(name)
+				out.subs.set(name, child.read(part)) when part is map<string, any>
+			}
+			return out
+		}
+
+		internal def readBucket(node map<string, any>, name string) AggregationBucket {
+			let out = new AggregationBucket()
+			let key = node.get("key")
+			if name != "" {
+				out.key = name
+			} else if !(key is none) {
+				out.key = key
+			}
+			let shown = node.get("key_as_string")
+			out.keyText = shown is string ?? (shown, textOf(out.key))
+			let docs = numberIn(node, "doc_count")
+			out.docCount = int(docs) unless docs is none
+			out.from = numberIn(node, "from")
+			out.to = numberIn(node, "to")
+			for let (child, aggregation) in subs {
+				let part = node.get(child)
+				out.subs.set(child, aggregation.read(part)) when part is map<string, any>
+			}
+			return out
+		}
+	}
+
+	// AggregationResult is what one aggregation answered. Which fields hold
+	// something depends on its kind: `value` for a metric (`avg`,
+	// `cardinality`), `count` to `sum` for `stats`, `values` for
+	// `percentiles`, `buckets` for a bucket aggregation, `docCount` and
+	// `subs` for one with a single bucket (`filter`, `nested`), `afterKey`
+	// for `composite`, `hits` (the sources) for `topHits`.
+	type AggregationResult {
+		value     ?float                         = none
+		valueText string                         = ""
+		count     int                            = 0
+		min       ?float                         = none
+		max       ?float                         = none
+		avg       ?float                         = none
+		sum       ?float                         = none
+		// Percentiles by percent: `"95.0"`.
+		values    map<string, float>             = {}
+		docCount  int                            = 0
+		buckets   AggregationBucket[]            = []
+		afterKey  map<string, any>               = {}
+		hits      map<string, any>[]             = []
+		subs      map<string, AggregationResult> = {}
+
+		def new() {}
+
+		// The aggregation under this one of that name; an empty result when
+		// there is none.
+		def sub(name string) AggregationResult {
+			let found = subs.get(name)
+			return found is none ?? (new AggregationResult(), found)
+		}
+
+		// The bucket whose key reads as `key`; an empty one (no documents)
+		// when there is none.
+		def bucket(key string) AggregationBucket {
+			for let each in buckets {
+				return each when each.keyText == key
+			}
+			return new AggregationBucket()
+		}
+	}
+
+	// AggregationBucket is one bucket of a bucket aggregation: its key (a
+	// term, a number, a date as epoch milliseconds, a composite's map; the
+	// filter's name for `filters`), the key as text, how many documents fall
+	// in it, a range's bounds, and the aggregations under it.
+	type AggregationBucket {
+		key      any                            = none
+		keyText  string                         = ""
+		docCount int                            = 0
+		from     ?float                         = none
+		to       ?float                         = none
+		subs     map<string, AggregationResult> = {}
+
+		def new() {}
+
+		// The aggregation under this bucket of that name; an empty result when
+		// there is none.
+		def sub(name string) AggregationResult {
+			let found = subs.get(name)
+			return found is none ?? (new AggregationResult(), found)
+		}
+	}
+}

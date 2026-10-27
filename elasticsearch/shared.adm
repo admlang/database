@@ -1,0 +1,208 @@
+// What a Client's parts share, and the addresses, cloud ids and
+// certificate fingerprints a client is given.
+internal partial module adm.database.elasticsearch.wire {
+	use (
+		std.crypto.hash::(SHA256)
+		std.data.encoding
+		std.crypto.x509::(CertPool)
+		std.data.encoding::(base64decode, base64encode)
+		std.net
+		std.net.http
+		std.net.tls
+		std.net.url
+		adm.database.elasticsearch::*
+	)
+
+	// Shared is the state a Client and its views share: the transport,
+	// once connected.
+	type Shared {
+		transport ?Transport = none
+
+		def new() {}
+
+		// The transport.
+		// Fails with ErrorKind.Closed before `connect`.
+		def wire() !Transport {
+			let current = transport
+			fail errorOf(ErrorKind.Closed, "elasticsearch: the client is not connected; call connect first") when current is none
+			return current
+		}
+
+		// Whether the cluster is OpenSearch.
+		def openSearch() bool {
+			let current = transport
+			return !(current is none) && current.family == "opensearch"
+		}
+	}
+
+	// The base of a node's address: scheme, host and port, the scheme's
+	// when the port is left out.
+	// Fails with ErrorKind.Argument for an address that is not `http:` or
+	// `https:`.
+	def baseOf(address string) !string {
+		let parsed = url.parse(address) onerror (err error) {
+			fail errorOf(ErrorKind.Argument, "elasticsearch: '{address}' is not an address: {err.message}")
+		}
+		fail errorOf(ErrorKind.Argument, "elasticsearch: '{address}' is not an http: or https: address") unless parsed.scheme := "http" || "https"
+		let host = parsed.hostname()
+		fail errorOf(ErrorKind.Argument, "elasticsearch: '{address}' names no host") when host == ""
+		let port = parsed.port()
+		port = parsed.scheme == "https" ?? (443, 80) when port <= 0
+		let shown = host.contains(":") ?? ("[{host}]", host)
+		return "{parsed.scheme}://{shown}:{port}"
+	}
+
+	// The address an Elastic Cloud id names: `name:` then base64 of
+	// `host$elasticsearch-id$kibana-id`, the host with an optional port.
+	// Fails with ErrorKind.Argument for an id that does not read.
+	def cloudAddress(cloudId string) !string {
+		let colon = cloudId.indexOf(":")
+		let encoded = colon >= 0 ?? (cloudId.slice(colon + 1), cloudId)
+		let decoded = string(base64decode(encoded) onerror (err error) {
+			fail errorOf(ErrorKind.Argument, "elasticsearch: the cloud id is not base64 after its name: {err.message}")
+		})
+		let parts = decoded.split("$")
+		fail errorOf(ErrorKind.Argument, "elasticsearch: the cloud id names no Elasticsearch host") when parts.len() < 2 || parts[0] == "" || parts[1] == ""
+		let host = parts[0]
+		let port = "443"
+		let at = host.indexOf(":")
+		if at >= 0 {
+			port = host.slice(at + 1)
+			host = host.slice(0, at)
+		}
+		return "https://{parts[1]}.{host}:{port}"
+	}
+
+	// pinnedConfig makes a TLS configuration that trusts the certificate
+	// with the fingerprint given: it meets a node, finds that certificate in
+	// the chain the node presents, and makes it the one authority, so the
+	// node's name is checked as usual.
+	// Fails with ErrorKind.Argument for a fingerprint that is not 32 bytes
+	// of hex, ErrorKind.Connection when no node can be met or none presents
+	// a certificate with that fingerprint.
+	def pinnedConfig(bases string[], fingerprint string, given ?tls.Config, timeout duration) !tls.Config {
+		let wanted = fingerprint.replace(":", "").lower().trim()
+		fail errorOf(ErrorKind.Argument, "elasticsearch: the CA fingerprint is not a SHA-256 in hex") unless /^[0-9a-f]{64}$/.test(wanted)
+		let failure = ""
+		for let base in bases {
+			continue unless base.startsWith("https:")
+			let host = base.slice(8, base.lastIndexOf(":"))
+			host = host.slice(1, host.len() - 1) when host.startsWith("[")
+			let failed = false
+			let raw = net.dialStream(base.slice(8), timeout) onerror (err error) {
+				failure = err.message
+				failed = true
+				recover new net.Connection(-1)
+			}
+			continue when failed
+			let conn = tls.client(raw, tls.Config{serverName: host, insecureSkipVerify: true})
+			conn.handshake(timeout) onerror (err error) {
+				failure = err.message
+				failed = true
+				recover none
+			}
+			if failed {
+				conn.close() onerror recover none
+				continue
+			}
+			let chain = conn.connectionState().peerCertificates
+			conn.close() onerror recover none
+			for let cert in chain {
+				if new SHA256().hash(cert.raw).hex().lower() == wanted {
+					let pool = new CertPool()
+					pool.addCert(cert)
+					let config = tls.Config{}
+					config = tls.Config{...given} unless given is none
+					config.rootCAs = pool
+					return config
+				}
+			}
+			failure = "no certificate {base} presents has that fingerprint" when failure == ""
+		}
+		fail errorOf(ErrorKind.Connection, "elasticsearch: the CA fingerprint could not be checked: {failure == "" ?? ("no https node", failure)}")
+	}
+
+	// The whole seconds of a span, rounded up.
+	def wholeSeconds(span duration) int {
+		return int((span.nanoseconds() + 999999999) / 1000000000)
+	}
+
+	// A span as the API writes it: `90s`, `1500ms`.
+	def spanText(span duration) string {
+		let ms = span.milliseconds()
+		return "{ms / 1000}s" when ms % 1000 == 0
+		return "{ms}ms"
+	}
+
+	// A cell of a cat row; "" when it is missing.
+	def cell(row map<string, string>, key string) string {
+		let value = row.get(key)
+		return value is none ?? ("", value)
+	}
+
+	// A cell of a cat row as a whole number; 0 when it is missing or not a
+	// number.
+	def number(row map<string, string>, key string) int {
+		let text = cell(row, key)
+		return 0 unless /^-?[0-9]{1,18}$/.test(text)
+		return text.toInt<int>(10)
+	}
+
+	// A cell of a cat row as a fraction; 0 when it is missing or not a
+	// number.
+	def fraction(row map<string, string>, key string) float {
+		let text = cell(row, key)
+		return 0.0 unless /^-?[0-9]+(\.[0-9]+)?$/.test(text)
+		return parseFloat<float>(text)
+	}
+
+	struct CountReply {
+		count int
+	}
+
+	struct PitReply {
+		id string
+		@json("pit_id")
+		pitId string
+	}
+
+	// Opens a point in time: `_pit` on Elasticsearch,
+	// `_search/point_in_time` on OpenSearch.
+	def openPit(shared Shared, index string, keepAlive duration) !PointInTime {
+		let link = try shared.wire()
+		let query = new url.Values()
+		query.set("keep_alive", spanText(keepAlive))
+		let path = shared.openSearch() ?? ("/{url.pathEscape(index)}/_search/point_in_time", "/{url.pathEscape(index)}/_pit")
+		let reply = PitReply{}
+		try link.json(http.Method.POST, path, query, target = reply)
+		let id = reply.id == "" ?? (reply.pitId, reply.id)
+		fail errorOf(ErrorKind.Protocol, "elasticsearch: the cluster opened a point in time without an id") when id == ""
+		return PointInTime{id: id, keepAlive: keepAlive}
+	}
+
+	def closePit(shared Shared, id string) !none {
+		let link = try shared.wire()
+		if shared.openSearch() {
+			try link.json(http.Method.DELETE, "/_search/point_in_time", body = {"pit_id": [id]})
+		} else {
+			try link.json(http.Method.DELETE, "/_pit", body = {"id": id})
+		}
+		return none
+	}
+
+	// The `Authorization` header: the API key, the bearer token, or the user
+	// and password, in that order; "" for none.
+	def authorizationOf(apiKey ?Secret<string>, bearerToken ?Secret<string>, username string, password ?Secret<string>) string {
+		if !(apiKey is none) {
+			let text = apiKey.reveal()
+			// `id:key` goes encoded; the encoded form goes as it is.
+			return "ApiKey {text.contains(":") ?? (base64encode(text.bytes()), text)}"
+		}
+		return "Bearer {bearerToken.reveal()}" unless bearerToken is none
+		if username != "" {
+			let word = password is none ?? ("", password.reveal())
+			return "Basic {base64encode("{username}:{word}".bytes())}"
+		}
+		return ""
+	}
+}

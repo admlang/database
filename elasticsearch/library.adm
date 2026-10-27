@@ -1,11 +1,15 @@
-// Elasticsearch and OpenSearch client
-@manifest(version = "0.0.1")
+// An Elasticsearch and OpenSearch client as an ADM library, over
+// std.net.http.
+@manifest(version = "0.1.0")
 library adm.database.elasticsearch {
 	use (
 		adm.database.elasticsearch
+		adm.database.elasticsearch.aggs
+		adm.database.elasticsearch.wire
 	)
 
 	export (
 		adm.database.elasticsearch
+		adm.database.elasticsearch.aggs
 	)
 }

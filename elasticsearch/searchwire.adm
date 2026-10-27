@@ -1,0 +1,244 @@
+// A search in the API's shape: the body a SearchOptions makes, and the
+// answer before it becomes a SearchResult.
+internal partial module adm.database.elasticsearch.wire {
+	use (
+		std.data.encoding
+		adm.database.elasticsearch::*
+	)
+
+	type SearchWire<T> {
+		took int
+		@json("timed_out")
+		timedOut bool
+		hits HitsWire<T>
+		aggregations map<string, any>
+		suggest map<string, Suggestion[]>
+		@json("_scroll_id")
+		scrollId string
+		@json("pit_id")
+		pitId string
+		// Set on a failed search of a multi-search.
+		error ?ErrorBody
+		status int
+
+		def new() {
+			hits = new HitsWire<T>()
+		}
+	}
+
+	type DocumentWire<T> {
+		@json("_id")
+		id string
+		@json("_version")
+		version int
+		@json("_seq_no")
+		seqNo int
+		@json("_primary_term")
+		primaryTerm int
+		found bool
+		@json("_source")
+		source T
+
+		def new() {
+			source = new T()
+		}
+	}
+
+	type ManyWire<T> {
+		docs DocumentWire<T>[]
+
+		def new() {}
+	}
+
+	type MultiWire<T> {
+		responses SearchWire<T>[]
+
+		def new() {}
+	}
+
+	struct ExplainWire {
+		explanation Explanation
+	}
+
+	// Whether a failure is a 404 that names no error: a document that is
+	// not there, as against an index that is not.
+	def absent(err error) bool {
+		return err.status == 404 && err.errorType == "" when err is ElasticError
+		return false
+	}
+
+	// A script as the API takes it.
+	def scriptBody(script Script) map<string, any> {
+		let out = new map<string, any>()
+		out.set("source", script.source)
+		out.set("lang", script.lang)
+		out.set("params", script.params) when script.params.len() > 0
+		return out
+	}
+
+	type HitsWire<T> {
+		total TotalWire
+		@json("max_score")
+		maxScore ?float
+		hits HitWire<T>[]
+
+		def new() {}
+	}
+
+	struct TotalWire {
+		value    int
+		relation string
+	}
+
+	type HitWire<T> {
+		@json("_index")
+		index string
+		@json("_id")
+		id string
+		@json("_score")
+		score ?float
+		@json("_source")
+		source T
+		sort any[]
+		highlight map<string, string[]>
+		@json("_seq_no")
+		seqNo int
+		@json("_primary_term")
+		primaryTerm int
+
+		def new() {
+			source = new T()
+		}
+	}
+
+	// The body of a search.
+	def searchBody(options SearchOptions, openSearch bool) map<string, any> {
+		let body = new map<string, any>()
+		let query = options.query
+		body.set("query", query.dsl(openSearch)) unless query is none
+		body.set("size", options.size)
+		body.set("from", options.from) when options.from > 0
+		if options.sort.len() > 0 {
+			let keys any[] = []
+			for let key in options.sort {
+				let settings = new map<string, any>()
+				settings.set("order", key.desc ?? ("desc", "asc"))
+				settings.set("missing", key.missing) unless key.missing == ""
+				keys.push(map<string, any>{key.field: settings})
+			}
+			body.set("sort", keys)
+		}
+		if options.noSource {
+			body.set("_source", false)
+		} else if options.includes.len() > 0 || options.excludes.len() > 0 {
+			body.set("_source", {"includes": options.includes, "excludes": options.excludes})
+		}
+		let highlight = options.highlight
+		if !(highlight is none) {
+			let fields = new map<string, any>()
+			for let field in highlight.fields {
+				fields.set(field, new map<string, any>())
+			}
+			let settings = new map<string, any>()
+			settings.set("fields", fields)
+			settings.set("pre_tags", [highlight.preTag]) unless highlight.preTag == ""
+			settings.set("post_tags", [highlight.postTag]) unless highlight.postTag == ""
+			settings.set("fragment_size", highlight.fragmentSize) when highlight.fragmentSize > 0
+			settings.set("number_of_fragments", highlight.numberOfFragments) when highlight.numberOfFragments > 0
+			body.set("highlight", settings)
+		}
+		if options.aggregations.len() > 0 {
+			let aggs = new map<string, any>()
+			for let (name, aggregation) in options.aggregations {
+				aggs.set(name, aggregation.dsl(openSearch))
+			}
+			body.set("aggs", aggs)
+		}
+		let post = options.postFilter
+		body.set("post_filter", post.dsl(openSearch)) unless post is none
+		body.set("search_after", options.searchAfter) when options.searchAfter.len() > 0
+		let pit = options.pointInTime
+		body.set("pit", {"id": pit.id, "keep_alive": spanText(pit.keepAlive)}) unless pit is none
+		body.set("track_total_hits", true) when options.exactTotal
+		let floor = options.minScore
+		body.set("min_score", floor) unless floor is none
+		let limit = options.timeout
+		body.set("timeout", spanText(limit)) unless limit is none
+		body.set("collapse", {"field": options.collapse}) unless options.collapse == ""
+		if options.suggest.len() > 0 {
+			let suggest = new map<string, any>()
+			for let (name, suggester) in options.suggest {
+				suggest.set(name, map<string, any>{"text": suggester.text, suggester.kind.value: map<string, any>{"field": suggester.field, "size": suggester.size}})
+			}
+			body.set("suggest", suggest)
+		}
+		body.set("seq_no_primary_term", true) when options.seqNoPrimaryTerm
+		return body
+	}
+
+	// The SearchResult a decoded answer stands for, its aggregations read
+	// as the options asked for them.
+	def resultOf<T>(wire SearchWire<T>, options SearchOptions) SearchResult<T> {
+		let out = new SearchResult<T>()
+		out.took = wire.took
+		out.timedOut = wire.timedOut
+		out.total = wire.hits.total.value
+		out.totalIsLowerBound = wire.hits.total.relation == "gte"
+		out.maxScore = wire.hits.maxScore
+		for let each in wire.hits.hits {
+			let hit = new Hit<T>()
+			hit.id = each.id
+			hit.index = each.index
+			hit.score = each.score
+			hit.source = each.source
+			hit.sort = each.sort
+			hit.highlight = each.highlight
+			hit.seqNo = each.seqNo
+			hit.primaryTerm = each.primaryTerm
+			out.hits.push(hit)
+		}
+		for let (name, aggregation) in options.aggregations {
+			let node = wire.aggregations.get(name)
+			out.aggregations.set(name, aggregation.read(node)) when node is map<string, any>
+		}
+		out.suggestions = wire.suggest
+		out.scrollId = wire.scrollId
+		out.pointInTimeId = wire.pitId
+		return out
+	}
+
+	// A number in a parsed JSON object; none when it is missing or null.
+	def numberIn(node map<string, any>, key string) ?float {
+		return numberOf(node.get(key))
+	}
+
+	// A parsed JSON number as a float; none for anything else.
+	def numberOf(value ?any) ?float {
+		match value {
+			case int:
+				return float(value)
+			case float:
+				return value
+			default:
+				return none
+		}
+	}
+
+	// A parsed JSON value as text: a string as it is, a number or a bool
+	// written out, "" for null.
+	def textOf(value ?any) string {
+		match value {
+			case string:
+				return value
+			case int:
+				return value.str()
+			case float:
+				let whole = int(value)
+				return float(whole) == value ?? (whole.str(), value.str())
+			case bool:
+				return value ?? ("true", "false")
+			default:
+				return value is none ?? ("", string(new encoding.JSON().encode(value)))
+		}
+	}
+}

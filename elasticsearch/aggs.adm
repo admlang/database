@@ -1,0 +1,192 @@
+// The aggregations a search computes: `aggs.terms("tags")`,
+// `aggs.stats("price")`, combined with `Aggregation.sub`.
+module adm.database.elasticsearch.aggs {
+	use (
+		adm.database.elasticsearch::*
+		adm.database.elasticsearch.wire::(rangesOf)
+	)
+
+	// A range of a `range` or `dateRange` aggregation: from (included) and
+	// to (excluded), either open when none, and its key ("" lets the server
+	// name it).
+	struct Bucket {
+		from ?any   = none
+		to   ?any   = none
+		key  string = ""
+	}
+
+	// A source of a `composite` aggregation: a name and the aggregation
+	// (`terms`, `histogram`, `dateHistogram`) its values come from.
+	struct Source {
+		name        string
+		aggregation Aggregation
+	}
+
+	// terms buckets documents by the values of a keyword, number or
+	// boolean field, the `size` most frequent first (`order` changes that:
+	// `{"_key": "asc"}`). `missing` buckets documents without a value under
+	// it.
+	def terms(field string, size int = 10, minDocCount int = 1, order map<string, string> = {}, missing ?any = none) Aggregation {
+		let settings = new map<string, any>()
+		settings.set("field", field)
+		settings.set("size", size)
+		settings.set("min_doc_count", minDocCount) unless minDocCount == 1
+		settings.set("order", order) when order.len() > 0
+		settings.set("missing", missing) unless missing is none
+		return new Aggregation("terms", settings)
+	}
+
+	// histogram buckets a numeric field by steps of `interval`.
+	def histogram(field string, interval float, minDocCount int = 0) Aggregation {
+		return new Aggregation("histogram", map<string, any>{"field": field, "interval": interval, "min_doc_count": minDocCount})
+	}
+
+	// dateHistogram buckets a date field by calendar units
+	// (`calendarInterval`: `day`, `week`, `month`, `quarter`, `year`) or
+	// fixed spans (`fixedInterval`: `90m`, `7d`), the keys written in
+	// `format` and `timeZone`.
+	def dateHistogram(field string, calendarInterval string = "", fixedInterval string = "", format string = "", timeZone string = "", minDocCount int = 0) Aggregation {
+		let settings = new map<string, any>()
+		settings.set("field", field)
+		settings.set("calendar_interval", calendarInterval) unless calendarInterval == ""
+		settings.set("fixed_interval", fixedInterval) unless fixedInterval == ""
+		settings.set("format", format) unless format == ""
+		settings.set("time_zone", timeZone) unless timeZone == ""
+		settings.set("min_doc_count", minDocCount)
+		return new Aggregation("date_histogram", settings)
+	}
+
+	// range buckets a numeric field by the ranges given.
+	def range(field string, ranges Bucket[]) Aggregation {
+		return new Aggregation("range", map<string, any>{"field": field, "ranges": rangesOf(ranges)})
+	}
+
+	// dateRange buckets a date field by the ranges given, as dates or date
+	// math (`now-1M/M`).
+	def dateRange(field string, ranges Bucket[], format string = "") Aggregation {
+		let settings = new map<string, any>()
+		settings.set("field", field)
+		settings.set("ranges", rangesOf(ranges))
+		settings.set("format", format) unless format == ""
+		return new Aggregation("date_range", settings)
+	}
+
+	// stats computes the count, min, max, average and sum of a numeric
+	// field.
+	def stats(field string) Aggregation {
+		return new Aggregation("stats", map<string, any>{"field": field})
+	}
+
+	// extendedStats adds the variance and standard deviation to `stats`.
+	def extendedStats(field string) Aggregation {
+		return new Aggregation("extended_stats", map<string, any>{"field": field})
+	}
+
+	// percentiles computes the percentiles of a numeric field: 1, 5, 25,
+	// 50, 75, 95 and 99 when none are given.
+	def percentiles(field string, percents float[] = []) Aggregation {
+		let settings = new map<string, any>()
+		settings.set("field", field)
+		settings.set("percents", percents) when percents.len() > 0
+		return new Aggregation("percentiles", settings)
+	}
+
+	// cardinality estimates how many distinct values a field holds, exactly
+	// up to `precisionThreshold`.
+	def cardinality(field string, precisionThreshold int = 0) Aggregation {
+		let settings = new map<string, any>()
+		settings.set("field", field)
+		settings.set("precision_threshold", precisionThreshold) when precisionThreshold > 0
+		return new Aggregation("cardinality", settings)
+	}
+
+	// avg computes the average of a numeric field.
+	def avg(field string) Aggregation {
+		return new Aggregation("avg", map<string, any>{"field": field})
+	}
+
+	// sum computes the sum of a numeric field.
+	def sum(field string) Aggregation {
+		return new Aggregation("sum", map<string, any>{"field": field})
+	}
+
+	// min finds the least value of a numeric field.
+	def min(field string) Aggregation {
+		return new Aggregation("min", map<string, any>{"field": field})
+	}
+
+	// max finds the greatest value of a numeric field.
+	def max(field string) Aggregation {
+		return new Aggregation("max", map<string, any>{"field": field})
+	}
+
+	// valueCount counts the values of a field.
+	def valueCount(field string) Aggregation {
+		return new Aggregation("value_count", map<string, any>{"field": field})
+	}
+
+	// missing counts the documents without a value in a field.
+	def missing(field string) Aggregation {
+		return new Aggregation("missing", map<string, any>{"field": field})
+	}
+
+	// nested aggregates the objects of a nested field as documents of their
+	// own; `reverseNested` under it goes back to the parents.
+	def nested(path string) Aggregation {
+		return new Aggregation("nested", map<string, any>{"path": path})
+	}
+
+	// reverseNested aggregates, under a `nested` aggregation, the parent
+	// documents again.
+	def reverseNested() Aggregation {
+		return new Aggregation("reverse_nested", new map<string, any>())
+	}
+
+	// global aggregates every document of the indices, whatever the
+	// search's query.
+	def global() Aggregation {
+		return new Aggregation("global", new map<string, any>())
+	}
+
+	// filter aggregates the documents a query matches, as one bucket.
+	def filter(query Query) Aggregation {
+		return new Aggregation(query)
+	}
+
+	// filters aggregates the documents of each query, a bucket by name.
+	def filters(queries map<string, Query>) Aggregation {
+		return new Aggregation(queries)
+	}
+
+	// composite pages through every combination of its sources' values,
+	// `size` buckets a page: give the result's `afterKey` as `after` for
+	// the next.
+	def composite(sources Source[], size int = 10, after map<string, any> = {}) Aggregation {
+		let list any[] = []
+		for let source in sources {
+			// A source takes the field, interval and format of its kind, not
+			// a size, a minimum count or an order of buckets.
+			let settings = new map<string, any>()
+			for let (key, value) in source.aggregation.settings {
+				settings.set(key, value) unless key := "size" || "min_doc_count" || "order"
+			}
+			list.push(map<string, any>{source.name: map<string, any>{source.aggregation.kind: settings}})
+		}
+		let settings = new map<string, any>()
+		settings.set("sources", list)
+		settings.set("size", size)
+		settings.set("after", after) when after.len() > 0
+		return new Aggregation("composite", settings)
+	}
+
+	// topHits returns the `size` best documents of each bucket, `sort`
+	// ordering them (`{"date": "desc"}`), only the `includes` fields when
+	// given.
+	def topHits(size int = 3, sort map<string, string>[] = [], includes string[] = []) Aggregation {
+		let settings = new map<string, any>()
+		settings.set("size", size)
+		settings.set("sort", sort) when sort.len() > 0
+		settings.set("_source", {"includes": includes}) when includes.len() > 0
+		return new Aggregation("top_hits", settings)
+	}
+}

@@ -1,0 +1,519 @@
+// These tests need a cluster: Elasticsearch at ADM_TEST_ELASTICSEARCH,
+// OpenSearch at ADM_TEST_OPENSEARCH; each runs against every cluster given
+// and passes without running when none is. They make and delete indices,
+// templates, scripts and pipelines named `adm-test-*`.
+partial module adm.database.elasticsearch {
+	use (
+		std.crypto.hash::(SHA256)
+		std.crypto.x509::(CertPool)
+		std.data.encoding
+		std.data.encoding::(base64encode, pemDecode)
+		std.net.http
+		std.net.tls
+		std.os
+		std.testing
+		std.time
+		adm.database.elasticsearch.aggs
+		adm.database.elasticsearch.wire::*
+	)
+
+	@env("ADM_TEST_ELASTICSEARCH")
+	internal const testElastic string
+
+	@env("ADM_TEST_OPENSEARCH")
+	internal const testOpen string
+
+	// A cluster with security on: its https address, the `elastic` user's
+	// password, and the folder holding its CA certificate `http_ca.crt`.
+	@env("ADM_TEST_ELASTICSEARCH_SECURE")
+	internal const testSecure string
+
+	@env("ADM_TEST_ELASTICSEARCH_PASSWORD")
+	internal const testPassword string
+
+	@env("ADM_TEST_ELASTICSEARCH_CERTS")
+	internal const testCerts string
+
+	internal struct Product {
+		id string
+		name string
+		@field(kind = "keyword")
+		code string
+		price float
+		stock int
+		tags string[]
+		added time.Time
+		@field(dims = 3, similarity = "cosine")
+		vector float[]
+		@field(nested = true)
+		sizes Size[]
+	}
+
+	internal struct Size {
+		label string
+		left  int
+	}
+
+	// The clusters to test against.
+	internal def clusters() string[] {
+		let out string[] = []
+		out.push(testElastic) unless testElastic == ""
+		out.push(testOpen) unless testOpen == ""
+		return out
+	}
+
+	internal def product(id string, name string, price float, stock int, tags string[], day int, vector float[]) Product {
+		return Product{id: id, name: name, code: "C-{id}", price: price, stock: stock, tags: tags, added: time.fromUnixNs(int64(1790000000 + day * 86400) * int64(1000000000)), vector: vector, sizes: [Size{label: "s", left: stock}, Size{label: "l", left: 0}]}
+	}
+
+	// A client on an emptied index `name` of products, holding five.
+	internal def stocked(address string, name string) !(Client, Index<Product>) {
+		let es = try connect(address)
+		es.indices.delete(name) onerror recover none
+		try es.indices.createFor<Product>(name, settings = {"number_of_shards": 1, "number_of_replicas": 0})
+		let products = es.index<Product>(name)
+		products.refresh = Refresh.WaitFor
+		try products.putMany({"1": product("1", "steel kettle", 39.9, 4, ["kitchen", "steel"], 1, [1.0, 0.0, 0.0]), "2": product("2", "glass kettle", 49.5, 0, ["kitchen", "glass"], 2, [0.9, 0.1, 0.0]), "3": product("3", "garden hose", 19.0, 12, ["garden"], 3, [0.0, 1.0, 0.0]), "4": product("4", "steel pan", 29.0, 7, ["kitchen", "steel"], 40, [0.7, 0.0, 0.7]), "5": product("5", "garden chair", 89.0, 2, ["garden", "furniture"], 41, [0.0, 0.7, 0.7])})
+		return (es, products)
+	}
+
+	// The product; fails when there is none.
+	internal def must(value ?Product) !Product {
+		fail "no product" when value is none
+		return value
+	}
+
+	// The document; fails when there is none.
+	internal def mustDoc(value ?Document<Product>) !Document<Product> {
+		fail "no document" when value is none
+		return value
+	}
+
+	internal def hitIds(result SearchResult<Product>) string[] {
+		let out string[] = []
+		for let hit in result.hits {
+			out.push(hit.id)
+		}
+		return out
+	}
+
+	internal def documents(address string) !none {
+		let name = "adm-test-docs"
+		let (es, products) = try stocked(address, name)
+		let mapping = try es.indices.mapping(name)
+		let text = string(new encoding.JSON().encode(mapping))
+		assert text.contains(`"code":{"type":"keyword"}`) && text.contains(`"sizes":{"type":"nested"`)
+		assert text.contains(es.family == "opensearch" ?? (`"vector":{"type":"knn_vector"`, `"vector":{"type":"dense_vector"`))
+		let kettle = try must(try products.get("1"))
+		assert kettle.name == "steel kettle" && kettle.tags.equals(["kitchen", "steel"]) && kettle.sizes.len() == 2
+		assert (try products.get("missing")) is none
+		assert try products.exists("1")
+		assert !(try products.exists("missing"))
+		let kind = ErrorKind.Server
+		products.create("1", product("1", "again", 1.0, 1, [], 0, [0.0, 0.0, 1.0])) onerror (err error) {
+			kind = kindOf(err)
+			recover WriteResult{}
+		}
+		assert kind == ErrorKind.Conflict
+		let added = try products.add(product("", "auto", 5.0, 1, [], 0, [0.0, 0.0, 1.0]))
+		assert added.id != "" && added.result == "created"
+		let current = try mustDoc(try products.document("2"))
+		assert current.version >= 1
+		let stale = current.seqNo
+		try products.put("2", product("2", "glass kettle", 45.0, 3, ["kitchen", "glass"], 2, [0.9, 0.1, 0.0]), ifSeqNo = current.seqNo, ifPrimaryTerm = current.primaryTerm)
+		kind = ErrorKind.Server
+		products.put("2", product("2", "late", 1.0, 1, [], 0, [0.0, 0.0, 1.0]), ifSeqNo = stale, ifPrimaryTerm = current.primaryTerm) onerror (err error) {
+			kind = kindOf(err)
+			recover WriteResult{}
+		}
+		assert kind == ErrorKind.Conflict
+		try products.update("3", {"stock": 11})
+		assert (try must(try products.get("3"))).stock == 11
+		try products.update("3", Script{source: "ctx._source.stock -= params.n", params: {"n": 5}})
+		assert (try must(try products.get("3"))).stock == 6
+		try products.update("9", {"name": "x"}, upsert = product("9", "upserted", 1.0, 1, [], 0, [0.0, 0.0, 1.0]))
+		assert (try must(try products.get("9"))).name == "upserted"
+		kind = ErrorKind.Server
+		products.update("missing", {"stock": 1}) onerror (err error) {
+			kind = kindOf(err)
+			recover WriteResult{}
+		}
+		assert kind == ErrorKind.NotFound
+		let many = try products.getMany(["1", "3", "missing"])
+		assert many.len() == 2 && many["3"].stock == 6
+		assert try products.delete("9")
+		assert !(try products.delete("9"))
+		kind = ErrorKind.Server
+		es.index<Product>("adm-test-no-such-index").get("1") onerror (err error) {
+			kind = kindOf(err)
+			recover none
+		}
+		assert kind == ErrorKind.NotFound
+		try es.indices.delete(name)
+		try es.close()
+		return none
+	}
+
+	internal def searching(address string) !none {
+		let name = "adm-test-search"
+		let (es, products) = try stocked(address, name)
+		let kettles = try products.search(matches("name", "kettle"), sort = "price:desc")
+		assert hitIds(kettles).equals(["2", "1"]) && kettles.total == 2
+		assert kettles.sources()[0].name == "glass kettle"
+		let walked string[] = []
+		for let hit in kettles {
+			walked.push(hit.id)
+		}
+		assert walked.equals(["2", "1"])
+		let stream = try products.scan(pageSize = 3)
+		let firstHit = try stream.next()
+		assert !(firstHit is none)
+		try stream.close()
+		assert (try stream.next()) is none
+		let both = try products.search(matches("name", "steel").and(term("tags", "kitchen")).filter(range("price", lte = 35)))
+		assert hitIds(both).equals(["4"])
+		let either = try products.search(term("code", "C-3").or(term("code", "C-5")), sort = "price")
+		assert hitIds(either).equals(["3", "5"])
+		let notGarden = try products.search(term("tags", "garden").not(), sort = "price")
+		assert hitIds(notGarden).equals(["4", "1", "2"])
+		let paged = try products.search(matchAll(), size = 2, from = 2, sort = "price")
+		assert hitIds(paged).equals(["1", "2"])
+		let fuzzyHit = try products.search(fuzzy("name", "kettel"))
+		assert fuzzyHit.total == 2
+		assert (try products.search(prefix("code", "C-"))).total == 5
+		assert (try products.search(wildcard("code", "c-?", caseInsensitive = true))).total == 5
+		assert hitIds(try products.search(ids(["4", "x"]))).equals(["4"])
+		assert (try products.search(multiMatch("garden", ["name", "tags"]))).total == 2
+		assert (try products.search(matchPhrase("name", "garden hose"))).total == 1
+		assert (try products.search(queryString("name:kettle AND price:[40 TO *]"))).total == 1
+		assert (try products.search(exists("vector"))).total == 5
+		let nestedHit = try products.search(nested("sizes", range("sizes.left", gte = 10)))
+		assert hitIds(nestedHit).equals(["3"])
+		let boosted = try products.search(functionScore(term("tags", "kitchen"), [fieldValueFactor("stock", modifier = "log1p")], boostMode = "replace"))
+		assert hitIds(boosted)[0] == "4"
+		let near = try products.search(knn("vector", [1.0, 0.0, 0.0], 2))
+		assert near.hits.len() >= 2 && hitIds(near)[0] == "1"
+		let lighted = try products.search(SearchOptions{query: matches("name", "kettle"), highlight: Highlight{fields: ["name"]}, suggest: {"fix": Suggester{field: "name", text: "kettel"}}, seqNoPrimaryTerm: true, includes: ["name"]})
+		assert lighted.hits[0].highlight["name"][0].contains("<em>kettle</em>")
+		assert lighted.suggestions["fix"][0].options[0].text == "kettle"
+		assert lighted.hits[0].source.price == 0.0 && lighted.hits[0].primaryTerm >= 1
+		assert (try products.count(term("tags", "garden"))) == 2
+		let why = try products.explain("1", matches("name", "kettle"))
+		assert why.value > 0.0
+		let several = try products.multiSearch([SearchOptions{query: term("tags", "garden")}, SearchOptions{query: term("tags", "steel"), size: 1}])
+		assert several.len() == 2 && several[0].total == 2 && several[1].hits.len() == 1
+		let inline = try products.searchTemplate(source = `{"query": {"term": {"code": "{{code}}"}}}`, params = {"code": "C-5"})
+		assert hitIds(inline).equals(["5"])
+		try es.indices.putSearchTemplate("adm-test-by-tag", `{"query": {"term": {"tags": "{{tag}}"}}}`)
+		assert (try products.searchTemplate(id = "adm-test-by-tag", params = {"tag": "steel"})).total == 2
+		try es.indices.deleteSearchTemplate("adm-test-by-tag")
+		let first = try products.search(SearchOptions{size: 2, sort: [Sort{field: "price"}, Sort{field: "code"}]})
+		let after = try products.search(SearchOptions{size: 2, sort: [Sort{field: "price"}, Sort{field: "code"}], searchAfter: first.hits[1].sort})
+		assert hitIds(first).equals(["3", "4"]) && hitIds(after).equals(["1", "2"])
+		let scanned string[] = []
+		for let hit in try products.scan(SearchOptions{query: term("tags", "kitchen")}, pageSize = 2) {
+			scanned.push(hit.id)
+		}
+		scanned.sort((a, b) => a < b)
+		assert scanned.equals(["1", "2", "4"])
+		let scrolled string[] = []
+		for let hit in try products.scroll(pageSize = 2) {
+			scrolled.push(hit.id)
+		}
+		assert scrolled.len() == 5
+		let pit = try es.openPointInTime(name)
+		let viaPit = try products.search(SearchOptions{pointInTime: pit, sort: [Sort{field: "price"}], size: 1})
+		assert hitIds(viaPit).equals(["3"])
+		try es.closePointInTime(pit)
+		let kind = ErrorKind.Server
+		products.search(try rawQuery(`{"no_such_query": {}}`)) onerror (err error) {
+			kind = kindOf(err)
+			recover new SearchResult<Product>()
+		}
+		assert kind == ErrorKind.Argument
+		try es.indices.delete(name)
+		try es.close()
+		return none
+	}
+
+	internal def aggregating(address string) !none {
+		let name = "adm-test-aggs"
+		let (es, products) = try stocked(address, name)
+		let options = SearchOptions{size: 0, aggregations: {"tags": aggs.terms("tags.keyword", size = 10).sub("price", aggs.stats("price")), "prices": aggs.histogram("price", 25.0), "months": aggs.dateHistogram("added", calendarInterval = "month"), "bands": aggs.range("price", [aggs.Bucket{to: 30}, aggs.Bucket{from: 30}]), "median": aggs.percentiles("price", [50.0]), "distinct": aggs.cardinality("tags.keyword"), "split": aggs.filters({"cheap": range("price", lt = 30), "dear": range("price", gte = 30)}), "best": aggs.topHits(1, sort = [{"price": "desc"}], includes = ["name"]), "sizes": aggs.nested("sizes").sub("left", aggs.sum("sizes.left")), "average": aggs.avg("stock")}}
+		let found = try products.search(options)
+		let kitchen = found.aggregation("tags").bucket("kitchen")
+		assert kitchen.docCount == 3
+		let stats = kitchen.sub("price")
+		assert stats.count == 3 && num(stats.min) == 29.0 && num(stats.max) == 49.5
+		assert found.aggregation("prices").buckets.len() >= 3
+		assert found.aggregation("months").buckets.len() >= 2
+		let bands = found.aggregation("bands").buckets
+		assert bands.len() == 2 && bands[0].docCount == 2 && bands[1].docCount == 3
+		assert found.aggregation("median").values.len() == 1
+		assert num(found.aggregation("distinct").value) == 5.0
+		assert found.aggregation("split").bucket("cheap").docCount == 2
+		assert textOf(found.aggregation("best").hits[0]["name"]) == "garden chair"
+		assert num(found.aggregation("sizes").sub("left").value) == 25.0
+		assert num(found.aggregation("average").value) == 5.0
+		let collected string[] = []
+		let after = new map<string, any>()
+		for let page = 0; page < 10; page++ {
+			let one = try products.search(SearchOptions{size: 0, aggregations: {"all": aggs.composite([aggs.Source{name: "tag", aggregation: aggs.terms("tags.keyword")}], size = 2, after = after)}})
+			let part = one.aggregation("all")
+			for let bucket in part.buckets {
+				collected.push(textOf(bucket.key))
+			}
+			break when part.buckets.len() < 2
+			after = part.afterKey
+		}
+		assert collected.len() == 5
+		try es.indices.delete(name)
+		try es.close()
+		return none
+	}
+
+	internal def bulkWriting(address string) !none {
+		let name = "adm-test-bulk"
+		let es = try connect(address)
+		es.indices.delete(name) onerror recover none
+		try es.indices.create(name, settings = {"number_of_shards": 1, "number_of_replicas": 0})
+		let early = es.bulk(flushInterval = 0s)
+		try early.index(name, "early", {"n": -1})
+		assert (try early.flush()).created == 1
+		try early.close()
+		let writer = es.bulk(flushActions = 50, flushInterval = 200ms)
+		for let i = 0; i < 120; i++ {
+			try writer.index(name, "d{i}", {"n": i})
+		}
+		// The timer sends the last twenty.
+		time.sleep(600ms)
+		try writer.create(name, "d1", {"n": 1})
+		try writer.update(name, "d2", {"n": 200})
+		try writer.delete(name, "d3")
+		try writer.delete(name, "nope")
+		let report = try writer.close()
+		assert report.created == 120 && report.updated == 1 && report.deleted == 1 && report.notFound == 1
+		assert report.failed == 1 && report.failures[0].id == "d1"
+		try es.indices.refresh(name)
+		assert (try es.count(name)) == 120
+		let typed = es.index<Size>(name)
+		try typed.put("x", Size{label: "x", left: 1})
+		try typed.refreshNow()
+		assert (try es.count(name)) == 121
+		assert es.indices.mappingFor<Product>()["properties"] is map<string, any>
+		try es.indices.delete(name)
+		try es.close()
+		return none
+	}
+
+	internal def administering(address string) !none {
+		let es = try connect(address)
+		for let old in ["adm-test-admin-1", "adm-test-admin-2", "adm-test-roll-000001", "adm-test-roll-000002", "adm-test-copy", "adm-test-tpl-a"] {
+			es.indices.delete(old) onerror recover none
+		}
+		try es.indices.create("adm-test-admin-1", settings = {"number_of_replicas": 0}, mappings = {"properties": {"n": {"type": "integer"}}})
+		assert try es.indices.exists("adm-test-admin-1")
+		assert !(try es.indices.exists("adm-test-admin-none"))
+		let kind = ErrorKind.Server
+		es.indices.create("adm-test-admin-1") onerror (err error) {
+			kind = kindOf(err)
+			recover none
+		}
+		assert kind == ErrorKind.Conflict
+		try es.indices.putMapping("adm-test-admin-1", {"properties": {"label": {"type": "keyword"}}})
+		assert string(new encoding.JSON().encode(try es.indices.mapping("adm-test-admin-1"))).contains(`"label":{"type":"keyword"}`)
+		try es.indices.putSettings("adm-test-admin-1", {"index": {"refresh_interval": "2s"}})
+		assert string(new encoding.JSON().encode(try es.indices.settings("adm-test-admin-1"))).contains(`"refresh_interval":"2s"`)
+		try es.indices.addAlias("adm-test-admin-1", "adm-test-alias", filter = term("n", 1))
+		assert (try es.indices.aliases("adm-test-admin-1"))["adm-test-admin-1"].includes("adm-test-alias")
+		assert (try es.catAliases()).len() >= 1
+		try es.indices.removeAlias("adm-test-admin-1", "adm-test-alias")
+		try es.indices.close("adm-test-admin-1")
+		try es.indices.open("adm-test-admin-1")
+		let raw = es.index<Size>("adm-test-admin-1")
+		raw.refresh = Refresh.Immediately
+		try raw.put("a", Size{label: "x", left: 1})
+		try es.indices.reindex("adm-test-admin-1", "adm-test-copy", refresh = true)
+		assert (try es.count("adm-test-copy")) == 1
+
+		try es.indices.create("adm-test-roll-000001", aliases = {"adm-test-roll": {"is_write_index": true}})
+		let dry = try es.indices.rollover("adm-test-roll", maxDocs = 1000, dryRun = true)
+		assert dry.dryRun && !dry.rolledOver
+		let rolled = try es.indices.rollover("adm-test-roll")
+		assert rolled.rolledOver && rolled.newIndex == "adm-test-roll-000002"
+
+		try es.indices.putComponentTemplate("adm-test-component", settings = {"number_of_replicas": 0}, mappings = {"properties": {"stamp": {"type": "date"}}})
+		try es.indices.putTemplate("adm-test-template", ["adm-test-tpl-*"], composedOf = ["adm-test-component"], priority = 300)
+		try es.indices.create("adm-test-tpl-a")
+		assert string(new encoding.JSON().encode(try es.indices.mapping("adm-test-tpl-a"))).contains(`"stamp":{"type":"date"}`)
+		assert (try es.indices.template("adm-test-template")).len() > 0
+		for let old in ["adm-test-admin-1", "adm-test-copy", "adm-test-roll-000001", "adm-test-roll-000002", "adm-test-tpl-a"] {
+			try es.indices.delete(old)
+		}
+		try es.indices.deleteTemplate("adm-test-template")
+		try es.indices.deleteComponentTemplate("adm-test-component")
+		kind = ErrorKind.Server
+		es.indices.delete("adm-test-admin-1") onerror (err error) {
+			kind = kindOf(err)
+			recover none
+		}
+		assert kind == ErrorKind.NotFound
+
+		try es.ingest.putPipeline("adm-test-pipe", [map<string, any>{"set": map<string, any>{"field": "seen", "value": "yes"}}, map<string, any>{"uppercase": map<string, any>{"field": "label"}}], description = "adm test")
+		let out = try es.ingest.simulate("adm-test-pipe", [map<string, any>{"label": "abc"}])
+		assert textOf(out[0]["seen"]) == "yes" && textOf(out[0]["label"]) == "ABC"
+		assert (try es.ingest.pipeline("adm-test-pipe")).hasKey("processors")
+		try es.ingest.deletePipeline("adm-test-pipe")
+
+		let info = try es.info()
+		assert info.version.number == es.version
+		let health = try es.health(waitForStatus = "yellow", wait = 10s)
+		assert health.status := "green" || "yellow"
+		assert (try es.catNodes()).len() >= 1
+		assert (try es.catIndices()).len() >= 0
+		assert (try es.catShards()).len() >= 0
+		assert (try es.cat("count")).len() == 1
+		try es.close()
+		return none
+	}
+
+	// The CA of the secure cluster as a pool, and its fingerprint.
+	internal def secureCA() !(CertPool, string) {
+		let text = string(try os.readFile("{testCerts}/http_ca.crt"))
+		let pool = new CertPool()
+		pool.appendCertsFromPEM(text)
+		let block = try pemDecode(text)
+		return (pool, new SHA256().hash(block.bytes).hex())
+	}
+
+	// Posts JSON to the secure cluster as `elastic` and returns the answer.
+	internal def securePost(path string, body string, pool CertPool) !map<string, any> {
+		let transport = new http.Transport()
+		transport.tls = tls.Config{rootCAs: pool}
+		let client = new http.Client()
+		client.transport = transport
+		let request = try http.newRequest(http.Method.POST, "{testSecure}{path}", body)
+		request.headers.set("Content-Type", "application/json")
+		request.headers.set("Authorization", "Basic {base64encode("elastic:{testPassword}".bytes())}")
+		let res = try client.do(request)
+		let parsed = try new encoding.JSON().parse(try res.bytes())
+		fail "not an object" unless parsed is map<string, any>
+		return parsed
+	}
+
+	check "Clusters" {
+		@test()
+		def TestDocuments() !none {
+			for let address in clusters() {
+				try documents(address)
+			}
+			return none
+		}
+
+		@test()
+		def TestSearching() !none {
+			for let address in clusters() {
+				try searching(address)
+			}
+			return none
+		}
+
+		@test()
+		def TestAggregating() !none {
+			for let address in clusters() {
+				try aggregating(address)
+			}
+			return none
+		}
+
+		@test()
+		def TestBulkWriting() !none {
+			for let address in clusters() {
+				try bulkWriting(address)
+			}
+			return none
+		}
+
+		@test()
+		def TestSniffing() !none {
+			for let address in clusters() {
+				let es = new Client()
+				es.sniff = true
+				try es.connect(address)
+				assert (try es.info()).version.number == es.version
+				try es.close()
+			}
+			return none
+		}
+
+		@test()
+		def TestSecurity() !none {
+			return none when testSecure == "" || testCerts == ""
+			let (pool, fingerprint) = try secureCA()
+			let pinned = new Client()
+			pinned.username = "elastic"
+			pinned.password = new Secret<string>(testPassword)
+			pinned.caFingerprint = fingerprint.upper()
+			try pinned.connect(testSecure)
+			assert (try pinned.health()).status := "green" || "yellow"
+			try pinned.close()
+			let rooted = new Client()
+			rooted.username = "elastic"
+			rooted.password = new Secret<string>(testPassword)
+			rooted.tls = tls.Config{rootCAs: pool}
+			try rooted.connect(testSecure)
+			try rooted.close()
+			let wrong = new Client()
+			wrong.username = "elastic"
+			wrong.password = new Secret<string>("not the password")
+			wrong.caFingerprint = fingerprint
+			let kind = ErrorKind.Server
+			wrong.connect(testSecure) onerror (err error) {
+				kind = kindOf(err)
+				recover none
+			}
+			assert kind == ErrorKind.Denied
+			let stranger = new Client()
+			stranger.caFingerprint = "00" + fingerprint.slice(2)
+			kind = ErrorKind.Server
+			stranger.connect(testSecure) onerror (err error) {
+				kind = kindOf(err)
+				recover none
+			}
+			assert kind == ErrorKind.Connection
+			let key = try securePost("/_security/api_key", `{"name": "adm-test-key", "expiration": "1h"}`, pool)
+			let encoded = textOf(key.get("encoded"))
+			assert encoded != ""
+			let viaKey = new Client()
+			viaKey.apiKey = new Secret<string>(encoded)
+			viaKey.tls = tls.Config{rootCAs: pool}
+			try viaKey.connect(testSecure)
+			try viaKey.info()
+			try viaKey.close()
+			let pair = new Client()
+			pair.apiKey = new Secret<string>("{textOf(key.get("id"))}:{textOf(key.get("api_key"))}")
+			pair.tls = tls.Config{rootCAs: pool}
+			try pair.connect(testSecure)
+			try pair.info()
+			try pair.close()
+			let token = try securePost("/_security/oauth2/token", `{"grant_type": "password", "username": "elastic", "password": "` + testPassword + `"}`, pool)
+			let bearer = new Client()
+			let access = textOf(token.get("access_token"))
+			assert access != ""
+			bearer.bearerToken = new Secret<string>(access)
+			bearer.tls = tls.Config{rootCAs: pool}
+			try bearer.connect(testSecure)
+			try bearer.info()
+			try bearer.close()
+			return none
+		}
+
+		@test()
+		def TestAdministering() !none {
+			for let address in clusters() {
+				try administering(address)
+			}
+			return none
+		}
+	}
+}

@@ -1,0 +1,84 @@
+// A bulk request in the API's shape: an action line and a body line per
+// item, and the answer item by item.
+internal partial module adm.database.elasticsearch.wire {
+	use (
+		std.data.encoding
+		adm.database.elasticsearch::*
+	)
+
+	// BulkItem is one item of a bulk request, as the lines it sends.
+	struct BulkItem {
+		lines byte[]
+	}
+
+	// The lines of an item: its action and metadata, then its bodies.
+	def bulkItem(action string, index string, id string, bodies any[]) BulkItem {
+		let header = new map<string, any>()
+		header.set("_index", index)
+		header.set("_id", id) unless id == ""
+		let codec = new encoding.JSON()
+		let lines byte[] = []
+		lines.push(...codec.encode(map<string, any>{action: header}))
+		lines.push(byte('\n'))
+		for let body in bodies {
+			lines.push(...encodeJSON(body))
+			lines.push(byte('\n'))
+		}
+		return BulkItem{lines: lines}
+	}
+
+	struct BulkReply {
+		errors bool
+		items  BulkEntry[]
+	}
+
+	// One item's outcome, under the name of its action.
+	struct BulkEntry {
+		index  ?BulkOutcome
+		create ?BulkOutcome
+		update ?BulkOutcome
+		delete ?BulkOutcome
+	}
+
+	// The action and outcome of an entry.
+	def outcomeOf(entry BulkEntry) (string, BulkOutcome) {
+		let index = entry.index
+		return ("index", index) unless index is none
+		let create = entry.create
+		return ("create", create) unless create is none
+		let update = entry.update
+		return ("update", update) unless update is none
+		let delete = entry.delete
+		return ("delete", delete) unless delete is none
+		return ("", BulkOutcome{})
+	}
+
+	struct BulkOutcome {
+		@json("_index")
+		index string
+		@json("_id")
+		id string
+		status int
+		result string
+		error ?ErrorBody
+	}
+
+	// Adds a report's counts and failures to another's.
+	def merge(into BulkReport, from BulkReport) {
+		into.created += from.created
+		into.updated += from.updated
+		into.deleted += from.deleted
+		into.notFound += from.notFound
+		into.noop += from.noop
+		into.failed += from.failed
+		into.failures.push(...from.failures)
+	}
+
+	// The ElasticError of a report with failures.
+	def failureOf(report BulkReport) ElasticError {
+		let first = report.failures[0]
+		let out = errorOf(ErrorKind.Server, "elasticsearch: {report.failed} of the bulk items failed; the first, {first.action} {first.id}: {first.errorType}: {first.reason}")
+		out.failures = report.failures
+		return out
+	}
+}

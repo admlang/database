@@ -1,0 +1,244 @@
+partial module adm.database.elasticsearch {
+	use (
+		std.data.encoding
+		std.net.http
+		std.net.url
+		std.sync
+		std.time
+		adm.database.elasticsearch.wire::*
+	)
+
+	// BulkReport counts what bulk writes did, and lists the items that
+	// failed.
+	struct BulkReport {
+		created  int
+		updated  int
+		deleted  int
+		// Deletes of documents that were not there.
+		notFound int
+		// Updates that changed nothing.
+		noop     int
+		failed   int
+		failures BulkFailure[]
+	}
+
+	// Bulk writes documents in batches through the `_bulk` API; `Client.bulk`
+	// makes one. A batch goes when `flushActions` items wait, or
+	// `flushBytes` of them, or every `flushInterval`, and on `flush` and
+	// `close`. Items the cluster pushes back on (429) go again after a
+	// pause, up to `maxRetries` times; other failures are reported. Any
+	// number of tasks may write through one Bulk.
+	//
+	// ```
+	// let writer = es.bulk()
+	// for let product in products {
+	//     try writer.index("products", product.id, product)
+	// }
+	// let report = try writer.close()
+	// print("{report.created} created, {report.failed} failed")
+	// ```
+	type Bulk {
+		flushActions         int
+		flushBytes           int
+		flushInterval        duration
+		refresh              Refresh
+		maxRetries           int            = 3
+		internal shared      Shared
+		internal lock        sync.Semaphore
+		internal items       BulkItem[]     = []
+		internal size        int            = 0
+		internal total       BulkReport     = BulkReport{}
+		// A failure of a batch the timer sent, for the next call to report.
+		internal atomic late ?error         = none
+		internal timers      (async none)[] = []
+		atomic closed        bool           = false
+
+		def new(shared Shared, flushActions int, flushBytes int, flushInterval duration, refresh Refresh) {
+			self.shared = shared
+			self.flushActions = flushActions.max(1)
+			self.flushBytes = flushBytes.max(1)
+			self.flushInterval = flushInterval
+			self.refresh = refresh
+			lock = new sync.Semaphore(1)
+			timers.push(async tick()) when flushInterval > 0s
+		}
+
+		// index stores a document under an id ("" lets the cluster make one
+		// up), replacing the one there.
+		// Fails with ErrorKind.Closed after `close`, and as `flush` does when
+		// the item fills a batch.
+		def index(index string, id string, doc any) !none {
+			return try add("index", index, id, [doc])
+		}
+
+		// create stores a document under an id that holds none; the item
+		// fails with a conflict when the id is taken.
+		// Fails as `index` does.
+		def create(index string, id string, doc any) !none {
+			return try add("create", index, id, [doc])
+		}
+
+		// update changes fields of a document; `upsert` is stored when it is
+		// missing, or `changes` itself with `docAsUpsert`.
+		// Fails as `index` does.
+		def update(index string, id string, changes any, upsert ?any = none, docAsUpsert bool = false) !none {
+			let body = new map<string, any>()
+			body.set("doc", changes)
+			body.set("upsert", upsert) unless upsert is none
+			body.set("doc_as_upsert", true) when docAsUpsert
+			return try add("update", index, id, [body])
+		}
+
+		// delete removes a document.
+		// Fails as `index` does.
+		def delete(index string, id string) !none {
+			return try add("delete", index, id, [])
+		}
+
+		// flush sends what waits and returns what that batch did.
+		// Fails with ErrorKind.Connection or TimedOut when the batch cannot
+		// be sent (its items wait for the next try), and with a failure of a
+		// batch the timer sent since the last call.
+		def flush() !BulkReport {
+			lock.acquire()
+			let report = sendLocked() onerror (err error) {
+				lock.release()
+				fail err
+			}
+			lock.release()
+			return report
+		}
+
+		// close sends what waits, stops the timer, and returns what every
+		// batch of this Bulk did.
+		// Fails as `flush` does.
+		def close() !BulkReport {
+			closed = true
+			for let ticking in timers {
+				ticking.cancel()
+			}
+			try flush()
+			return total
+		}
+
+		// What every batch so far did.
+		def report() BulkReport {
+			return total
+		}
+
+		def dispose() {
+			close() onerror recover BulkReport{}
+		}
+
+		// ---- internals ----
+
+		internal def add(action string, index string, id string, bodies any[]) !none {
+			fail errorOf(ErrorKind.Closed, "elasticsearch: the bulk writer is closed") when closed
+			let item = bulkItem(action, index, id, bodies)
+			lock.acquire()
+			items.push(item)
+			size += item.lines.len()
+			if items.len() >= flushActions || size >= flushBytes {
+				sendLocked() onerror (err error) {
+					lock.release()
+					fail err
+				}
+			}
+			lock.release()
+			return none
+		}
+
+		// Sends the waiting items while holding the lock. Items pushed back
+		// with 429 go again after a pause.
+		internal def sendLocked() !BulkReport {
+			let carried = late
+			late = none
+			fail carried unless carried is none
+			let report = BulkReport{}
+			let pause = 100ms
+			for let round = 0; items.len() > 0; round++ {
+				let batch = items
+				let (retry, done) = try sendBatch(batch, round >= maxRetries)
+				items = retry
+				size = 0
+				for let item in retry {
+					size += item.lines.len()
+				}
+				merge(report, done)
+				break when retry.len() == 0
+				time.sleep(pause)
+				pause = pause + pause
+			}
+			merge(total, report)
+			return report
+		}
+
+		// Sends one batch; returns the items to send again (pushed back,
+		// unless this is the last round) and what the others did.
+		internal def sendBatch(batch BulkItem[], last bool) !(BulkItem[], BulkReport) {
+			let link = try shared.wire()
+			let body byte[] = []
+			for let item in batch {
+				body.push(...item.lines)
+			}
+			let query = new url.Values()
+			query.set("refresh", refresh.value) unless refresh == Refresh.None
+			let busy = false
+			let data = link.call(http.Method.POST, "/_bulk", query, body, link.mediaType(true)) onerror (err error) {
+				fail err unless err is ElasticError && err.kind == ErrorKind.Busy && !last
+				busy = true
+				recover byte[]
+			}
+			return (batch, BulkReport{}) when busy
+			let reply = BulkReply{}
+			new encoding.JSON().decode(data, reply) onerror (err error) {
+				fail errorOf(ErrorKind.Protocol, "elasticsearch: POST /_bulk: the answer does not read: {err.message}")
+			}
+			let retry BulkItem[] = []
+			let done = BulkReport{}
+			for let (i, entry) in reply.items {
+				let item = batch[i.min(batch.len() - 1)]
+				let (action, outcome) = outcomeOf(entry)
+				let problem = outcome.error
+				if outcome.status == 429 && !last {
+					retry.push(item)
+				} else if !(problem is none) {
+					done.failed++
+					done.failures.push(BulkFailure{action: action, index: outcome.index, id: outcome.id, status: outcome.status, errorType: problem.kind, reason: problem.reason})
+				} else {
+					match outcome.result {
+						case "created":
+							done.created++
+						case "updated":
+							done.updated++
+						case "deleted":
+							done.deleted++
+						case "not_found":
+							done.notFound++
+						case "noop":
+							done.noop++
+						default:
+					}
+				}
+			}
+			return (retry, done)
+		}
+
+		// Sends what waits every `flushInterval` until the writer closes.
+		internal async def tick() none {
+			for !closed {
+				time.sleep(flushInterval)
+				break when closed || canceled()
+				lock.acquire()
+				if items.len() > 0 {
+					sendLocked() onerror (err error) {
+						late = err
+						recover BulkReport{}
+					}
+				}
+				lock.release()
+			}
+			return none
+		}
+	}
+}
