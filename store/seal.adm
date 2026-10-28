@@ -35,6 +35,8 @@ internal partial module adm.database.store.engine {
 	// The page number and the span are authenticated with it, so a run
 	// copied to another place in the file does not open there.
 	type Sealer {
+		// The cipher, which keeps its own copy of the key and wipes it when
+		// it goes.
 		aead     cipher.AEAD
 		// `formatSealed`, or `formatSealedNarrow` for a file of version
 		// 0.1.0.
