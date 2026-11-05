@@ -184,6 +184,9 @@ let keyed = try store.open("keys.db", store.Options{key: key32})    // 32 bytes 
   meta pages. `key` is used as it is; give one or the other.
 - `open` fails with `ErrorKind.Key` when the key or password is missing or wrong, and when one
   is given for a file that is not encrypted.
+- `open` writes a fresh database only into a file that holds nothing: one whose handle reports
+  size 0 but reads bytes, or whose name stats a size, fails with `ErrorKind.Corrupt` instead of
+  being initialized over.
 - `backup` and `compact` write copies that open with the same key or password.
 - A file encrypted by version 0.1.0 (ChaCha20-Poly1305 with 12-byte nonces) opens, reads and
   is written on in that form, and its copies (`backup`, `compact`) keep it; new files get the

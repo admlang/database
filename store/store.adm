@@ -302,6 +302,15 @@ partial module adm.database.store {
 			fail errorOf(ErrorKind.Storage, "store: {path}: {err.message}", err)
 		}
 		if info.size == 0 {
+			// A fresh database is written only over nothing: a file that reads
+			// bytes, or that its name says holds some, is a database or someone
+			// else's file, never a blank to initialize, whatever the handle's
+			// size says.
+			let probe byte[] = []
+			probe.len(1)
+			let read = file.readAt(probe, 0) onerror recover 0
+			let named = os.stat(path) onerror recover info
+			fail errorOf(ErrorKind.Corrupt, "store: {path} reads as empty but holds bytes; refusing to initialize it") when read > 0 || named.size > 0
 			fail errorOf(ErrorKind.Corrupt, "store: {path} is empty") when settings.readOnly
 			let sealer = inherit
 			sealer = try newSealer(settings.key.reveal(), settings.password.reveal(), settings.passwordRounds) when sealer is none
